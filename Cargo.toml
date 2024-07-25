@@ -5,3 +5,4 @@ edition = "2021"
 
 [dependencies]
 pingora = { version = "0.3.0", features = ["lb", "proxy"] }
+redis = "0.25.4"
