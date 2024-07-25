@@ -910,13 +910,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mosaic-reverse-proxy"
-version = "0.1.0"
-dependencies = [
- "pingora",
-]
-
-[[package]]
 name = "nix"
 version = "0.24.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1297,6 +1290,13 @@ dependencies = [
  "pingora-timeout",
  "regex",
  "tokio",
+]
+
+[[package]]
+name = "pingora-reverse-proxy"
+version = "0.1.0"
+dependencies = [
+ "pingora",
 ]
 
 [[package]]
