@@ -4,4 +4,4 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-pingora = "0.2.0"
+pingora = { version = "0.3.0", features = ["lb", "proxy"] }
