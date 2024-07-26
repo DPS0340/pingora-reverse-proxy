@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+async-trait = "0.1.81"
 once_cell = "1.19.0"
 pingora = { version = "0.3.0", features = ["lb", "proxy"] }
+pingora-core = "0.3.0"
+pingora-proxy = "0.3.0"
 redis = "0.25.4"

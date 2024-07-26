@@ -1,3 +1,4 @@
+mod proxy;
 mod redis_utils;
 use pingora::prelude::*;
 
