@@ -1302,6 +1302,7 @@ dependencies = [
  "pingora-core",
  "pingora-proxy",
  "redis",
+ "serde_json",
 ]
 
 [[package]]
