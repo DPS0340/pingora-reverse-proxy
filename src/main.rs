@@ -1,5 +1,6 @@
 mod proxy;
 mod redis_utils;
+mod utils;
 use pingora_core::server::Server;
 use pingora_proxy::http_proxy_service;
 use proxy::DynamicGateway;

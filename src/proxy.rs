@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use redis::*;
 
-use crate::redis_utils::init_redis_connection;
+use crate::{redis_utils::init_redis_connection, utils::log_and_return_err};
 
 pub struct DynamicGateway {}
 
@@ -28,10 +28,16 @@ impl ProxyHttp for DynamicGateway {
         session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        let results: Vec<String> = init_redis_connection()
-            .unwrap()
-            .hgetall("configurable-proxy-redis-storage")
-            .unwrap();
+        let results: Vec<String> =
+            match init_redis_connection()?.hgetall("configurable-proxy-redis-storage") {
+                Ok(res) => res,
+                Err(e) => {
+                    return log_and_return_err(Err(pingora::Error::explain(
+                        pingora::ErrorType::HTTPStatus(400),
+                        format!("configurable-proxy-redis-storage lookup failed: {}", e),
+                    )))
+                }
+            };
 
         println!("{:?}", results);
 
