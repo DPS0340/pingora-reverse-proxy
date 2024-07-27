@@ -1,35 +1,25 @@
 use async_trait::async_trait;
 
-use pingora_core::server::configuration::Opt;
-use pingora_core::server::Server;
+use itertools::Itertools;
+use log::info;
+use pingora::http::ResponseHeader;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::Result;
-use pingora_http::ResponseHeader;
-use pingora_load_balancing::{health_check, selection::RoundRobin, LoadBalancer};
 use pingora_proxy::{ProxyHttp, Session};
-
-use std::sync::Arc;
+use serde_json::Value;
 
 use redis::*;
 
 use crate::redis_utils::init_redis_connection;
 
-pub struct LB(Arc<LoadBalancer<RoundRobin>>);
-
-pub struct DynamicGateway {
-    redis_connection: Connection,
-}
+pub struct DynamicGateway {}
 
 #[async_trait]
-impl ProxyHttp for LB {
-    type CTX = DynamicGateway;
-    fn new_ctx(&self) -> Self::CTX {
-        DynamicGateway {
-            redis_connection: init_redis_connection().unwrap(),
-        }
-    }
+impl ProxyHttp for DynamicGateway {
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
 
-    async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
+    async fn request_filter(&self, _session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
         Ok(false)
     }
 
@@ -38,23 +28,53 @@ impl ProxyHttp for LB {
         session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        let raw_result: String = _ctx
-            .redis_connection
+        let results: Vec<String> = init_redis_connection()
+            .unwrap()
             .hgetall("configurable-proxy-redis-storage")
             .unwrap();
 
-        println!(raw_result);
+        println!("{:?}", results);
 
-        let (even, odd): (Vec<_>, Vec<_>) = raw_result
-            .split("\n")
-            .map(|s| s.to_string())
-            .partition(|&x, i| i % 2 == 0);
+        let (even, odd): (Vec<_>, Vec<_>) =
+            results
+                .iter()
+                .enumerate()
+                .partition_map(|(i, s)| match i % 2 {
+                    0 => itertools::Either::Left(s),
+                    _ => itertools::Either::Right(s),
+                });
 
-        let result: Vec<_> = even.iter().zip(odd).collect();
+        let result: Vec<(_, _)> = even
+            .iter()
+            .zip(
+                odd.iter()
+                    .map(|s| serde_json::from_str(s).unwrap())
+                    .collect::<Vec<Value>>(),
+            )
+            .collect();
+
+        let path = session.req_header().uri.path();
+
+        let found = result
+            .iter()
+            .find(|(prefix, _)| path.starts_with(prefix.as_str()));
+
+        if found.is_none() {
+            let e = Err(pingora::Error::explain(
+                pingora::ErrorType::HTTPStatus(404),
+                "Upstream peer which matches prefix not found",
+            ));
+            info!("An error occurred: {e:?}");
+            return e;
+        }
+
+        let (&prefix, value): (&&String, Value) = found.unwrap().to_owned();
+
+        let addr = value["target"].as_str().unwrap();
 
         info!("connecting to {addr:?}");
 
-        let peer = Box::new(HttpPeer::new(addr, true, "one.one.one.one".to_string()));
+        let peer = Box::new(HttpPeer::new(addr, true, prefix.to_string()));
         Ok(peer)
     }
 
@@ -90,27 +110,5 @@ impl ProxyHttp for LB {
             "{} response code: {response_code}",
             self.request_summary(session, ctx)
         );
-
-        self.req_metric.inc();
     }
-}
-
-fn main() {
-    env_logger::init();
-
-    // read command line arguments
-    let opt = Opt::parse();
-    let mut server = Server::new(Some(opt)).unwrap();
-    server.bootstrap();
-
-    let mut proxy = pingora_proxy::http_proxy_service(
-        &server.configuration,
-        DynamicGateway {
-            redis_connection: init_redis_connection().unwrap(),
-        },
-    );
-    proxy.add_tcp("0.0.0.0:8080");
-    server.add_service(proxy);
-
-    server.run_forever();
 }
