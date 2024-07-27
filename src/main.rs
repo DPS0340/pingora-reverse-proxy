@@ -12,6 +12,9 @@ fn main() {
     server.bootstrap();
 
     let mut svc = http_proxy_service(&server.configuration, DynamicGateway {});
+    // proxy port: 8080
+    // mgmt port: 8081
+    //   -> admin api (prefix, service redis hset)
     svc.add_tcp("0.0.0.0:8080");
 
     server.add_service(svc);
