@@ -39,8 +39,6 @@ impl ProxyHttp for DynamicGateway {
                 }
             };
 
-        println!("{:?}", results);
-
         let (even, odd): (Vec<_>, Vec<_>) =
             results
                 .iter()
