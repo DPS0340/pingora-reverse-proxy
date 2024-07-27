@@ -28,8 +28,29 @@ impl ProxyHttp for DynamicGateway {
         session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        let results: Vec<String> =
-            match init_redis_connection()?.hgetall("configurable-proxy-redis-storage") {
+        let path = session.req_header().uri.path();
+        let prefixes = path
+            .split("/")
+            .collect_vec()
+            .iter()
+            .enumerate()
+            .filter(|(i, e)| (*i as i32) > 0)
+            .map(|(i, &e)| e)
+            .collect_vec();
+
+        info!("{:?}", prefixes);
+
+        if prefixes.len() < 2 {
+            return log_and_return_err(Err(pingora::Error::explain(
+                pingora::ErrorType::HTTPStatus(400),
+                format!("Prefixes too short: {:?}", prefixes),
+            )));
+        }
+
+        let prefix = format!("{}/{}", prefixes[0], prefixes[1]);
+
+        let raw_result: Option<String> =
+            match init_redis_connection()?.hget("configurable-proxy-redis-storage", &prefix) {
                 Ok(res) => res,
                 Err(e) => {
                     return log_and_return_err(Err(pingora::Error::explain(
@@ -39,46 +60,20 @@ impl ProxyHttp for DynamicGateway {
                 }
             };
 
-        let (even, odd): (Vec<_>, Vec<_>) =
-            results
-                .iter()
-                .enumerate()
-                .partition_map(|(i, s)| match i % 2 {
-                    0 => itertools::Either::Left(s),
-                    _ => itertools::Either::Right(s),
-                });
+        let result = raw_result.ok_or(
+            log_and_return_err(Result::<Box<()>, _>::Err(pingora::Error::explain(
+                pingora::ErrorType::HTTPStatus(400),
+                format!("Upstream peer which matches prefix not found: {}", prefix),
+            )))
+            .unwrap_err(),
+        )?;
 
-        let result: Vec<(_, _)> = even
-            .iter()
-            .zip(
-                odd.iter()
-                    .map(|s| serde_json::from_str(s).unwrap())
-                    .collect::<Vec<Value>>(),
-            )
-            .collect();
-
-        let path = session.req_header().uri.path();
-
-        let found = result
-            .iter()
-            .find(|(prefix, _)| path.starts_with(prefix.as_str()));
-
-        if found.is_none() {
-            let e = Err(pingora::Error::explain(
-                pingora::ErrorType::HTTPStatus(404),
-                "Upstream peer which matches prefix not found",
-            ));
-            info!("An error occurred: {e:?}");
-            return e;
-        }
-
-        let (&prefix, value): (&&String, Value) = found.unwrap().to_owned();
-
+        let value: Value = serde_json::from_str(&result).unwrap();
         let addr = value["target"].as_str().unwrap();
 
-        info!("connecting to {addr:?}");
+        info!("Connecting to {addr:?}");
 
-        let peer = Box::new(HttpPeer::new(addr, true, prefix.to_string()));
+        let peer = Box::new(HttpPeer::new(addr, true, prefix));
         Ok(peer)
     }
 
