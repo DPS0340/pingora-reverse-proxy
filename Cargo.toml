@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 async-trait = "0.1.81"
 env_logger = "0.11.5"
+http = "1.1.0"
 itertools = "0.13.0"
 lazy_mut = "0.1.0"
 log = "0.4.22"

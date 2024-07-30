@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 
+use http::Uri;
 use itertools::Itertools;
 use log::info;
 use pingora::http::ResponseHeader;
@@ -28,14 +29,15 @@ impl ProxyHttp for DynamicGateway {
         session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        let path = session.req_header().uri.path();
-        let prefixes = path
+        let uri = &session.req_header().uri;
+        let path = uri.path();
+        let mut prefixes = path
             .split("/")
             .collect_vec()
             .iter()
             .enumerate()
-            .filter(|(i, e)| (*i as i32) > 0)
-            .map(|(i, &e)| e)
+            .filter(|(i, _)| (*i as i32) > 0)
+            .map(|(_, &e)| e)
             .collect_vec();
 
         info!("{:?}", prefixes);
@@ -48,6 +50,18 @@ impl ProxyHttp for DynamicGateway {
         }
 
         let prefix = format!("{}/{}", prefixes[0], prefixes[1]);
+
+        for _ in 0..2 {
+            prefixes.remove(0);
+        }
+
+        let rewrited_uri = uri
+            .to_string()
+            .replacen(prefix.as_str(), "", 1)
+            .parse::<Uri>()
+            .unwrap();
+
+        session.req_header_mut().set_uri(rewrited_uri);
 
         let raw_result: Option<String> =
             match init_redis_connection()?.hget("configurable-proxy-redis-storage", &prefix) {
