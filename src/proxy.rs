@@ -1,12 +1,16 @@
+use std::{fmt::format, str::FromStr};
+
 use bytes::Bytes;
+
+use regex::Regex;
 
 use async_trait::async_trait;
 
-use http::Uri;
+use http::{HeaderValue, StatusCode, Uri};
 use itertools::Itertools;
 use log::info;
 use once_cell::sync::Lazy;
-use pingora::http::ResponseHeader;
+use pingora::{http::ResponseHeader, protocols, tls::ssl_sys::stack_st_X509_NAME};
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::Result;
 use pingora_proxy::{ProxyHttp, Session};
@@ -23,6 +27,8 @@ pub struct ProxyCtx {
 }
 
 static FORWARD_PATH_HEADER: &str = "X-Forwarded-Path";
+static PORT_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r":\d+").unwrap());
+static PROTOCOL_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"(https?|wss?)://").unwrap());
 
 #[async_trait]
 impl ProxyHttp for DynamicGateway {
@@ -66,14 +72,6 @@ impl ProxyHttp for DynamicGateway {
             prefixes.remove(0);
         }
 
-        let rewrited_uri = uri
-            .to_string()
-            .replacen(prefix.as_str(), "", 1)
-            .parse::<Uri>()
-            .unwrap();
-
-        session.req_header_mut().set_uri(rewrited_uri);
-
         let raw_result: Option<String> =
             match init_redis_connection()?.hget("configurable-proxy-redis-storage", &prefix) {
                 Ok(res) => res,
@@ -85,16 +83,63 @@ impl ProxyHttp for DynamicGateway {
                 }
             };
 
-        let result = raw_result.ok_or(
+        let result = raw_result.ok_or_else(|| {
             log_and_return_err(Result::<Box<()>, _>::Err(pingora::Error::explain(
                 pingora::ErrorType::HTTPStatus(400),
                 format!("Upstream peer which matches prefix not found: {}", prefix),
             )))
-            .unwrap_err(),
-        )?;
+            .unwrap_err()
+        })?;
 
         let value: Value = serde_json::from_str(&result).unwrap();
-        let addr = value["target"].as_str().unwrap();
+        let mut addr = value["target"].as_str().unwrap().to_string();
+        let addr_ = &addr.clone();
+
+        if PROTOCOL_REGEX.is_match(addr_) {
+            let protocol = PROTOCOL_REGEX.find(addr_).unwrap().as_str();
+            info!("{}", protocol);
+            addr = addr.replace(protocol, "");
+            let port = match protocol {
+                "http://" => Some("80"),
+                "https://" => Some("443"),
+                // TODO: handle ws / wss
+                _ => None,
+            };
+            if port.is_some() {
+                let p = port.unwrap();
+                addr = format!("{}:{}", addr, p);
+            }
+        }
+
+        let rewrited_uri_str = uri.to_string().replacen(prefix.as_str(), "", 1);
+
+        let original_uri = &session.req_header().uri;
+
+        info!("{}", uri.to_string());
+        info!("{}", rewrited_uri_str);
+        info!("{:?}", original_uri);
+
+        let rewrited_uri = uri
+            .to_string()
+            .replacen(format!("{}/", prefix.as_str()).as_str(), "/", 1)
+            .replacen(prefix.as_str(), "/", 1)
+            .parse::<Uri>()
+            .unwrap();
+
+        session.req_header_mut().set_uri(rewrited_uri);
+
+        let addr_without_port = PORT_REGEX.replace_all(addr.as_str(), "").to_string();
+
+        let req_header = session.req_header_mut();
+
+        let _ = req_header.insert_header(
+            "X-Forwarded-Host",
+            req_header.headers.clone()["Host"].to_str().unwrap_or(""),
+        );
+
+        let _ = session
+            .req_header_mut()
+            .insert_header("Host", &addr_without_port);
 
         let _ = session
             .req_header_mut()
@@ -102,19 +147,58 @@ impl ProxyHttp for DynamicGateway {
 
         info!("Connecting to {addr:?}");
 
-        let peer = Box::new(HttpPeer::new(addr, true, prefix));
+        let peer = Box::new(HttpPeer::new(addr.as_str(), true, addr_without_port));
         Ok(peer)
     }
 
     async fn response_filter(
         &self,
-        _session: &mut Session,
-        _upstream_response: &mut ResponseHeader,
+        session: &mut Session,
+        upstream_response: &mut ResponseHeader,
         _ctx: &mut Self::CTX,
     ) -> Result<()>
     where
         Self::CTX: Send + Sync,
     {
+        let headers = &session.req_header().headers;
+        if !headers.contains_key(FORWARD_PATH_HEADER) {
+            info!("!headers.contains_key(FORWARD_PATH_HEADER)");
+            return Ok(());
+        }
+
+        let prefix = headers[FORWARD_PATH_HEADER].to_str().unwrap();
+
+        let upstream_host = session.req_header().headers["Host"].to_str().unwrap();
+        let status = upstream_response.status;
+
+        if [StatusCode::MOVED_PERMANENTLY, StatusCode::FOUND].contains(&status) {
+            info!("301 or 302");
+            let host = session.req_header().headers["X-Forwarded-Host"]
+                .to_str()
+                .unwrap();
+            session.req_header().uri.host().unwrap_or("");
+            let location = upstream_response
+                .headers
+                .get("Location")
+                .map(|e| e.to_str().unwrap_or(""))
+                .unwrap_or("");
+
+            info!("upstream_host: {}", upstream_host);
+            info!("host: {}", host);
+            info!("location: {}", location);
+            info!(
+                "replaced location: {}",
+                location.replace(upstream_host, format!("{}/{}", host, prefix).as_str())
+            );
+
+            let _ = upstream_response.insert_header(
+                "Location",
+                location.replace(upstream_host, format!("{}/{}", host, prefix).as_str()),
+            );
+        }
+        // if (res.statusCode == 301 || res.statusCode == 302) {
+        // 	res.setHeader('Location', `${data.proxyUrl}${res.getHeader('Location').toString().replace(serviceAccessUrlSuffix + '/', '')}`)
+        // }
         Ok(())
     }
 
@@ -136,17 +220,26 @@ impl ProxyHttp for DynamicGateway {
         }
 
         if end_of_stream {
-            let response_body = String::from_utf8(ctx.buffer.clone()).ok();
+            let response_body = String::from_utf8_lossy(ctx.buffer.as_slice());
 
-            if response_body.is_none() {
-                return Ok(None);
-            }
+            // info!("response_body_exists: {}", response_body.is_some());
+            // if response_body.is_none() {
+            //     return Ok(None);
+            // }
 
-            let headers = &session.req_header().headers;
-            println!("{}", response_body.unwrap());
+            // let response_body = response_body.unwrap();
 
-            if headers.contains_key(FORWARD_PATH_HEADER) {
-                let _prefix = headers[FORWARD_PATH_HEADER].to_str().ok();
+            info!("response_body: {}", response_body);
+
+            let req_header = session.req_header_mut();
+            if req_header.headers.contains_key(FORWARD_PATH_HEADER) {
+                req_header.remove_header("Content-Length");
+
+                let _prefix = req_header.headers[FORWARD_PATH_HEADER].to_str().unwrap();
+
+                let replaced = response_body.replace("\"/", format!("\"{}/", _prefix).as_str());
+
+                *body = Some(Bytes::copy_from_slice(replaced.as_bytes()));
             }
         }
         Ok(None)
