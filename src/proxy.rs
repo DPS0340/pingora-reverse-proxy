@@ -1,16 +1,14 @@
-use std::{fmt::format, str::FromStr};
-
 use bytes::Bytes;
 
 use regex::Regex;
 
 use async_trait::async_trait;
 
-use http::{HeaderValue, StatusCode, Uri};
+use http::Uri;
 use itertools::Itertools;
 use log::info;
 use once_cell::sync::Lazy;
-use pingora::{http::ResponseHeader, protocols, tls::ssl_sys::stack_st_X509_NAME};
+use pingora::http::ResponseHeader;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::Result;
 use pingora_proxy::{ProxyHttp, Session};
@@ -22,8 +20,10 @@ use crate::{redis_utils::init_redis_connection, utils::log_and_return_err};
 
 pub struct DynamicGateway {}
 
+// TODO: Cache context using hashmap
 pub struct ProxyCtx {
     buffer: Vec<u8>,
+    content_type: Option<String>,
 }
 
 static FORWARD_PATH_HEADER: &str = "X-Forwarded-Path";
@@ -34,7 +34,10 @@ static PROTOCOL_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"(https?|wss?)://"
 impl ProxyHttp for DynamicGateway {
     type CTX = ProxyCtx;
     fn new_ctx(&self) -> Self::CTX {
-        ProxyCtx { buffer: vec![] }
+        ProxyCtx {
+            buffer: vec![],
+            content_type: None,
+        }
     }
 
     async fn request_filter(&self, _session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
@@ -137,13 +140,17 @@ impl ProxyHttp for DynamicGateway {
             req_header.headers.clone()["Host"].to_str().unwrap_or(""),
         );
 
+        let _ = req_header.insert_header("Accept-Encoding", "identity");
+
         let _ = session
             .req_header_mut()
             .insert_header("Host", &addr_without_port);
 
         let _ = session
             .req_header_mut()
-            .append_header("X-Forwarded-Path", &prefix);
+            .append_header(FORWARD_PATH_HEADER, &prefix);
+
+        info!("prefix: {prefix}");
 
         info!("Connecting to {addr:?}");
 
@@ -155,7 +162,7 @@ impl ProxyHttp for DynamicGateway {
         &self,
         session: &mut Session,
         upstream_response: &mut ResponseHeader,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> Result<()>
     where
         Self::CTX: Send + Sync,
@@ -165,6 +172,12 @@ impl ProxyHttp for DynamicGateway {
         upstream_response
             .insert_header("Transfer-Encoding", "chunked")
             .unwrap();
+
+        if let Some(t) = upstream_response.headers.get("Content-Type") {
+            ctx.content_type = Some(t.to_str().unwrap().to_string());
+        } else {
+            ctx.content_type = None;
+        }
 
         Ok(())
 
@@ -241,12 +254,24 @@ impl ProxyHttp for DynamicGateway {
             info!("response_body: {}", response_body);
 
             let req_header = session.req_header_mut();
-            if req_header.headers.contains_key(FORWARD_PATH_HEADER) {
-                let _prefix = req_header.headers[FORWARD_PATH_HEADER].to_str().unwrap();
+            let _prefix = req_header.headers[FORWARD_PATH_HEADER].to_str().unwrap();
+            //info!("_prefix: {_prefix}");
 
-                let replaced = response_body.replace("\"/", format!("\"{}/", _prefix).as_str());
+            let replaced = response_body
+                .replace(r#"=/"#, format!(r#"={}/"#, _prefix).as_str())
+                .replace(r#""/"#, format!(r#""{}/"#, _prefix).as_str());
 
+            //info!("replaced: {replaced}");
+
+            let content_type = ctx.content_type.as_ref();
+
+            if ["text/", "application/"]
+                .iter()
+                .any(|&e| content_type.map(|c| c.contains(e)).unwrap_or(false))
+            {
                 *body = Some(Bytes::copy_from_slice(replaced.as_bytes()));
+            } else {
+                *body = Some(Bytes::copy_from_slice(ctx.buffer.as_slice()));
             }
         }
         Ok(None)
