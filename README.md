@@ -1,5 +1,11 @@
 # pingora-reverse-proxy
 
+## Run
+
+```bash
+RUST_LOG=debug cargo run
+```
+
 ## TODOs
 
 - [ ] HashMap based ctx
