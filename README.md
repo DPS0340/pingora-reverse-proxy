@@ -10,7 +10,7 @@ RUST_LOG=debug cargo run
 
 ## TODOs
 
-- [ ] HashMap based ctx
+- [ ] (Thread Safe) HashMap based ctx
 - [ ] Handle ws & wss
 - [ ] Implement mgmt api
 - [x] Implement Image build actions (CD)
