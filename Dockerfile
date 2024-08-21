@@ -18,3 +18,5 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 WORKDIR /var/opt/pingora
 COPY . .
 RUN cargo build
+
+ENTRYPOINT ["/var/opt/pingora/target/debug/pingora-reverse-proxy"]
