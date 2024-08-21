@@ -7,7 +7,7 @@ use crate::utils::log_and_return_err;
 
 pub static REDIS_ENDPOINT: Lazy<String> = Lazy::new(|| {
     option_env!("REDIS_ENDPOINT")
-        .unwrap_or("redis://127.0.0.1:8081")
+        .unwrap_or("redis://127.0.0.1:8091")
         .to_owned()
 });
 
