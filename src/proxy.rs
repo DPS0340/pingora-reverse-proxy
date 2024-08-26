@@ -5,7 +5,6 @@ use regex::Regex;
 use async_trait::async_trait;
 
 use http::Uri;
-use itertools::Itertools;
 use log::info;
 use once_cell::sync::Lazy;
 use pingora::http::ResponseHeader;
@@ -14,16 +13,25 @@ use pingora_core::Result;
 use pingora_proxy::{ProxyHttp, Session};
 use serde_json::Value;
 
+use dashmap::DashMap;
+
 use redis::*;
 
-use crate::{redis_utils::init_redis_connection, utils::log_and_return_err};
+use crate::{
+    redis_utils::init_redis_connection,
+    utils::{log_and_return_err, parse_prefix},
+};
 
 pub struct DynamicGateway {}
 
 // TODO: Cache context using hashmap
-pub struct ProxyCtx {
+pub struct UpstreamResCtx {
     buffer: Vec<u8>,
     content_type: Option<String>,
+}
+
+pub struct ProxyCtx {
+    map: DashMap<String, UpstreamResCtx>,
 }
 
 static FORWARD_PATH_HEADER: &str = "X-Forwarded-Path";
@@ -35,8 +43,7 @@ impl ProxyHttp for DynamicGateway {
     type CTX = ProxyCtx;
     fn new_ctx(&self) -> Self::CTX {
         ProxyCtx {
-            buffer: vec![],
-            content_type: None,
+            map: DashMap::new(),
         }
     }
 
@@ -50,30 +57,14 @@ impl ProxyHttp for DynamicGateway {
         _ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
         let uri = &session.req_header().uri;
-        let path = uri.path();
-        let mut prefixes = path
-            .split("/")
-            .collect_vec()
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| (*i as i32) > 0)
-            .map(|(_, &e)| e)
-            .collect_vec();
 
-        info!("{:?}", prefixes);
+        let prefix = parse_prefix(uri);
 
-        if prefixes.len() < 2 {
-            return log_and_return_err(Err(pingora::Error::explain(
-                pingora::ErrorType::HTTPStatus(400),
-                format!("Prefixes too short: {:?}", prefixes),
-            )));
+        if let Err(e) = prefix {
+            return e.into_err();
         }
 
-        let prefix = format!("/{}/{}", prefixes[0], prefixes[1]);
-
-        for _ in 0..2 {
-            prefixes.remove(0);
-        }
+        let prefix = prefix.unwrap().to_string();
 
         let raw_result: Option<String> =
             match init_redis_connection()?.hget("configurable-proxy-redis-storage", &prefix) {
@@ -173,10 +164,34 @@ impl ProxyHttp for DynamicGateway {
             .insert_header("Transfer-Encoding", "chunked")
             .unwrap();
 
+        let uri = &session.req_header().uri;
+
+        let prefix = parse_prefix(uri);
+
+        if let Err(e) = prefix {
+            return e.into_err();
+        }
+
+        let prefix = prefix.unwrap().to_string();
+
+        let mut e = match ctx.map.get_mut(&prefix) {
+            Some(e) => e,
+            None => {
+                ctx.map.insert(
+                    prefix.clone(),
+                    UpstreamResCtx {
+                        buffer: vec![],
+                        content_type: None,
+                    },
+                );
+                ctx.map.get_mut(&prefix).unwrap()
+            }
+        };
+
         if let Some(t) = upstream_response.headers.get("Content-Type") {
-            ctx.content_type = Some(t.to_str().unwrap().to_string());
+            e.content_type = Some(t.to_str().unwrap().to_string());
         } else {
-            ctx.content_type = None;
+            e.content_type = None;
         }
 
         Ok(())
@@ -232,38 +247,50 @@ impl ProxyHttp for DynamicGateway {
     where
         Self::CTX: Send + Sync,
     {
+        let uri = &session.req_header().uri;
+
+        let prefix = parse_prefix(uri);
+
+        if let Err(e) = prefix {
+            return e.into_err();
+        }
+
+        let prefix = prefix.unwrap().to_string();
+
+        let mut e = match ctx.map.get_mut(&prefix) {
+            Some(e) => e,
+            None => {
+                ctx.map.insert(
+                    prefix.clone(),
+                    UpstreamResCtx {
+                        buffer: vec![],
+                        content_type: None,
+                    },
+                );
+                ctx.map.get_mut(&prefix).unwrap()
+            }
+        };
+
         // buffer the data
         if let Some(b) = body {
-            ctx.buffer.extend(&b[..]);
+            e.buffer.extend(&b[..]);
             // drop the body
             b.clear();
         }
 
         if end_of_stream {
-            let response_body = String::from_utf8_lossy(ctx.buffer.as_slice());
-
-            // info!("response_body_exists: {}", response_body.is_ok());
-            // if let Err(e) = response_body {
-            //     info!("{:?}", ctx.buffer.clone()[1]);
-            //     info!("{}", e);
-            //     return Ok(None);
-            // }
-
-            // let response_body = response_body.unwrap();
+            let response_body = String::from_utf8_lossy(e.buffer.as_slice());
 
             info!("response_body: {}", response_body);
 
             let req_header = session.req_header_mut();
             let _prefix = req_header.headers[FORWARD_PATH_HEADER].to_str().unwrap();
-            //info!("_prefix: {_prefix}");
 
             let replaced = response_body
                 .replace(r#"=/"#, format!(r#"={}/"#, _prefix).as_str())
                 .replace(r#""/"#, format!(r#""{}/"#, _prefix).as_str());
 
-            //info!("replaced: {replaced}");
-
-            let content_type = ctx.content_type.as_ref();
+            let content_type = e.content_type.as_ref();
 
             if ["text/", "application/"]
                 .iter()
@@ -271,8 +298,10 @@ impl ProxyHttp for DynamicGateway {
             {
                 *body = Some(Bytes::copy_from_slice(replaced.as_bytes()));
             } else {
-                *body = Some(Bytes::copy_from_slice(ctx.buffer.as_slice()));
+                *body = Some(Bytes::copy_from_slice(e.buffer.as_slice()));
             }
+
+            ctx.map.remove(&prefix);
         }
         Ok(None)
     }
