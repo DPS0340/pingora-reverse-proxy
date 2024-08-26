@@ -4,7 +4,7 @@ use regex::Regex;
 
 use async_trait::async_trait;
 
-use http::Uri;
+use http::{StatusCode, Uri};
 use log::info;
 use once_cell::sync::Lazy;
 use pingora::http::ResponseHeader;
@@ -89,17 +89,25 @@ impl ProxyHttp for DynamicGateway {
         let mut addr = value["target"].as_str().unwrap().to_string();
         let addr_ = &addr.clone();
 
+        let mut sni: bool = false;
+
         if PROTOCOL_REGEX.is_match(addr_) {
             let protocol = PROTOCOL_REGEX.find(addr_).unwrap().as_str();
             info!("{}", protocol);
             addr = addr.replace(protocol, "");
             let port = match protocol {
-                "http://" => Some("80"),
-                "https://" => Some("443"),
+                "http://" => {
+                    sni = false;
+                    Some("80")
+                }
+                "https://" => {
+                    sni = true;
+                    Some("443")
+                }
                 // TODO: handle ws / wss
                 _ => None,
             };
-            if port.is_some() {
+            if port.is_some() && !PORT_REGEX.is_match(&addr) {
                 let p = port.unwrap();
                 addr = format!("{}:{}", addr, p);
             }
@@ -131,6 +139,8 @@ impl ProxyHttp for DynamicGateway {
             req_header.headers.clone()["Host"].to_str().unwrap_or(""),
         );
 
+        let _ = req_header.insert_header("Host", addr_);
+
         let _ = req_header.insert_header("Accept-Encoding", "identity");
 
         let _ = session
@@ -145,7 +155,7 @@ impl ProxyHttp for DynamicGateway {
 
         info!("Connecting to {addr:?}");
 
-        let peer = Box::new(HttpPeer::new(addr.as_str(), true, addr_without_port));
+        let peer = Box::new(HttpPeer::new(addr.as_str(), sni, addr_without_port));
         Ok(peer)
     }
 
@@ -194,47 +204,45 @@ impl ProxyHttp for DynamicGateway {
             e.content_type = None;
         }
 
+        let req_header = session.req_header_mut();
+
+        if !req_header.headers.contains_key(FORWARD_PATH_HEADER) {
+            info!("!headers.contains_key(FORWARD_PATH_HEADER)");
+            return Ok(());
+        }
+
+        let prefix = req_header.headers[FORWARD_PATH_HEADER].to_str().unwrap();
+
+        let upstream_host = req_header.headers["Host"].to_str().unwrap();
+        let status = upstream_response.status;
+
+        if [StatusCode::MOVED_PERMANENTLY, StatusCode::FOUND].contains(&status) {
+            info!("301 or 302");
+            let host = req_header.headers["X-Forwarded-Host"].to_str().unwrap();
+            req_header.uri.host().unwrap_or("");
+            let location = upstream_response
+                .headers
+                .get("Location")
+                .map(|e| e.to_str().unwrap_or(""))
+                .unwrap_or("");
+
+            info!("upstream_host: {}", upstream_host);
+            info!("host: {}", host);
+            info!("location: {}", location);
+            info!(
+                "replaced location: {}",
+                location.replace(upstream_host, format!("{}/{}", host, prefix).as_str())
+            );
+
+            let _ = upstream_response.insert_header(
+                "Location",
+                location.replace(upstream_host, format!("{}/{}", host, prefix).as_str()),
+            );
+        }
+        // if (res.statusCode == 301 || res.statusCode == 302) {
+        // 	res.setHeader('Location', `${data.proxyUrl}${res.getHeader('Location').toString().replace(serviceAccessUrlSuffix + '/', '')}`)
+        // }
         Ok(())
-
-        //         let req_header = session.req_header_mut();
-
-        //         if !req_header.headers.contains_key(FORWARD_PATH_HEADER) {
-        //             info!("!headers.contains_key(FORWARD_PATH_HEADER)");
-        //             return Ok(());
-        //         }
-
-        //         let prefix = req_header.headers[FORWARD_PATH_HEADER].to_str().unwrap();
-
-        //         let upstream_host = req_header.headers["Host"].to_str().unwrap();
-        //         let status = upstream_response.status;
-
-        //         if [StatusCode::MOVED_PERMANENTLY, StatusCode::FOUND].contains(&status) {
-        //             info!("301 or 302");
-        //             let host = req_header.headers["X-Forwarded-Host"].to_str().unwrap();
-        //             req_header.uri.host().unwrap_or("");
-        //             let location = upstream_response
-        //                 .headers
-        //                 .get("Location")
-        //                 .map(|e| e.to_str().unwrap_or(""))
-        //                 .unwrap_or("");
-
-        //             info!("upstream_host: {}", upstream_host);
-        //             info!("host: {}", host);
-        //             info!("location: {}", location);
-        //             info!(
-        //                 "replaced location: {}",
-        //                 location.replace(upstream_host, format!("{}/{}", host, prefix).as_str())
-        //             );
-
-        //             let _ = upstream_response.insert_header(
-        //                 "Location",
-        //                 location.replace(upstream_host, format!("{}/{}", host, prefix).as_str()),
-        //             );
-        //         }
-        //         // if (res.statusCode == 301 || res.statusCode == 302) {
-        //         // 	res.setHeader('Location', `${data.proxyUrl}${res.getHeader('Location').toString().replace(serviceAccessUrlSuffix + '/', '')}`)
-        //         // }
-        //         Ok(())
     }
 
     fn response_body_filter(
@@ -256,6 +264,8 @@ impl ProxyHttp for DynamicGateway {
         }
 
         let prefix = prefix.unwrap().to_string();
+
+        info!("prefix: {}", prefix);
 
         let mut e = match ctx.map.get_mut(&prefix) {
             Some(e) => e,
