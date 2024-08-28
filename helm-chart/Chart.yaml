@@ -1,6 +1,6 @@
 apiVersion: v2
 name: pingora-reverse-proxy
-description: A Helm chart for Kubernetes
+description: Dynamic Reverse Proxy using pingora & redis-rs & axum
 
 # A chart can be either an 'application' or a 'library' chart.
 #
