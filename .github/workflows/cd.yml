@@ -33,3 +33,26 @@ jobs:
 
           docker tag $IMAGE_NAME $IMAGE_ID:$VERSION
           docker push $IMAGE_ID:$VERSION
+
+  deploy-github-pages:
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: write
+      contents: read
+    needs: build-and-push-container-image
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v2
+
+      - name: tar & index helm chart
+        run: |
+          helm package ./helm-chart
+          helm repo index .
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
