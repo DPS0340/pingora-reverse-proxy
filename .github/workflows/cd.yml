@@ -5,12 +5,14 @@ on:
 env:
   IMAGE_NAME: pingora-reverse-proxy
 
+permissions:
+  pages: write
+  contents: read
+  id-token: write
+
 jobs:
   build-and-push-container-image:
     runs-on: ubuntu-24.04
-    permissions:
-      packages: write
-      contents: read
     steps:
       - name: checkout
         uses: actions/checkout@v2
@@ -36,9 +38,6 @@ jobs:
 
   deploy-github-pages:
     runs-on: ubuntu-24.04
-    permissions:
-      packages: write
-      contents: read
     needs: build-and-push-container-image
     environment:
       name: github-pages
