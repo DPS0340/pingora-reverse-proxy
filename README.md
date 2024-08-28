@@ -1,5 +1,7 @@
 # pingora-reverse-proxy
 
+[![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/pingora-reverse-proxy)](https://artifacthub.io/packages/search?repo=pingora-reverse-proxy)
+
 > Dynamic Reverse Proxy using pingora & redis-rs & axum
 
 ## Run
