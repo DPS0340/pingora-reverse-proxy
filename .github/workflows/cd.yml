@@ -50,7 +50,12 @@ jobs:
       - name: tar & index helm chart
         run: |
           helm package ./helm-chart
-          helm repo index .
+          helm repo index ./
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v3.0.1
+        with:
+          path: ./
 
       - name: Deploy to GitHub Pages
         id: deployment
