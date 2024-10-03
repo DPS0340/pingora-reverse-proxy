@@ -17,4 +17,11 @@ RUST_LOG=debug cargo run
 - [ ] Implement mgmt api
 - [x] Implement Image build actions (CD)
 - [ ] Implement helm chart & Integrate cluster develop tool e.g. devspace
-- [ ] Implement Decompress -> Modify -> Compress Response body
+- [ ] Implement Decompress -> Modify -> Compress Response body with various encodings
+    - [x] identity
+    - [ ] gzip
+    - [ ] compress
+    - [ ] deflate
+    - [ ] br
+    - [ ] zstd
+    - [ ] *
