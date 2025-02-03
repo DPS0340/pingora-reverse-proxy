@@ -6,7 +6,6 @@ use mgmt_api::{get_app, get_listener};
 use pingora_core::server::Server;
 use pingora_proxy::http_proxy_service;
 use proxy::DynamicGateway;
-use tokio::runtime::Runtime;
 
 fn main() {
     env_logger::init();
@@ -23,16 +22,20 @@ fn main() {
 
     server.add_service(svc);
 
-    let rt = Runtime::new().unwrap();
+    let binding = pingora_runtime::Runtime::new_steal(8, "pingora-reverse-proxy");
+    let rt = binding.get_handle();
 
     let app = get_app();
     let listener = get_listener();
 
     // Serve pingora server and mgmt api
     let (_e1, _e2) = rt.block_on(async {
-        let mgmt_server = axum::serve(listener.await, app.await.clone());
-        tokio::join!(async { mgmt_server.await.unwrap() }, async {
-            server.run_forever()
-        })
+        tokio::join!(
+            async {
+                let mgmt_server = axum::serve(listener.await, app.await.clone());
+                mgmt_server.await.unwrap()
+            },
+            async { server.run_forever() }
+        )
     });
 }

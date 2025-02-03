@@ -1,4 +1,3 @@
-use axum::serve::Serve;
 use axum::{routing::get, Router};
 use tokio::net::TcpListener;
 use tokio::sync::OnceCell;
