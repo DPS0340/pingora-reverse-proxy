@@ -18,6 +18,7 @@ RUST_LOG=debug cargo run
 - [x] Implement Image build actions (CD)
 - [ ] Implement helm chart & Integrate cluster develop tool e.g. devspace
 - [ ] Implement Decompress -> Modify -> Compress Response body with various encodings
+    - See [Content-Encoding](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Encoding) !
     - [x] identity
     - [ ] gzip
     - [ ] compress
