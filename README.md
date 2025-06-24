@@ -1,6 +1,6 @@
 # pingora-reverse-proxy
 
-[![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/packages/helm/pipeline-operator-dps0340-fork/pipeline-operator)](https://artifacthub.io/packages/helm/pipeline-operator-dps0340-fork/pipeline-operator)
+[![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/pingora-reverse-proxy)](https://artifacthub.io/packages/helm/pingora-reverse-proxy/pingora-reverse-proxy)
 
 > Dynamic Reverse Proxy using pingora & redis-rs & axum
 
