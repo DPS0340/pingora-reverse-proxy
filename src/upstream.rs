@@ -429,8 +429,6 @@ pub fn rewrite_location<B, R>(
             let _ = parsed.set_scheme(protocol);
         }
     }
-    let _ = parsed.set_username("");
-    let _ = parsed.set_password(None);
     let value =
         HeaderValue::from_str(parsed.as_str()).map_err(|_| ProxyRequestError::InvalidLocation)?;
     response.headers_mut().insert(LOCATION, value);
@@ -467,7 +465,7 @@ fn url_host(url: &Url) -> Option<String> {
 }
 
 fn whatwg_scheme(value: &str) -> Option<&str> {
-    let scheme = value.strip_suffix(':').unwrap_or(value);
+    let scheme = value.split_once(':').map_or(value, |(scheme, _)| scheme);
     let mut bytes = scheme.bytes();
     bytes.next()?.is_ascii_alphabetic().then_some(())?;
     bytes

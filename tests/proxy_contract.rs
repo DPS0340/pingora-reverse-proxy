@@ -534,7 +534,7 @@ fn uri_redirect_rewrite_requires_matching_target_host_and_redirect_status() {
 }
 
 #[test]
-fn uri_redirect_matches_host_and_port_without_exposing_userinfo() {
+fn uri_redirect_matches_host_and_port_and_preserves_location_userinfo() {
     let target =
         Target::parse(&Url::parse("http://target-user:target-pass@upstream.example:8080").unwrap())
             .unwrap();
@@ -554,7 +554,7 @@ fn uri_redirect_matches_host_and_port_without_exposing_userinfo() {
 
     assert_eq!(
         response.headers()[LOCATION],
-        "https://upstream.example:8080/next"
+        "https://redirect-user:redirect-pass@upstream.example:8080/next"
     );
 }
 
@@ -598,7 +598,7 @@ fn uri_protocol_rewrite_does_not_require_host_and_follows_whatwg_setter() {
     rewrite_location(&mut response, &request, &target, &opts).unwrap();
     assert_eq!(
         response.headers()[LOCATION],
-        "http://upstream.example:8080/next"
+        "ftp://upstream.example:8080/next"
     );
 }
 
