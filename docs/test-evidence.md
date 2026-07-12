@@ -194,3 +194,70 @@ cargo check --all-targets --all-features
 ```
 
 All three exited `0`. No dependency was added.
+
+## Task 5 final supervisor findings RED
+
+The lifecycle/overflow contracts were compiled before production changes:
+
+```bash
+cargo test --test store_contract --no-run
+```
+
+Exit code: `101`. The expected failures were the missing
+`DETACHED_MUTATION_DIAGNOSTIC_CAPACITY` export and missing
+`MutationDrainOutcome::{dropped_detached_failures,dropped_detached_panics}`
+fields.
+
+The process-hook contract was then run before installing the hook:
+
+```bash
+cargo test --test store_contract process_panic_hook_redacts_payload_for_live_and_detached_mutations -- --exact --nocapture
+```
+
+Exit code: `101`. The subprocess stderr did not contain the required fixed
+`process panic redacted at ...` evidence, proving the default hook still exposed
+the panic path before the fix.
+
+## Task 5 final supervisor findings GREEN
+
+The focused store contract suite passed after the handle-free RAII tracker,
+256-entry diagnostic ring, race-safe drain loop, and once-only process hook were
+implemented:
+
+```bash
+cargo test --test store_contract -- --nocapture
+```
+
+Exit code: `0`; `34 passed`, `0 failed`. The panic tests emitted only fixed
+redaction text with `tests/store_contract.rs` line/column evidence. The
+subprocess assertion also proved its secret payload sentinel was absent while
+live and detached callers received fixed route-put panic errors.
+
+The high-case-count compatibility matrix passed:
+
+```bash
+PROPTEST_CASES=2048 cargo test --test api_contract --test config_contract --test route_properties --test store_contract -- --nocapture
+```
+
+Exit code: `0`. Results: API `33 passed`, config `26 passed`, route `11 passed`,
+store `34 passed`; no failures, ignores, or filtered tests.
+
+The full all-target/all-feature suite also passed with `PROPTEST_CASES=2048`:
+
+```bash
+PROPTEST_CASES=2048 cargo test --all-targets --all-features -- --nocapture
+```
+
+Exit code: `0`; the same `104` integration contracts passed, with both unit-test
+targets reporting no unit tests and no failures.
+
+Final quality gates:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo check --all-targets --all-features
+```
+
+All three exited `0`. `git diff --check` also exited `0`. No dependency was
+added.

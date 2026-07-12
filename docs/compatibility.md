@@ -14,18 +14,30 @@ service-level contract tests land.
 ## Route mutation lifecycle
 
 Accepted `add`, `put`, activity-update, and delete operations are owned by the
-route registry, not by an individual HTTP request future. The registry tracks
-every mutation task and its active count. Cancelling a request drops only its
-result receiver; persistence and immutable-snapshot reconciliation continue.
+route registry, not by an individual HTTP request future. A task-owned RAII
+guard tracks only the active count; the registry deliberately retains no Tokio
+task handles. Cancelling a request drops only its result receiver; persistence
+and immutable-snapshot reconciliation continue.
 `RouteRegistry::drain_mutations(timeout)` provides the bounded shutdown
 boundary, returning whether it timed out, the remaining active count, and any
 detached backend failures or task panics accumulated since the previous drain.
-Panic diagnostics contain only the operation kind and fixed text, while debug
+Detached diagnostics use one 256-entry oldest-first eviction ring. Each drain
+consumes the entries and per-kind dropped counts present at that instant exactly
+once; still-active tasks report later outcomes to the next drain. Panic
+diagnostics contain only the operation kind and fixed text, while debug
 formatting redacts detached backend error text.
+
+Creating the first route registry installs a once-only process-wide panic hook.
+This is a deliberate security policy: it replaces any prior hook and emits only
+fixed redaction text plus the panic's compile-time source file, line, and column,
+never the payload or its `Debug` representation. The hook is never temporarily
+swapped, so concurrent mutation panics cannot race with hook restoration.
 
 Task 8 shutdown must stop accepting management requests, call this bounded
 drain and surface its outcome, and only then allow the Tokio runtime to
 terminate. A timeout is reported but does not cancel the pending mutation.
+An already-inactive zero-duration drain succeeds; an active zero-duration drain
+reports timeout only while its final locked active observation remains nonzero.
 
 | CHP long option | Classification | Configuration behavior and contract test |
 |---|---|---|

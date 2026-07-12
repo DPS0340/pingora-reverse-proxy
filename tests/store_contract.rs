@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::process::Command;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -7,7 +8,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use pingora_reverse_proxy::route::{RouteData, RouteKey};
-use pingora_reverse_proxy::route_table::{MutationOperation, RouteMatch, RouteRegistry};
+use pingora_reverse_proxy::route_table::{
+    MutationOperation, RouteMatch, RouteRegistry, DETACHED_MUTATION_DIAGNOSTIC_CAPACITY,
+};
 use pingora_reverse_proxy::store::memory::MemoryStore;
 use pingora_reverse_proxy::store::{Store, StoreError};
 use proptest::prelude::*;
@@ -1015,7 +1018,9 @@ impl Store for SupervisedPutStore {
                 Ok(())
             }
             SupervisedPutOutcome::Error => Err(StoreError::message("detached backend failure")),
-            SupervisedPutOutcome::Panic => panic!("sensitive panic payload must not escape"),
+            SupervisedPutOutcome::Panic => {
+                panic!("SUPERVISOR_PANIC_SECRET_SENTINEL_7d69f58e")
+            }
         }
     }
 
@@ -1026,6 +1031,73 @@ impl Store for SupervisedPutStore {
     async fn delete(&self, _key: &RouteKey) -> Result<Option<RouteData>, StoreError> {
         Err(StoreError::message("unused delete"))
     }
+}
+
+#[test]
+fn process_panic_hook_redacts_payload_for_live_and_detached_mutations() {
+    const CHILD_ENV: &str = "ROUTE_MUTATION_PANIC_HOOK_CHILD";
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "panic_hook_subprocess_child_receives_fixed_mutation_errors",
+            "--nocapture",
+        ])
+        .env(CHILD_ENV, "1")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "child test failed");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("process panic redacted at "));
+    assert!(stderr.contains("tests/store_contract.rs:"));
+    assert!(!stderr.contains("SUPERVISOR_PANIC_SECRET_SENTINEL_7d69f58e"));
+}
+
+#[test]
+fn panic_hook_subprocess_child_receives_fixed_mutation_errors() {
+    if std::env::var_os("ROUTE_MUTATION_PANIC_HOOK_CHILD").is_none() {
+        return;
+    }
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let live_store = Arc::new(SupervisedPutStore::new(SupervisedPutOutcome::Panic));
+        let live_registry = RouteRegistry::load(live_store.clone()).await.unwrap();
+        let live = tokio::spawn({
+            let registry = Arc::clone(&live_registry);
+            async move {
+                registry
+                    .put(key("/hook-live"), route("http://hook-live.example"))
+                    .await
+            }
+        });
+        live_store.entered.acquire().await.unwrap().forget();
+        live_store.release.add_permits(1);
+        assert_eq!(
+            live.await.unwrap().unwrap_err().to_string(),
+            "route put mutation task panicked"
+        );
+
+        let detached_store = Arc::new(SupervisedPutStore::new(SupervisedPutOutcome::Panic));
+        let detached_registry = RouteRegistry::load(detached_store.clone()).await.unwrap();
+        start_and_cancel_supervised_put(
+            &detached_registry,
+            &detached_store,
+            key("/hook-detached"),
+            route("http://hook-detached.example"),
+        )
+        .await;
+        detached_store.release.add_permits(1);
+        let drained = detached_registry
+            .drain_mutations(Duration::from_secs(1))
+            .await;
+        assert!(!drained.timed_out);
+        assert_eq!(drained.detached_panics.len(), 1);
+        assert_eq!(
+            drained.detached_panics[0].message,
+            "route put mutation task panicked"
+        );
+    });
 }
 
 async fn start_and_cancel_supervised_put(
@@ -1073,6 +1145,10 @@ async fn cancelled_caller_later_store_error_is_surfaced_by_drain() {
         route("http://error.example"),
     )
     .await;
+    let while_active = registry.drain_mutations(Duration::ZERO).await;
+    assert!(while_active.timed_out);
+    assert_eq!(while_active.active_mutations, 1);
+    assert!(while_active.detached_failures.is_empty());
     store.release.add_permits(1);
 
     let drained = registry.drain_mutations(Duration::from_secs(1)).await;
@@ -1161,6 +1237,126 @@ async fn drain_times_out_while_backend_pending_then_succeeds_after_release() {
     let drained = registry.drain_mutations(Duration::from_secs(1)).await;
     assert!(!drained.timed_out);
     assert_eq!(drained.active_mutations, 0);
+}
+
+#[tokio::test]
+async fn zero_duration_drain_distinguishes_inactive_from_active() {
+    let inactive = RouteRegistry::load(memory_store()).await.unwrap();
+    let drained = inactive.drain_mutations(Duration::ZERO).await;
+    assert!(!drained.timed_out);
+    assert_eq!(drained.active_mutations, 0);
+
+    let store = Arc::new(SupervisedPutStore::new(SupervisedPutOutcome::Success));
+    let active = RouteRegistry::load(store.clone()).await.unwrap();
+    start_and_cancel_supervised_put(
+        &active,
+        &store,
+        key("/zero-active"),
+        route("http://zero-active.example"),
+    )
+    .await;
+
+    let timed_out = active.drain_mutations(Duration::ZERO).await;
+    assert!(timed_out.timed_out);
+    assert_eq!(timed_out.active_mutations, 1);
+
+    store.release.add_permits(1);
+    assert!(
+        !active
+            .drain_mutations(Duration::from_secs(1))
+            .await
+            .timed_out
+    );
+}
+
+#[tokio::test]
+async fn completion_at_drain_deadline_never_reports_timeout_with_zero_active() {
+    for index in 0..128 {
+        let store = Arc::new(SupervisedPutStore::new(SupervisedPutOutcome::Success));
+        let registry = RouteRegistry::load(store.clone()).await.unwrap();
+        start_and_cancel_supervised_put(
+            &registry,
+            &store,
+            key(&format!("/deadline/{index}")),
+            route("http://deadline.example"),
+        )
+        .await;
+
+        let release = tokio::spawn({
+            let store = Arc::clone(&store);
+            async move {
+                tokio::task::yield_now().await;
+                store.release.add_permits(1);
+            }
+        });
+        let outcome = registry.drain_mutations(Duration::ZERO).await;
+        assert!(!(outcome.timed_out && outcome.active_mutations == 0));
+        release.await.unwrap();
+        if outcome.active_mutations != 0 {
+            let completed = registry.drain_mutations(Duration::from_secs(1)).await;
+            assert!(!completed.timed_out);
+            assert_eq!(completed.active_mutations, 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn detached_diagnostics_are_bounded_and_consumed_once() {
+    let total = DETACHED_MUTATION_DIAGNOSTIC_CAPACITY + 37;
+    let store = Arc::new(SupervisedPutStore::new(SupervisedPutOutcome::Error));
+    let registry = RouteRegistry::load(store.clone()).await.unwrap();
+    let callers: Vec<_> = (0..total)
+        .map(|index| {
+            let registry = Arc::clone(&registry);
+            tokio::spawn(async move {
+                registry
+                    .put(
+                        key(&format!("/overflow/{index}")),
+                        route("http://overflow.example"),
+                    )
+                    .await
+            })
+        })
+        .collect();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let outcome = registry.drain_mutations(Duration::ZERO).await;
+            if outcome.active_mutations == total {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    for caller in &callers {
+        caller.abort();
+    }
+    for caller in callers {
+        assert!(caller.await.unwrap_err().is_cancelled());
+    }
+    store.release.add_permits(total);
+
+    let drained = registry.drain_mutations(Duration::from_secs(5)).await;
+    assert!(!drained.timed_out);
+    assert_eq!(drained.active_mutations, 0);
+    assert_eq!(
+        drained.detached_failures.len() + drained.detached_panics.len(),
+        DETACHED_MUTATION_DIAGNOSTIC_CAPACITY
+    );
+    assert_eq!(
+        drained.dropped_detached_failures,
+        total - DETACHED_MUTATION_DIAGNOSTIC_CAPACITY
+    );
+    assert_eq!(drained.dropped_detached_panics, 0);
+
+    let consumed = registry.drain_mutations(Duration::ZERO).await;
+    assert!(!consumed.timed_out);
+    assert!(consumed.detached_failures.is_empty());
+    assert!(consumed.detached_panics.is_empty());
+    assert_eq!(consumed.dropped_detached_failures, 0);
+    assert_eq!(consumed.dropped_detached_panics, 0);
 }
 
 #[tokio::test]

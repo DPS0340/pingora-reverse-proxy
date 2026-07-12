@@ -483,15 +483,20 @@ git commit -m "feat: add CHP-compatible route management API"
 
 #### Task 5 final acceptance finding: supervised mutation lifecycle
 
-The registry owns and tracks every `add`, `put`, activity-update, and delete
-task. Caller cancellation drops only the response receiver. The shared
-supervisor observes every terminal backend result or panic, records detached
-diagnostics without mutation data or panic payloads, decrements active count,
-and wakes bounded `drain_mutations(timeout)` waiters. Live callers retain exact
-backend `Result` behavior, with a fixed operation-specific `StoreError` for a
-task panic. Contract tests cover cancelled success and failure, panic, timeout
-and later release, concurrent drain, unavailable-runtime spawn failure, runtime
-shutdown cancellation, and registry lifetime release.
+The registry owns every `add`, `put`, activity-update, and delete task without
+retaining task handles. A task-owned RAII guard accounts for completion, panic
+unwind, runtime cancellation, and future drop. Caller cancellation drops only
+the response receiver. The shared supervisor observes every terminal backend
+result or panic, retains at most 256 detached diagnostics with surfaced
+per-kind overflow counts, decrements active count, and wakes bounded
+`drain_mutations(timeout)` waiters. The once-only process panic hook redacts
+payloads before `catch_unwind` while retaining safe source location. Live
+callers retain exact backend `Result` behavior, with a fixed operation-specific
+`StoreError` for a task panic. Contract tests cover cancelled success and
+failure, panic-hook stderr redaction, zero-duration and deadline races,
+diagnostic overflow and one-shot consumption, concurrent drain,
+unavailable-runtime spawn failure, runtime shutdown cancellation, and registry
+lifetime release.
 
 ### Task 6: URI Construction, Header Policy, and Upstream Peer Selection
 

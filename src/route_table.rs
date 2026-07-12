@@ -1,10 +1,10 @@
 //! Immutable, segment-indexed route matching.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, Once};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -12,10 +12,28 @@ use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
 use tokio::sync::{oneshot, Mutex, Notify};
-use tokio::task::JoinHandle;
 
 use crate::route::{RouteData, RouteKey};
 use crate::store::{Store, StoreError};
+
+static INSTALL_REDACTED_PANIC_HOOK: Once = Once::new();
+
+fn install_redacted_panic_hook() {
+    INSTALL_REDACTED_PANIC_HOOK.call_once(|| {
+        std::panic::set_hook(Box::new(|panic_info| {
+            if let Some(location) = panic_info.location() {
+                eprintln!(
+                    "process panic redacted at {}:{}:{}",
+                    location.file(),
+                    location.line(),
+                    location.column()
+                );
+            } else {
+                eprintln!("process panic redacted at unknown source location");
+            }
+        }));
+    });
+}
 
 #[derive(Clone, Debug, Default)]
 struct Node {
@@ -125,18 +143,40 @@ pub struct MutationDrainOutcome {
     pub active_mutations: usize,
     pub detached_failures: Vec<DetachedMutationFailure>,
     pub detached_panics: Vec<DetachedMutationPanic>,
+    /// Detached backend failures discarded when the diagnostic ring overflowed.
+    pub dropped_detached_failures: usize,
+    /// Detached panics discarded when the diagnostic ring overflowed.
+    pub dropped_detached_panics: usize,
 }
 
-#[derive(Default)]
+/// Maximum detached mutation diagnostics retained between drains.
+///
+/// The single shared ring bounds total diagnostic retention across failures and
+/// panics. On overflow, the oldest entry is discarded and counted in the next
+/// drain outcome.
+pub const DETACHED_MUTATION_DIAGNOSTIC_CAPACITY: usize = 256;
+
+enum DetachedMutationDiagnostic {
+    Failure(DetachedMutationFailure),
+    Panic(DetachedMutationPanic),
+}
+
 struct MutationTrackerState {
     active: usize,
-    handles: Vec<TrackedMutation>,
-    detached_failures: Vec<DetachedMutationFailure>,
-    detached_panics: Vec<DetachedMutationPanic>,
+    diagnostics: VecDeque<DetachedMutationDiagnostic>,
+    dropped_detached_failures: usize,
+    dropped_detached_panics: usize,
 }
 
-struct TrackedMutation {
-    handle: JoinHandle<()>,
+impl Default for MutationTrackerState {
+    fn default() -> Self {
+        Self {
+            active: 0,
+            diagnostics: VecDeque::with_capacity(DETACHED_MUTATION_DIAGNOSTIC_CAPACITY),
+            dropped_detached_failures: 0,
+            dropped_detached_panics: 0,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -158,10 +198,6 @@ impl MutationTracker {
         state.active = state.active.saturating_add(1);
     }
 
-    fn track(&self, handle: JoinHandle<()>) {
-        self.state().handles.push(TrackedMutation { handle });
-    }
-
     fn finish(
         &self,
         failure: Option<DetachedMutationFailure>,
@@ -171,10 +207,10 @@ impl MutationTracker {
             let mut state = self.state();
             state.active = state.active.saturating_sub(1);
             if let Some(failure) = failure {
-                state.detached_failures.push(failure);
+                state.push_diagnostic(DetachedMutationDiagnostic::Failure(failure));
             }
             if let Some(panic) = panic {
-                state.detached_panics.push(panic);
+                state.push_diagnostic(DetachedMutationDiagnostic::Panic(panic));
             }
         }
         self.changed.notify_waiters();
@@ -184,27 +220,68 @@ impl MutationTracker {
         self.state().active
     }
 
-    async fn wait_until_inactive(&self) {
+    async fn wait_until_inactive(&self, timeout: Duration) -> bool {
+        if self.active() == 0 {
+            return false;
+        }
+        let deadline = tokio::time::sleep(timeout);
+        tokio::pin!(deadline);
         loop {
             let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
             if self.active() == 0 {
-                return;
+                return false;
             }
-            changed.await;
+            tokio::select! {
+                _ = &mut deadline => return true,
+                _ = &mut changed => {}
+            }
         }
     }
 
-    fn outcome(&self, timed_out: bool) -> MutationDrainOutcome {
+    fn outcome(&self, deadline_elapsed: bool) -> MutationDrainOutcome {
         let mut state = self.state();
-        state
-            .handles
-            .retain(|tracked| !tracked.handle.is_finished());
-        MutationDrainOutcome {
-            timed_out,
-            active_mutations: state.active,
-            detached_failures: std::mem::take(&mut state.detached_failures),
-            detached_panics: std::mem::take(&mut state.detached_panics),
+        let mut detached_failures = Vec::new();
+        let mut detached_panics = Vec::new();
+        for diagnostic in state.diagnostics.drain(..) {
+            match diagnostic {
+                DetachedMutationDiagnostic::Failure(failure) => {
+                    detached_failures.push(failure);
+                }
+                DetachedMutationDiagnostic::Panic(panic) => detached_panics.push(panic),
+            }
         }
+        let dropped_detached_failures = std::mem::take(&mut state.dropped_detached_failures);
+        let dropped_detached_panics = std::mem::take(&mut state.dropped_detached_panics);
+        MutationDrainOutcome {
+            timed_out: deadline_elapsed && state.active != 0,
+            active_mutations: state.active,
+            detached_failures,
+            detached_panics,
+            dropped_detached_failures,
+            dropped_detached_panics,
+        }
+    }
+}
+
+impl MutationTrackerState {
+    fn push_diagnostic(&mut self, diagnostic: DetachedMutationDiagnostic) {
+        if self.diagnostics.len() == DETACHED_MUTATION_DIAGNOSTIC_CAPACITY {
+            if let Some(dropped) = self.diagnostics.pop_front() {
+                match dropped {
+                    DetachedMutationDiagnostic::Failure(_) => {
+                        self.dropped_detached_failures =
+                            self.dropped_detached_failures.saturating_add(1);
+                    }
+                    DetachedMutationDiagnostic::Panic(_) => {
+                        self.dropped_detached_panics =
+                            self.dropped_detached_panics.saturating_add(1);
+                    }
+                }
+            }
+        }
+        self.diagnostics.push_back(diagnostic);
     }
 }
 
@@ -216,6 +293,7 @@ struct ActiveMutation {
 
 impl ActiveMutation {
     fn new(tracker: Arc<MutationTracker>, operation: MutationOperation) -> Self {
+        tracker.start();
         Self {
             tracker,
             operation,
@@ -350,6 +428,7 @@ impl RouteRegistry {
     /// Because persisted snapshots do not contain runtime mutation history,
     /// initial matcher precedence is deterministic ascending `RouteKey` order.
     pub async fn load(store: Arc<dyn Store>) -> Result<Arc<Self>, StoreError> {
+        install_redacted_panic_hook();
         let routes = store.snapshot().await?;
         Ok(Arc::new(Self {
             store,
@@ -476,17 +555,8 @@ impl RouteRegistry {
     /// Detached diagnostics are returned once and consumed by this call. A
     /// timeout does not cancel pending mutations; a later drain can finish them.
     pub async fn drain_mutations(&self, timeout: Duration) -> MutationDrainOutcome {
-        let timed_out = tokio::time::timeout(timeout, async {
-            self.mutations.wait_until_inactive().await;
-            // Completion accounting is the task's final synchronous action.
-            // Yield once so completed handles can transition to `is_finished`
-            // before the tracker prunes them without detaching pending work.
-            tokio::task::yield_now().await;
-        })
-        .await
-        .is_err();
-
-        self.mutations.outcome(timed_out)
+        let deadline_elapsed = self.mutations.wait_until_inactive(timeout).await;
+        self.mutations.outcome(deadline_elapsed)
     }
 
     async fn run_mutation<T, F>(
@@ -505,42 +575,45 @@ impl RouteRegistry {
             ))
         })?;
         let (response, receiver) = oneshot::channel();
-        self.mutations.start();
         let active = ActiveMutation::new(Arc::clone(&self.mutations), operation);
-        let handle = runtime.spawn(async move {
-            match CatchUnwindFuture::new(mutation).await {
-                Ok(result) => {
-                    let detached_error = result.as_ref().err().cloned();
-                    let (acknowledged, acknowledgment) = oneshot::channel();
-                    let detached = match response.send(MutationResponse {
-                        result,
-                        acknowledged,
-                    }) {
-                        Ok(()) => acknowledgment.await.is_err(),
-                        Err(_) => true,
-                    };
-                    let detached_failure = detached_error
-                        .filter(|_| detached)
-                        .map(|error| DetachedMutationFailure { operation, error });
-                    active.finish(detached_failure, None);
+        let spawned = catch_unwind(AssertUnwindSafe(|| {
+            runtime.spawn(async move {
+                match CatchUnwindFuture::new(mutation).await {
+                    Ok(result) => {
+                        let detached_error = result.as_ref().err().cloned();
+                        let (acknowledged, acknowledgment) = oneshot::channel();
+                        let detached = match response.send(MutationResponse {
+                            result,
+                            acknowledged,
+                        }) {
+                            Ok(()) => acknowledgment.await.is_err(),
+                            Err(_) => true,
+                        };
+                        let detached_failure = detached_error
+                            .filter(|_| detached)
+                            .map(|error| DetachedMutationFailure { operation, error });
+                        active.finish(detached_failure, None);
+                    }
+                    Err(()) => {
+                        let message = operation.panic_message();
+                        let (acknowledged, acknowledgment) = oneshot::channel();
+                        let detached = match response.send(MutationResponse {
+                            result: Err(StoreError::message(message.clone())),
+                            acknowledged,
+                        }) {
+                            Ok(()) => acknowledgment.await.is_err(),
+                            Err(_) => true,
+                        };
+                        let detached_panic =
+                            detached.then_some(DetachedMutationPanic { operation, message });
+                        active.finish(None, detached_panic);
+                    }
                 }
-                Err(()) => {
-                    let message = operation.panic_message();
-                    let (acknowledged, acknowledgment) = oneshot::channel();
-                    let detached = match response.send(MutationResponse {
-                        result: Err(StoreError::message(message.clone())),
-                        acknowledged,
-                    }) {
-                        Ok(()) => acknowledgment.await.is_err(),
-                        Err(_) => true,
-                    };
-                    let detached_panic =
-                        detached.then_some(DetachedMutationPanic { operation, message });
-                    active.finish(None, detached_panic);
-                }
-            }
-        });
-        self.mutations.track(handle);
+            })
+        }));
+        if let Ok(handle) = spawned {
+            drop(handle);
+        }
 
         let response = receiver.await.map_err(|_| {
             StoreError::message(format!(
