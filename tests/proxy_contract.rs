@@ -1,8 +1,15 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::net::{SocketAddr as StdSocketAddr, TcpListener as StdTcpListener};
 use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
+use async_trait::async_trait;
+use clap::Parser;
 use http::header::{CONNECTION, HOST, LOCATION, UPGRADE};
 use http::{HeaderMap, HeaderValue, Request, Response, StatusCode, Uri};
 use openssl::asn1::Asn1Time;
@@ -15,12 +22,775 @@ use pingora::tls::{
 use proptest::prelude::*;
 use url::Url;
 
+use axum::body::Bytes;
+use axum::extract::Request as AxumRequest;
+use axum::response::IntoResponse;
+use axum::routing::any as any_route;
+use axum::Router;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::oneshot;
+
+use pingora_reverse_proxy::activity::ActivityWriter;
 use pingora_reverse_proxy::config::ProxyOptions;
+use pingora_reverse_proxy::config::{AppConfig, Cli};
+use pingora_reverse_proxy::proxy::ChpProxy;
+use pingora_reverse_proxy::route::RouteData;
 use pingora_reverse_proxy::route::RouteKey;
+use pingora_reverse_proxy::route_table::RouteRegistry;
+use pingora_reverse_proxy::store::memory::MemoryStore;
+use pingora_reverse_proxy::store::{Store, StoreError};
 use pingora_reverse_proxy::upstream::{
     apply_forwarded_headers, apply_request_headers, build_upstream_uri, rewrite_location,
     ForwardedContext, Target, TargetError, TlsClientConfig, UpstreamRoute,
 };
+
+struct ReservedPort {
+    listener: Option<StdTcpListener>,
+    address: StdSocketAddr,
+}
+
+impl ReservedPort {
+    fn new() -> Self {
+        let listener = StdTcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        Self {
+            listener: Some(listener),
+            address,
+        }
+    }
+
+    fn release(&mut self) -> StdSocketAddr {
+        drop(self.listener.take());
+        self.address
+    }
+}
+
+struct EchoServer {
+    address: StdSocketAddr,
+    shutdown: Option<oneshot::Sender<()>>,
+}
+
+impl EchoServer {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown, stopped) = oneshot::channel();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().fallback(any_route(move |request: AxumRequest| async move {
+                    let (parts, body) = request.into_parts();
+                    if parts.uri.path().ends_with("/redirect") {
+                        return (
+                            StatusCode::MOVED_PERMANENTLY,
+                            [(LOCATION, format!("http://{address}/next"))],
+                            "",
+                        )
+                            .into_response();
+                    }
+                    let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+                    let response = serde_json::json!({
+                        "method": parts.method.as_str(),
+                        "uri": parts.uri.to_string(),
+                        "host": parts.headers.get(HOST).and_then(|value| value.to_str().ok()),
+                        "x_custom": parts.headers.get("x-custom").and_then(|value| value.to_str().ok()),
+                        "x_forwarded_for": parts.headers.get("x-forwarded-for").and_then(|value| value.to_str().ok()),
+                        "x_forwarded_port": parts.headers.get("x-forwarded-port").and_then(|value| value.to_str().ok()),
+                        "x_forwarded_proto": parts.headers.get("x-forwarded-proto").and_then(|value| value.to_str().ok()),
+                        "x_forwarded_host": parts.headers.get("x-forwarded-host").and_then(|value| value.to_str().ok()),
+                        "body": String::from_utf8_lossy(&body),
+                    });
+                    (
+                        [
+                            ("content-type", "application/json"),
+                            ("content-encoding", "identity"),
+                            ("x-disallowed", "secret"),
+                        ],
+                        response.to_string(),
+                    )
+                        .into_response()
+                })),
+            )
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+        });
+        Self {
+            address,
+            shutdown: Some(shutdown),
+        }
+    }
+
+    fn target(&self, path: &str) -> String {
+        format!("http://{}{path}", self.address)
+    }
+}
+
+impl Drop for EchoServer {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+    }
+}
+
+struct ProxyProcess {
+    child: Child,
+    base_url: String,
+}
+
+impl ProxyProcess {
+    async fn start(extra_args: &[String]) -> Self {
+        let mut reservation = ReservedPort::new();
+        let address = reservation.release();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pingora-reverse-proxy"))
+            .args([
+                "--ip",
+                "127.0.0.1",
+                "--port",
+                &address.port().to_string(),
+                "--api-port",
+                &address.port().saturating_add(1).to_string(),
+            ])
+            .args(extra_args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let base_url = format!("http://{address}");
+        let client = reqwest::Client::new();
+        for _ in 0..100 {
+            if client
+                .get(format!("{base_url}/_chp_healthz"))
+                .send()
+                .await
+                .is_ok()
+            {
+                return Self { child, base_url };
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("proxy binary did not begin listening on its reserved port");
+    }
+
+    async fn get(&self, path: &str) -> reqwest::Response {
+        reqwest::Client::new()
+            .get(format!("{}{path}", self.base_url))
+            .send()
+            .await
+            .unwrap()
+    }
+}
+
+impl Drop for ProxyProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+struct TestShutdown(Arc<AtomicBool>);
+
+#[async_trait]
+impl pingora::server::ShutdownSignalWatch for TestShutdown {
+    async fn recv(&self) -> pingora::server::ShutdownSignal {
+        while !self.0.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        pingora::server::ShutdownSignal::FastShutdown
+    }
+}
+
+struct ProxyHarness {
+    registry: Arc<RouteRegistry>,
+    activity: ActivityWriter,
+    base_url: String,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl ProxyHarness {
+    async fn start(arguments: &[String], routes: &[(&str, String)]) -> Self {
+        let mut reservation = ReservedPort::new();
+        let address = reservation.address;
+        let mut argv = vec![
+            "proxy-test".to_owned(),
+            "--ip".to_owned(),
+            "127.0.0.1".to_owned(),
+            "--port".to_owned(),
+            address.port().to_string(),
+            "--api-port".to_owned(),
+            address.port().saturating_add(1).to_string(),
+        ];
+        argv.extend_from_slice(arguments);
+        let config = AppConfig::try_from(Cli::try_parse_from(argv).unwrap()).unwrap();
+        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let registry = RouteRegistry::load(store).await.unwrap();
+        for (key, target) in routes {
+            registry
+                .add(
+                    RouteKey::parse(key).unwrap(),
+                    target.clone(),
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let activity = ActivityWriter::start(Arc::clone(&registry), 1);
+        let proxy =
+            ChpProxy::from_config(Arc::clone(&registry), &config, activity.clone()).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        reservation.release();
+        let thread = std::thread::spawn(move || {
+            let mut server = pingora::server::Server::new(None).unwrap();
+            server.bootstrap();
+            let mut service = pingora::proxy::http_proxy_service(&server.configuration, proxy);
+            service.add_tcp(&address.to_string());
+            server.add_service(service);
+            server.run(pingora::server::RunArgs {
+                shutdown_signal: Box::new(TestShutdown(thread_stop)),
+            });
+        });
+        let base_url = format!("http://{address}");
+        let client = reqwest::Client::new();
+        for _ in 0..100 {
+            if client
+                .get(format!("{base_url}/_chp_healthz"))
+                .send()
+                .await
+                .is_ok()
+            {
+                return Self {
+                    registry,
+                    activity,
+                    base_url,
+                    stop,
+                    thread: Some(thread),
+                };
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        stop.store(true, Ordering::Release);
+        let _ = thread.join();
+        panic!("in-process Pingora server did not begin listening");
+    }
+
+    async fn request(&self, request: reqwest::RequestBuilder) -> reqwest::Response {
+        request.send().await.unwrap()
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}{path}", self.base_url)
+    }
+
+    fn route(&self, key: &str) -> RouteData {
+        self.registry
+            .get(&RouteKey::parse(key).unwrap())
+            .expect("route exists")
+    }
+
+    async fn wait_for_activity_after(&self, key: &str, before: chrono::DateTime<chrono::Utc>) {
+        for _ in 0..100 {
+            if self.route(key).last_activity > before {
+                self.activity.flush().await;
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("activity for {key} was not observed");
+    }
+}
+
+impl Drop for ProxyHarness {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+struct ChunkedUpstream {
+    address: StdSocketAddr,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ChunkedUpstream {
+    async fn start(chunks: Vec<&'static [u8]>) -> Self {
+        Self::start_with_delay(chunks, Duration::from_millis(15)).await
+    }
+
+    async fn start_with_delay(chunks: Vec<&'static [u8]>, chunk_delay: Duration) -> Self {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            for chunk in chunks {
+                stream
+                    .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                    .await
+                    .unwrap();
+                stream.write_all(chunk).await.unwrap();
+                stream.write_all(b"\r\n").await.unwrap();
+                stream.flush().await.unwrap();
+                tokio::time::sleep(chunk_delay).await;
+            }
+            stream.write_all(b"0\r\n\r\n").await.unwrap();
+        });
+        Self { address, task }
+    }
+
+    fn target(&self) -> String {
+        format!("http://{}", self.address)
+    }
+}
+
+impl Drop for ChunkedUpstream {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[tokio::test]
+async fn network_binary_proxies_default_route_and_health_takes_precedence() {
+    let upstream = EchoServer::start().await;
+    let proxy =
+        ProxyProcess::start(&["--default-target".to_owned(), upstream.target("/base/")]).await;
+
+    let response = proxy.get("/tree?q=%2F").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["uri"], "/base/tree?q=%2F");
+
+    let response = proxy.get("/_chp_healthz").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[http::header::CONTENT_TYPE],
+        "application/json"
+    );
+    assert_eq!(
+        response.bytes().await.unwrap(),
+        Bytes::from_static(br#"{"status":"OK"}"#)
+    );
+}
+
+#[tokio::test]
+async fn network_binary_without_route_returns_404() {
+    let proxy = ProxyProcess::start(&[]).await;
+    let response = proxy.get("/missing").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.text().await.unwrap(), "Not Found");
+}
+
+#[tokio::test]
+async fn network_registered_route_streams_request_and_applies_forwarding_policy() {
+    let upstream = EchoServer::start().await;
+    let harness = ProxyHarness::start(
+        &[
+            "--no-include-prefix".to_owned(),
+            "--change-origin".to_owned(),
+            "--custom-header".to_owned(),
+            "x-custom: configured".to_owned(),
+        ],
+        &[("/external", upstream.target("/base/"))],
+    )
+    .await;
+    let before = harness.route("/external").last_activity;
+    let url = Url::parse(&harness.url("/external/tree?q=%2F")).unwrap();
+    let address = (url.host_str().unwrap(), url.port().unwrap());
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    let host = format!("{}:{}", url.host_str().unwrap(), url.port().unwrap());
+    stream
+        .write_all(
+            format!(
+                "POST /external/tree?q=%2F HTTP/1.1\r\nHost: {host}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    for chunk in [b"streamed-".as_slice(), b"request".as_slice()] {
+        stream
+            .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+            .await
+            .unwrap();
+        stream.write_all(chunk).await.unwrap();
+        stream.write_all(b"\r\n").await.unwrap();
+        stream.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    stream.write_all(b"0\r\n\r\n").await.unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    let body_offset = response
+        .windows(4)
+        .position(|bytes| bytes == b"\r\n\r\n")
+        .unwrap()
+        + 4;
+    let body: serde_json::Value = serde_json::from_slice(&response[body_offset..]).unwrap();
+    assert_eq!(body["uri"], "/base/tree?q=%2F");
+    assert_eq!(body["body"], "streamed-request");
+    assert_eq!(body["host"], upstream.address.to_string());
+    assert_eq!(body["x_custom"], "configured");
+    assert_eq!(body["x_forwarded_proto"], "http");
+    assert_eq!(body["x_forwarded_port"], url.port().unwrap().to_string());
+    assert_eq!(body["x_forwarded_host"], host);
+    assert!(body["x_forwarded_for"]
+        .as_str()
+        .unwrap()
+        .starts_with("127.0.0.1"));
+    harness.wait_for_activity_after("/external", before).await;
+}
+
+#[tokio::test]
+async fn network_streams_chunked_response_and_reuses_downstream_keepalive() {
+    let upstream = EchoServer::start().await;
+    let harness = ProxyHarness::start(&[], &[("/", upstream.target("/"))]).await;
+    let client = reqwest::Client::new();
+    for _ in 0..2 {
+        let response = harness.request(client.get(harness.url("/keepalive"))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[CONNECTION], "keep-alive");
+    }
+
+    let chunked = ChunkedUpstream::start(vec![b"streamed ", b"response"]).await;
+    let chunked_harness = ProxyHarness::start(&[], &[("/", chunked.target())]).await;
+    let response = chunked_harness
+        .request(reqwest::Client::new().get(chunked_harness.url("/chunks")))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.bytes().await.unwrap(),
+        Bytes::from_static(b"streamed response")
+    );
+}
+
+#[tokio::test]
+async fn network_stream_activity_is_observable_before_response_finishes() {
+    let upstream =
+        ChunkedUpstream::start_with_delay(vec![b"first", b"last"], Duration::from_millis(250))
+            .await;
+    let harness = ProxyHarness::start(&[], &[("/stream", upstream.target())]).await;
+    let before = harness.route("/stream").last_activity;
+    let mut response = harness
+        .request(reqwest::Client::new().get(harness.url("/stream")))
+        .await;
+
+    assert_eq!(response.chunk().await.unwrap().unwrap(), "first");
+    assert!(
+        harness.route("/stream").last_activity > before,
+        "stream activity must publish before the final chunk and logging callback"
+    );
+}
+
+#[tokio::test]
+async fn network_unavailable_upstream_is_503_without_activity_and_health_wins() {
+    let mut unavailable = ReservedPort::new();
+    let target = format!("http://{}", unavailable.release());
+    let harness = ProxyHarness::start(
+        &[],
+        &[("/missing", target.clone()), ("/_chp_healthz", target)],
+    )
+    .await;
+    let before_missing = harness.route("/missing").last_activity;
+    let before_health = harness.route("/_chp_healthz").last_activity;
+
+    let response = harness
+        .request(reqwest::Client::new().get(harness.url("/missing/path")))
+        .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(harness.route("/missing").last_activity, before_missing);
+
+    let response = harness
+        .request(reqwest::Client::new().get(harness.url("/_chp_healthz")))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap(),
+        serde_json::json!({"status":"OK"})
+    );
+    assert_eq!(harness.route("/_chp_healthz").last_activity, before_health);
+}
+
+#[tokio::test]
+async fn network_redirects_are_untouched_by_default_and_rewritten_when_enabled() {
+    let upstream = EchoServer::start().await;
+    let no_redirects = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let untouched = ProxyHarness::start(
+        &["--no-include-prefix".to_owned()],
+        &[("/external", upstream.target("/"))],
+    )
+    .await;
+    let response = untouched
+        .request(no_redirects.get(untouched.url("/external/redirect")))
+        .await;
+    assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(
+        response.headers()[LOCATION],
+        format!("http://{}/next", upstream.address)
+    );
+
+    let rewritten = ProxyHarness::start(
+        &[
+            "--no-include-prefix".to_owned(),
+            "--auto-rewrite".to_owned(),
+            "--protocol-rewrite".to_owned(),
+            "https".to_owned(),
+        ],
+        &[("/external", upstream.target("/"))],
+    )
+    .await;
+    let before = rewritten.route("/external").last_activity;
+    let response = rewritten
+        .request(no_redirects.get(rewritten.url("/external/redirect")))
+        .await;
+    assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+    let public = Url::parse(&rewritten.base_url).unwrap();
+    assert_eq!(
+        response.headers()[LOCATION],
+        format!("https://127.0.0.1:{}/next", public.port().unwrap())
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(rewritten.route("/external").last_activity, before);
+}
+
+#[tokio::test]
+async fn network_custom_and_file_errors_follow_chp_fallback_policy() {
+    let error_server = EchoServer::start().await;
+    let custom = ProxyHarness::start(
+        &["--error-target".to_owned(), error_server.target("/errors/")],
+        &[],
+    )
+    .await;
+    let response = custom
+        .request(reqwest::Client::new().get(custom.url("/missing?q=%2F")))
+        .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.headers()["content-type"], "application/json");
+    assert_eq!(response.headers()["content-encoding"], "identity");
+    assert!(!response.headers().contains_key("x-disallowed"));
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["method"], "GET");
+    assert_eq!(body["uri"], "/errors/404?url=%2Fmissing%3Fq%3D%252F");
+
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(directory.path().join("404.html"), "specific 404").unwrap();
+    fs::write(directory.path().join("error.html"), "generic error").unwrap();
+    let files = ProxyHarness::start(
+        &[
+            "--error-path".to_owned(),
+            directory.path().to_string_lossy().into_owned(),
+        ],
+        &[],
+    )
+    .await;
+    let response = files
+        .request(reqwest::Client::new().get(files.url("/missing")))
+        .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.headers()["content-type"], "text/html");
+    assert_eq!(response.text().await.unwrap(), "specific 404");
+
+    fs::remove_file(directory.path().join("404.html")).unwrap();
+    let response = files
+        .request(reqwest::Client::new().get(files.url("/missing")))
+        .await;
+    assert_eq!(response.text().await.unwrap(), "generic error");
+    fs::remove_file(directory.path().join("error.html")).unwrap();
+    let response = files
+        .request(reqwest::Client::new().get(files.url("/missing")))
+        .await;
+    assert_eq!(response.text().await.unwrap(), "Not Found");
+
+    let mut unavailable = ReservedPort::new();
+    let unavailable_target = format!("http://{}", unavailable.release());
+    let unavailable_files = ProxyHarness::start(
+        &[
+            "--error-path".to_owned(),
+            directory.path().to_string_lossy().into_owned(),
+        ],
+        &[("/unavailable", unavailable_target)],
+    )
+    .await;
+    let response = unavailable_files
+        .request(reqwest::Client::new().get(unavailable_files.url("/unavailable")))
+        .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.text().await.unwrap(), "Service Unavailable");
+}
+
+#[tokio::test]
+async fn network_typed_internal_errors_are_500_and_custom_failure_uses_reason_phrase() {
+    let invalid = ProxyHarness::start(&[], &[("/invalid", "not a URL".to_owned())]).await;
+    let before = invalid.route("/invalid").last_activity;
+    let response = invalid
+        .request(reqwest::Client::new().get(invalid.url("/invalid")))
+        .await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(response.text().await.unwrap(), "Internal Server Error");
+    assert_eq!(invalid.route("/invalid").last_activity, before);
+
+    let mut unavailable = ReservedPort::new();
+    let errors = ProxyHarness::start(
+        &[
+            "--error-target".to_owned(),
+            format!("http://{}/", unavailable.release()),
+        ],
+        &[],
+    )
+    .await;
+    let response = errors
+        .request(reqwest::Client::new().get(errors.url("/missing")))
+        .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.text().await.unwrap(), "Not Found");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn network_unix_custom_error_target_uses_get_and_copies_only_content_headers() {
+    let directory = tempfile::tempdir().unwrap();
+    let socket_path = directory.path().join("errors.sock");
+    let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+    let (request_tx, request_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = vec![0; 4096];
+        let count = stream.read(&mut request).await.unwrap();
+        let _ = request_tx.send(String::from_utf8_lossy(&request[..count]).into_owned());
+        stream
+            .write_all(
+                b"HTTP/1.1 418 Teapot\r\nContent-Type: text/plain\r\nContent-Encoding: identity\r\nX-Disallowed: secret\r\nContent-Length: 10\r\nConnection: close\r\n\r\nunix error",
+            )
+            .await
+            .unwrap();
+    });
+    let encoded_socket = socket_path.to_string_lossy().replace('/', "%2F");
+    let harness = ProxyHarness::start(
+        &[
+            "--error-target".to_owned(),
+            format!("http+unix://{encoded_socket}/errors/"),
+        ],
+        &[],
+    )
+    .await;
+    let response = harness
+        .request(reqwest::Client::new().get(harness.url("/missing?q=%2F")))
+        .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.headers()["content-type"], "text/plain");
+    assert_eq!(response.headers()["content-encoding"], "identity");
+    assert!(!response.headers().contains_key("x-disallowed"));
+    assert_eq!(response.text().await.unwrap(), "unix error");
+    let request = request_rx.await.unwrap();
+    assert!(request.starts_with("GET /errors/404?url=%2Fmissing%3Fq%3D%252F HTTP/1.1\r\n"));
+    server.await.unwrap();
+}
+
+struct FailingActivityStore {
+    routes: tokio::sync::RwLock<BTreeMap<RouteKey, RouteData>>,
+    attempts: AtomicUsize,
+}
+
+#[async_trait]
+impl Store for FailingActivityStore {
+    async fn snapshot(&self) -> Result<BTreeMap<RouteKey, RouteData>, StoreError> {
+        Ok(self.routes.read().await.clone())
+    }
+
+    async fn add(
+        &self,
+        key: RouteKey,
+        target: String,
+        extra: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<RouteData, StoreError> {
+        let data = RouteData {
+            target,
+            last_activity: chrono::Utc::now(),
+            extra,
+        };
+        self.routes.write().await.insert(key, data.clone());
+        Ok(data)
+    }
+
+    async fn put(&self, key: RouteKey, data: RouteData) -> Result<(), StoreError> {
+        self.routes.write().await.insert(key, data);
+        Ok(())
+    }
+
+    async fn update_activity(
+        &self,
+        _key: &RouteKey,
+        _at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), StoreError> {
+        self.attempts.fetch_add(1, Ordering::Relaxed);
+        Err(StoreError::message("activity persistence unavailable"))
+    }
+
+    async fn delete(&self, key: &RouteKey) -> Result<Option<RouteData>, StoreError> {
+        Ok(self.routes.write().await.remove(key))
+    }
+}
+
+#[tokio::test]
+async fn activity_memory_update_is_immediate_coalesced_and_survives_persistence_failure() {
+    let key = RouteKey::parse("/activity").unwrap();
+    let initial = chrono::Utc::now() - chrono::Duration::minutes(1);
+    let store = Arc::new(FailingActivityStore {
+        routes: tokio::sync::RwLock::new(BTreeMap::from([(
+            key.clone(),
+            RouteData {
+                target: "http://upstream.example".to_owned(),
+                last_activity: initial,
+                extra: serde_json::Map::from_iter([(
+                    "unknown".to_owned(),
+                    serde_json::json!({"preserved": true}),
+                )]),
+            },
+        )])),
+        attempts: AtomicUsize::new(0),
+    });
+    let registry = RouteRegistry::load(store.clone()).await.unwrap();
+    let writer = ActivityWriter::start(Arc::clone(&registry), 1);
+    let first = initial + chrono::Duration::seconds(1);
+    let newest = initial + chrono::Duration::seconds(3);
+
+    writer.record_at(&key, first);
+    writer.record_at(&key, initial + chrono::Duration::seconds(2));
+    writer.record_at(&key, newest);
+
+    let observed = registry.get(&key).unwrap();
+    assert_eq!(observed.last_activity, newest);
+    assert_eq!(
+        observed.extra["unknown"],
+        serde_json::json!({"preserved": true})
+    );
+    writer.flush().await;
+    assert_eq!(store.attempts.load(Ordering::Relaxed), 1);
+    assert_eq!(writer.persistence_errors(), 1);
+    assert_eq!(registry.get(&key).unwrap().last_activity, newest);
+}
 
 fn options(include_prefix: bool, prepend_path: bool) -> ProxyOptions {
     ProxyOptions {

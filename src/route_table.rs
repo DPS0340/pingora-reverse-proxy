@@ -573,6 +573,40 @@ impl RouteRegistry {
         self.snapshot.load().resolve(request_path)
     }
 
+    /// Publish an observed activity timestamp before persistence is attempted.
+    ///
+    /// This is intentionally separate from [`Self::update_activity`], whose
+    /// persistence-first contract is used by management mutations. The proxy
+    /// data plane uses this method so a completed request is immediately
+    /// observable even when best-effort activity persistence later fails.
+    pub fn observe_activity(&self, key: &RouteKey, at: DateTime<Utc>) -> bool {
+        loop {
+            let current = self.snapshot.load_full();
+            let mut routes = current.routes.clone();
+            let Some(existing) = routes.by_key.get(key) else {
+                return false;
+            };
+            if existing.last_activity >= at {
+                return false;
+            }
+            routes.update_activity(key, at);
+            let next = Arc::new(RouteSnapshot::from_ordered_routes(routes));
+            let previous = self.snapshot.compare_and_swap(&current, next);
+            if Arc::ptr_eq(&current, &previous) {
+                return true;
+            }
+        }
+    }
+
+    /// Persist a previously observed proxy activity timestamp.
+    pub async fn persist_observed_activity(
+        &self,
+        key: &RouteKey,
+        at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        self.store.update_activity(key, at).await
+    }
+
     /// Persist a route replacement and publish it atomically on success.
     pub async fn put(self: &Arc<Self>, key: RouteKey, data: RouteData) -> Result<(), StoreError> {
         let registry = Arc::clone(self);
