@@ -11,6 +11,8 @@ pub struct MetricsSnapshot {
     pub api_route_get: u64,
     pub api_route_add: u64,
     pub api_route_delete: u64,
+    pub activity_persistence_failures: u64,
+    pub activity_dropped: u64,
 }
 
 /// Process metrics used by request handlers.
@@ -20,6 +22,8 @@ pub struct Metrics {
     api_route_get: AtomicU64,
     api_route_add: AtomicU64,
     api_route_delete: AtomicU64,
+    activity_persistence_failures: AtomicU64,
+    activity_dropped: AtomicU64,
 }
 
 impl Metrics {
@@ -47,6 +51,15 @@ impl Metrics {
         self.api_route_delete.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_activity_persistence_failure(&self) {
+        self.activity_persistence_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_activity_drop(&self) {
+        self.activity_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Return stable values for contract tests and future metric rendering.
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
@@ -58,6 +71,10 @@ impl Metrics {
             api_route_get: self.api_route_get.load(Ordering::Relaxed),
             api_route_add: self.api_route_add.load(Ordering::Relaxed),
             api_route_delete: self.api_route_delete.load(Ordering::Relaxed),
+            activity_persistence_failures: self
+                .activity_persistence_failures
+                .load(Ordering::Relaxed),
+            activity_dropped: self.activity_dropped.load(Ordering::Relaxed),
         }
     }
 }

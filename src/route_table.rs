@@ -617,10 +617,8 @@ impl RouteRegistry {
     }
 
     async fn put_owned(&self, key: RouteKey, data: RouteData) -> Result<(), StoreError> {
-        let mut routes = self.snapshot.load().routes.clone();
         self.store.put(key.clone(), data.clone()).await?;
-        routes.replace(key, data);
-        self.publish(routes);
+        self.merge_and_publish(|routes| routes.replace(key.clone(), data.clone()));
         Ok(())
     }
 
@@ -644,10 +642,8 @@ impl RouteRegistry {
         target: String,
         extra: Map<String, Value>,
     ) -> Result<(), StoreError> {
-        let mut routes = self.snapshot.load().routes.clone();
         let data = self.store.add(key.clone(), target, extra).await?;
-        routes.replace(key, data);
-        self.publish(routes);
+        self.merge_and_publish(|routes| routes.replace(key.clone(), data.clone()));
         Ok(())
     }
 
@@ -670,10 +666,8 @@ impl RouteRegistry {
         key: RouteKey,
         at: DateTime<Utc>,
     ) -> Result<(), StoreError> {
-        let mut routes = self.snapshot.load().routes.clone();
         self.store.update_activity(&key, at).await?;
-        routes.update_activity(&key, at);
-        self.publish(routes);
+        self.merge_and_publish(|routes| routes.update_activity(&key, at));
         Ok(())
     }
 
@@ -688,16 +682,22 @@ impl RouteRegistry {
     }
 
     async fn delete_owned(&self, key: RouteKey) -> Result<Option<RouteData>, StoreError> {
-        let mut routes = self.snapshot.load().routes.clone();
         let deleted = self.store.delete(&key).await?;
-        routes.remove(&key);
-        self.publish(routes);
+        self.merge_and_publish(|routes| routes.remove(&key));
         Ok(deleted)
     }
 
-    fn publish(&self, routes: OrderedRoutes) {
-        self.snapshot
-            .store(Arc::new(RouteSnapshot::from_ordered_routes(routes)));
+    fn merge_and_publish(&self, mut apply: impl FnMut(&mut OrderedRoutes)) {
+        loop {
+            let current = self.snapshot.load_full();
+            let mut routes = current.routes.clone();
+            apply(&mut routes);
+            let next = Arc::new(RouteSnapshot::from_ordered_routes(routes));
+            let previous = self.snapshot.compare_and_swap(&current, next);
+            if Arc::ptr_eq(&current, &previous) {
+                return;
+            }
+        }
     }
 
     /// Seal mutation admission and wait at most `timeout` for accepted work.

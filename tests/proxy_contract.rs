@@ -13,6 +13,9 @@ use clap::Parser;
 use http::header::{CONNECTION, HOST, LOCATION, UPGRADE};
 use http::{HeaderMap, HeaderValue, Request, Response, StatusCode, Uri};
 use openssl::asn1::Asn1Time;
+use openssl::bn::{BigNum, MsbOption};
+use openssl::rsa::Rsa;
+use openssl::ssl::{SslAcceptor, SslMethod};
 use pingora::protocols::l4::socket::SocketAddr;
 use pingora::tls::{
     hash::MessageDigest,
@@ -33,6 +36,7 @@ use tokio::sync::oneshot;
 use pingora_reverse_proxy::activity::ActivityWriter;
 use pingora_reverse_proxy::config::ProxyOptions;
 use pingora_reverse_proxy::config::{AppConfig, Cli};
+use pingora_reverse_proxy::metrics::Metrics;
 use pingora_reverse_proxy::proxy::ChpProxy;
 use pingora_reverse_proxy::route::RouteData;
 use pingora_reverse_proxy::route::RouteKey;
@@ -82,6 +86,15 @@ impl EchoServer {
                 listener,
                 Router::new().fallback(any_route(move |request: AxumRequest| async move {
                     let (parts, body) = request.into_parts();
+                    let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+                    if parts.uri.path().ends_with("/redirect-body") {
+                        return (
+                            StatusCode::FOUND,
+                            [(LOCATION, format!("http://{address}/next"))],
+                            "redirect traffic",
+                        )
+                            .into_response();
+                    }
                     if parts.uri.path().ends_with("/redirect") {
                         return (
                             StatusCode::MOVED_PERMANENTLY,
@@ -90,7 +103,6 @@ impl EchoServer {
                         )
                             .into_response();
                     }
-                    let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
                     let response = serde_json::json!({
                         "method": parts.method.as_str(),
                         "uri": parts.uri.to_string(),
@@ -100,6 +112,9 @@ impl EchoServer {
                         "x_forwarded_port": parts.headers.get("x-forwarded-port").and_then(|value| value.to_str().ok()),
                         "x_forwarded_proto": parts.headers.get("x-forwarded-proto").and_then(|value| value.to_str().ok()),
                         "x_forwarded_host": parts.headers.get("x-forwarded-host").and_then(|value| value.to_str().ok()),
+                        "connection": parts.headers.get(CONNECTION).and_then(|value| value.to_str().ok()),
+                        "upgrade": parts.headers.get(UPGRADE).and_then(|value| value.to_str().ok()),
+                        "x_custom_hop": parts.headers.get("x-custom-hop").and_then(|value| value.to_str().ok()),
                         "body": String::from_utf8_lossy(&body),
                     });
                     (
@@ -138,6 +153,27 @@ impl Drop for EchoServer {
     }
 }
 
+async fn exact_health_ready(client: &reqwest::Client, base_url: &str) -> bool {
+    let Ok(Ok(response)) = tokio::time::timeout(
+        Duration::from_millis(250),
+        client.get(format!("{base_url}/_chp_healthz")).send(),
+    )
+    .await
+    else {
+        return false;
+    };
+    if response.status() != StatusCode::OK
+        || response.headers().get(http::header::CONTENT_TYPE)
+            != Some(&HeaderValue::from_static("application/json"))
+    {
+        return false;
+    }
+    matches!(
+        tokio::time::timeout(Duration::from_millis(250), response.bytes()).await,
+        Ok(Ok(body)) if body == Bytes::from_static(br#"{"status":"OK"}"#)
+    )
+}
+
 struct ProxyProcess {
     child: Child,
     base_url: String,
@@ -145,38 +181,39 @@ struct ProxyProcess {
 
 impl ProxyProcess {
     async fn start(extra_args: &[String]) -> Self {
-        let mut reservation = ReservedPort::new();
-        let address = reservation.release();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_pingora-reverse-proxy"))
-            .args([
-                "--ip",
-                "127.0.0.1",
-                "--port",
-                &address.port().to_string(),
-                "--api-port",
-                &address.port().saturating_add(1).to_string(),
-            ])
-            .args(extra_args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let base_url = format!("http://{address}");
         let client = reqwest::Client::new();
-        for _ in 0..100 {
-            if client
-                .get(format!("{base_url}/_chp_healthz"))
-                .send()
-                .await
-                .is_ok()
-            {
-                return Self { child, base_url };
+        for _attempt in 0..5 {
+            let mut reservation = ReservedPort::new();
+            let address = reservation.release();
+            let mut child = Command::new(env!("CARGO_BIN_EXE_pingora-reverse-proxy"))
+                .args([
+                    "--ip",
+                    "127.0.0.1",
+                    "--port",
+                    &address.port().to_string(),
+                    "--api-port",
+                    &address.port().saturating_add(1).to_string(),
+                ])
+                .args(extra_args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let base_url = format!("http://{address}");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while tokio::time::Instant::now() < deadline {
+                if exact_health_ready(&client, &base_url).await {
+                    return Self { child, base_url };
+                }
+                if child.try_wait().ok().flatten().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = child.kill();
+            let _ = child.wait();
         }
-        let _ = child.kill();
-        let _ = child.wait();
-        panic!("proxy binary did not begin listening on its reserved port");
+        panic!("proxy binary did not bind and pass its exact health contract after retries");
     }
 
     async fn get(&self, path: &str) -> reqwest::Response {
@@ -217,73 +254,79 @@ struct ProxyHarness {
 
 impl ProxyHarness {
     async fn start(arguments: &[String], routes: &[(&str, String)]) -> Self {
-        let mut reservation = ReservedPort::new();
-        let address = reservation.address;
-        let mut argv = vec![
-            "proxy-test".to_owned(),
-            "--ip".to_owned(),
-            "127.0.0.1".to_owned(),
-            "--port".to_owned(),
-            address.port().to_string(),
-            "--api-port".to_owned(),
-            address.port().saturating_add(1).to_string(),
-        ];
-        argv.extend_from_slice(arguments);
-        let config = AppConfig::try_from(Cli::try_parse_from(argv).unwrap()).unwrap();
-        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
-        let registry = RouteRegistry::load(store).await.unwrap();
-        for (key, target) in routes {
-            registry
-                .add(
-                    RouteKey::parse(key).unwrap(),
-                    target.clone(),
-                    Default::default(),
-                )
-                .await
-                .unwrap();
-        }
-        let activity = ActivityWriter::start(Arc::clone(&registry), 1);
-        let proxy =
-            ChpProxy::from_config(Arc::clone(&registry), &config, activity.clone()).unwrap();
-        let stop = Arc::new(AtomicBool::new(false));
-        let thread_stop = Arc::clone(&stop);
-        reservation.release();
-        let thread = std::thread::spawn(move || {
-            let mut server = pingora::server::Server::new(None).unwrap();
-            server.bootstrap();
-            let mut service = pingora::proxy::http_proxy_service(&server.configuration, proxy);
-            service.add_tcp(&address.to_string());
-            server.add_service(service);
-            server.run(pingora::server::RunArgs {
-                shutdown_signal: Box::new(TestShutdown(thread_stop)),
-            });
-        });
-        let base_url = format!("http://{address}");
         let client = reqwest::Client::new();
-        for _ in 0..100 {
-            if client
-                .get(format!("{base_url}/_chp_healthz"))
-                .send()
-                .await
-                .is_ok()
-            {
-                return Self {
-                    registry,
-                    activity,
-                    base_url,
-                    stop,
-                    thread: Some(thread),
-                };
+        for _attempt in 0..5 {
+            let mut reservation = ReservedPort::new();
+            let address = reservation.address;
+            let mut argv = vec![
+                "proxy-test".to_owned(),
+                "--ip".to_owned(),
+                "127.0.0.1".to_owned(),
+                "--port".to_owned(),
+                address.port().to_string(),
+                "--api-port".to_owned(),
+                address.port().saturating_add(1).to_string(),
+            ];
+            argv.extend_from_slice(arguments);
+            let config = AppConfig::try_from(Cli::try_parse_from(argv).unwrap()).unwrap();
+            let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+            let registry = RouteRegistry::load(store).await.unwrap();
+            for (key, target) in routes {
+                registry
+                    .add(
+                        RouteKey::parse(key).unwrap(),
+                        target.clone(),
+                        Default::default(),
+                    )
+                    .await
+                    .unwrap();
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            let activity = ActivityWriter::start(Arc::clone(&registry), 1);
+            let proxy =
+                ChpProxy::from_config(Arc::clone(&registry), &config, activity.clone()).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread_stop = Arc::clone(&stop);
+            reservation.release();
+            let thread = std::thread::spawn(move || {
+                let mut server = pingora::server::Server::new(None).unwrap();
+                server.bootstrap();
+                let mut service = pingora::proxy::http_proxy_service(&server.configuration, proxy);
+                service.add_tcp(&address.to_string());
+                server.add_service(service);
+                server.run(pingora::server::RunArgs {
+                    shutdown_signal: Box::new(TestShutdown(thread_stop)),
+                });
+            });
+            let base_url = format!("http://{address}");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while tokio::time::Instant::now() < deadline {
+                if exact_health_ready(&client, &base_url).await {
+                    return Self {
+                        registry,
+                        activity,
+                        base_url,
+                        stop,
+                        thread: Some(thread),
+                    };
+                }
+                if thread.is_finished() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            stop.store(true, Ordering::Release);
+            let _ = thread.join();
         }
-        stop.store(true, Ordering::Release);
-        let _ = thread.join();
-        panic!("in-process Pingora server did not begin listening");
+        panic!("in-process Pingora server did not bind and pass exact health after retries");
     }
 
     async fn request(&self, request: reqwest::RequestBuilder) -> reqwest::Response {
         request.send().await.unwrap()
+    }
+
+    async fn get(&self, path: &str) -> reqwest::Response {
+        self.request(reqwest::Client::new().get(self.url(path)))
+            .await
     }
 
     fn url(&self, path: &str) -> String {
@@ -320,6 +363,164 @@ impl Drop for ProxyHarness {
 struct ChunkedUpstream {
     address: StdSocketAddr,
     task: tokio::task::JoinHandle<()>,
+}
+
+struct CustomErrorProbe {
+    address: StdSocketAddr,
+    requests: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl CustomErrorProbe {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let task_requests = Arc::clone(&requests);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                task_requests.fetch_add(1, Ordering::Relaxed);
+                let mut request = [0; 1024];
+                let _ = stream.read(&mut request).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\ncustom error",
+                    )
+                    .await;
+            }
+        });
+        Self {
+            address,
+            requests,
+            task,
+        }
+    }
+
+    fn target(&self) -> String {
+        format!("http://{}/errors/", self.address)
+    }
+
+    fn request_count(&self) -> usize {
+        self.requests.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for CustomErrorProbe {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+struct RawErrorServer {
+    address: StdSocketAddr,
+    request: oneshot::Receiver<String>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl RawErrorServer {
+    async fn start(response: Vec<u8>, delay: Duration) -> Self {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = vec![0; 32 * 1024];
+            let count = stream.read(&mut bytes).await.unwrap();
+            let _ = request_tx.send(String::from_utf8_lossy(&bytes[..count]).into_owned());
+            tokio::time::sleep(delay).await;
+            let _ = stream.write_all(&response).await;
+        });
+        Self {
+            address,
+            request,
+            task,
+        }
+    }
+
+    fn target(&self, suffix: &str) -> String {
+        format!("http://{}{suffix}", self.address)
+    }
+}
+
+async fn partial_response_upstream() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0; 1024];
+        let _ = stream.read(&mut request).await.unwrap();
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\npartial-200",
+            )
+            .await
+            .unwrap();
+    });
+    (format!("http://{address}"), task)
+}
+
+async fn stalled_request_upstream() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0; 1024];
+        let _ = stream.read(&mut request).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    });
+    (format!("http://{address}"), task)
+}
+
+fn https_error_server(response: Vec<u8>) -> (String, JoinHandle<()>) {
+    let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+    let mut name = X509NameBuilder::new().unwrap();
+    name.append_entry_by_text("CN", "localhost").unwrap();
+    let name = name.build();
+    let mut certificate = X509::builder().unwrap();
+    certificate.set_version(2).unwrap();
+    let mut serial = BigNum::new().unwrap();
+    serial.rand(64, MsbOption::MAYBE_ZERO, false).unwrap();
+    let serial = serial.to_asn1_integer().unwrap();
+    certificate.set_serial_number(&serial).unwrap();
+    certificate.set_subject_name(&name).unwrap();
+    certificate.set_issuer_name(&name).unwrap();
+    certificate.set_pubkey(&key).unwrap();
+    certificate
+        .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+        .unwrap();
+    certificate
+        .set_not_after(&Asn1Time::days_from_now(1).unwrap())
+        .unwrap();
+    certificate.sign(&key, MessageDigest::sha256()).unwrap();
+    let certificate = certificate.build();
+    let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
+    acceptor.set_private_key(&key).unwrap();
+    acceptor.set_certificate(&certificate).unwrap();
+    acceptor.check_private_key().unwrap();
+    let acceptor = acceptor.build();
+    let listener = StdTcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let thread = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let Ok(mut stream) = acceptor.accept(stream) else {
+            return;
+        };
+        let mut request = [0; 2048];
+        let _ = std::io::Read::read(&mut stream, &mut request);
+        let _ = std::io::Write::write_all(&mut stream, &response);
+    });
+    (format!("https://{address}/errors/"), thread)
 }
 
 impl ChunkedUpstream {
@@ -369,6 +570,7 @@ impl Drop for ChunkedUpstream {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn network_binary_proxies_default_route_and_health_takes_precedence() {
     let upstream = EchoServer::start().await;
     let proxy =
@@ -392,6 +594,7 @@ async fn network_binary_proxies_default_route_and_health_takes_precedence() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn network_binary_without_route_returns_404() {
     let proxy = ProxyProcess::start(&[]).await;
     let response = proxy.get("/missing").await;
@@ -400,6 +603,7 @@ async fn network_binary_without_route_returns_404() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn network_registered_route_streams_request_and_applies_forwarding_policy() {
     let upstream = EchoServer::start().await;
     let harness = ProxyHarness::start(
@@ -460,6 +664,225 @@ async fn network_registered_route_streams_request_and_applies_forwarding_policy(
 }
 
 #[tokio::test]
+#[serial_test::serial]
+async fn network_request_body_is_forwarded_incrementally_before_downstream_completion() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let (first_tx, first_rx) = oneshot::channel();
+    let upstream = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut received = Vec::new();
+        let mut chunk = [0; 1024];
+        loop {
+            let count = stream.read(&mut chunk).await.unwrap();
+            received.extend_from_slice(&chunk[..count]);
+            if received
+                .windows(b"first".len())
+                .any(|part| part == b"first")
+            {
+                break;
+            }
+        }
+        let _ = first_tx.send(());
+        while !received.windows(5).any(|part| part == b"0\r\n\r\n") {
+            let count = stream.read(&mut chunk).await.unwrap();
+            assert!(count > 0);
+            received.extend_from_slice(&chunk[..count]);
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .unwrap();
+    });
+    let harness =
+        ProxyHarness::start(&[], &[("/stream-request", format!("http://{address}"))]).await;
+    let url = Url::parse(&harness.base_url).unwrap();
+    let mut client = tokio::net::TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
+        .await
+        .unwrap();
+    client
+        .write_all(
+            format!(
+                "POST /stream-request HTTP/1.1\r\nHost: {}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nfirst\r\n",
+                url.authority()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    client.flush().await.unwrap();
+    tokio::time::timeout(Duration::from_millis(500), first_rx)
+        .await
+        .expect("upstream sees the first chunk before the request is complete")
+        .unwrap();
+    client.write_all(b"6\r\nsecond\r\n0\r\n\r\n").await.unwrap();
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).await.unwrap();
+    assert!(response.starts_with(b"HTTP/1.1 200"));
+    upstream.await.unwrap();
+}
+
+async fn read_raw_response(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+    let mut response = Vec::new();
+    let mut chunk = [0; 1024];
+    loop {
+        let count = stream.read(&mut chunk).await.unwrap();
+        assert!(count > 0);
+        response.extend_from_slice(&chunk[..count]);
+        let Some(header_end) = response.windows(4).position(|part| part == b"\r\n\r\n") else {
+            continue;
+        };
+        let headers = std::str::from_utf8(&response[..header_end]).unwrap();
+        let length = headers
+            .lines()
+            .find_map(|line| {
+                line.split_once(':').and_then(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+            })
+            .unwrap();
+        if response.len() >= header_end + 4 + length {
+            return response;
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn network_reuses_the_same_downstream_socket_and_upstream_connection() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let task_accepts = Arc::clone(&accepts);
+    let upstream = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        task_accepts.fetch_add(1, Ordering::Relaxed);
+        let mut buffered = Vec::new();
+        let mut chunk = [0; 1024];
+        for _ in 0..2 {
+            while !buffered.windows(4).any(|part| part == b"\r\n\r\n") {
+                let count = stream.read(&mut chunk).await.unwrap();
+                assert!(count > 0);
+                buffered.extend_from_slice(&chunk[..count]);
+            }
+            let end = buffered
+                .windows(4)
+                .position(|part| part == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            buffered.drain(..end);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok",
+                )
+                .await
+                .unwrap();
+        }
+    });
+    let harness = ProxyHarness::start(&[], &[("/reuse", format!("http://{address}"))]).await;
+    let url = Url::parse(&harness.base_url).unwrap();
+    let mut client = tokio::net::TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
+        .await
+        .unwrap();
+    for index in 0..2 {
+        client
+            .write_all(
+                format!(
+                    "GET /reuse/{index} HTTP/1.1\r\nHost: {}\r\nConnection: keep-alive\r\n\r\n",
+                    url.authority()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let response = read_raw_response(&mut client).await;
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+        assert!(response.ends_with(b"ok"));
+    }
+    upstream.await.unwrap();
+    assert_eq!(accepts.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn network_host_routing_selects_the_host_prefixed_route() {
+    let upstream = EchoServer::start().await;
+    let harness = ProxyHarness::start(
+        &["--host-routing".to_owned()],
+        &[("/example.test/service", upstream.target("/"))],
+    )
+    .await;
+    let response = harness
+        .request(
+            reqwest::Client::new()
+                .get(harness.url("/service/tree"))
+                .header(HOST, "example.test"),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["uri"], "/service/tree");
+
+    let response = harness
+        .request(
+            reqwest::Client::new()
+                .get(harness.url("/service/tree"))
+                .header(HOST, "other.test"),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn network_forwarding_runs_before_custom_headers_and_final_hop_scrub_preserves_websocket() {
+    let upstream = EchoServer::start().await;
+    let harness = ProxyHarness::start(
+        &[
+            "--custom-header".to_owned(),
+            "x-forwarded-for: configured-for".to_owned(),
+            "--custom-header".to_owned(),
+            "x-forwarded-port: 7443".to_owned(),
+            "--custom-header".to_owned(),
+            "x-forwarded-proto: configured-proto".to_owned(),
+            "--custom-header".to_owned(),
+            "x-forwarded-host: configured.example".to_owned(),
+            "--custom-header".to_owned(),
+            "connection: x-custom-hop".to_owned(),
+            "--custom-header".to_owned(),
+            "x-custom-hop: secret".to_owned(),
+            "--custom-header".to_owned(),
+            "upgrade: h2c".to_owned(),
+        ],
+        &[("/headers", upstream.target("/"))],
+    )
+    .await;
+    let response = harness
+        .request(
+            reqwest::Client::new()
+                .get(harness.url("/headers"))
+                .header(CONNECTION, "keep-alive, Upgrade")
+                .header(UPGRADE, "websocket"),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["x_forwarded_for"], "configured-for");
+    assert_eq!(body["x_forwarded_port"], "7443");
+    assert_eq!(body["x_forwarded_proto"], "configured-proto");
+    assert_eq!(body["x_forwarded_host"], "configured.example");
+    assert_eq!(body["connection"], "upgrade");
+    assert_eq!(body["upgrade"], "websocket");
+    assert!(body["x_custom_hop"].is_null());
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn network_streams_chunked_response_and_reuses_downstream_keepalive() {
     let upstream = EchoServer::start().await;
     let harness = ProxyHarness::start(&[], &[("/", upstream.target("/"))]).await;
@@ -483,6 +906,7 @@ async fn network_streams_chunked_response_and_reuses_downstream_keepalive() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn network_stream_activity_is_observable_before_response_finishes() {
     let upstream =
         ChunkedUpstream::start_with_delay(vec![b"first", b"last"], Duration::from_millis(250))
@@ -501,6 +925,41 @@ async fn network_stream_activity_is_observable_before_response_finishes() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
+async fn network_redirect_request_and_response_body_traffic_never_records_activity() {
+    let upstream = EchoServer::start().await;
+    let harness = ProxyHarness::start(
+        &["--no-include-prefix".to_owned()],
+        &[("/redirect", upstream.target("/"))],
+    )
+    .await;
+    let before = harness.route("/redirect").last_activity;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let response = harness
+        .request(
+            client
+                .post(harness.url("/redirect/redirect-body"))
+                .body("request body traffic"),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::FOUND);
+    assert_eq!(response.text().await.unwrap(), "redirect traffic");
+
+    let response = harness
+        .request(client.get(harness.url("/redirect/redirect-body")))
+        .await;
+    assert_eq!(response.status(), StatusCode::FOUND);
+    assert_eq!(response.text().await.unwrap(), "redirect traffic");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(harness.route("/redirect").last_activity, before);
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn network_unavailable_upstream_is_503_without_activity_and_health_wins() {
     let mut unavailable = ReservedPort::new();
     let target = format!("http://{}", unavailable.release());
@@ -531,6 +990,76 @@ async fn network_unavailable_upstream_is_503_without_activity_and_health_wins() 
 }
 
 #[tokio::test]
+#[serial_test::serial]
+async fn network_proxy_failures_never_render_after_response_start_or_downstream_disconnect() {
+    let errors = CustomErrorProbe::start().await;
+    let (upstream, partial_task) = partial_response_upstream().await;
+    let partial = ProxyHarness::start(
+        &["--error-target".to_owned(), errors.target()],
+        &[("/partial", upstream)],
+    )
+    .await;
+    let url = Url::parse(&partial.url("/partial")).unwrap();
+    let mut stream = tokio::net::TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
+        .await
+        .unwrap();
+    stream
+        .write_all(
+            format!(
+                "GET /partial HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                url.authority()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    assert!(response.starts_with(b"HTTP/1.1 200"));
+    assert_eq!(
+        response
+            .windows(b"HTTP/1.1 ".len())
+            .filter(|window| *window == b"HTTP/1.1 ")
+            .count(),
+        1,
+        "a partial success response must not be followed by a second status"
+    );
+    partial_task.await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(errors.request_count(), 0);
+
+    let (upstream, stalled_task) = stalled_request_upstream().await;
+    let disconnected = ProxyHarness::start(
+        &["--error-target".to_owned(), errors.target()],
+        &[("/disconnect", upstream)],
+    )
+    .await;
+    let url = Url::parse(&disconnected.url("/disconnect")).unwrap();
+    let mut stream = tokio::net::TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
+        .await
+        .unwrap();
+    stream
+        .write_all(
+            format!(
+                "POST /disconnect HTTP/1.1\r\nHost: {}\r\nContent-Length: 100\r\n\r\nx",
+                url.authority()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    drop(stream);
+    stalled_task.await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        errors.request_count(),
+        0,
+        "a dead downstream must not trigger custom-error work"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn network_redirects_are_untouched_by_default_and_rewritten_when_enabled() {
     let upstream = EchoServer::start().await;
     let no_redirects = reqwest::Client::builder()
@@ -576,6 +1105,7 @@ async fn network_redirects_are_untouched_by_default_and_rewritten_when_enabled()
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn network_custom_and_file_errors_follow_chp_fallback_policy() {
     let error_server = EchoServer::start().await;
     let custom = ProxyHarness::start(
@@ -641,6 +1171,311 @@ async fn network_custom_and_file_errors_follow_chp_fallback_policy() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
+async fn network_custom_error_redirects_are_not_followed() {
+    let destination = CustomErrorProbe::start().await;
+    let redirect = RawErrorServer::start(
+        format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://{}/escaped\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            destination.address
+        )
+        .into_bytes(),
+        Duration::ZERO,
+    )
+    .await;
+    let harness = ProxyHarness::start(
+        &["--error-target".to_owned(), redirect.target("/errors/")],
+        &[],
+    )
+    .await;
+    let response = harness
+        .request(reqwest::Client::new().get(harness.url("/missing")))
+        .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.text().await.unwrap(), "");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(destination.request_count(), 0);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn network_custom_error_url_preserves_literal_target_shape_and_uri_component_encoding() {
+    for (suffix, expected) in [
+        ("", "/404?url=%2Fspecial%2F!~*()%27%2525"),
+        ("/", "/404?url=%2Fspecial%2F!~*()%27%2525"),
+        ("/base", "/base/404?url=%2Fspecial%2F!~*()%27%2525"),
+        ("/base/", "/base/404?url=%2Fspecial%2F!~*()%27%2525"),
+        (
+            "/base?fixed=1",
+            "/base?fixed=1/404?url=%2Fspecial%2F!~*()%27%2525",
+        ),
+    ] {
+        let server = RawErrorServer::start(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+            Duration::ZERO,
+        )
+        .await;
+        let target = server.target(suffix);
+        let harness = ProxyHarness::start(&["--error-target".to_owned(), target], &[]).await;
+        let url = Url::parse(&harness.base_url).unwrap();
+        let mut stream =
+            tokio::net::TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
+                .await
+                .unwrap();
+        stream
+            .write_all(
+                format!(
+                    "GET /special/!~*()'%25 HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                    url.authority()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 404"));
+        let RawErrorServer { request, task, .. } = server;
+        let request = request.await.unwrap();
+        assert!(
+            request.starts_with(&format!("GET {expected} HTTP/1.1\r\n")),
+            "unexpected custom error request for target suffix {suffix:?}: {request:?}"
+        );
+        task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn network_custom_error_slow_and_oversized_responses_fall_back_within_bounds() {
+    let slow = RawErrorServer::start(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nslow".to_vec(),
+        Duration::from_secs(2),
+    )
+    .await;
+    let harness =
+        ProxyHarness::start(&["--error-target".to_owned(), slow.target("/errors/")], &[]).await;
+    let response = tokio::time::timeout(
+        Duration::from_millis(1500),
+        harness.request(reqwest::Client::new().get(harness.url("/missing"))),
+    )
+    .await
+    .expect("custom errors have an explicit total deadline");
+    assert_eq!(response.text().await.unwrap(), "Not Found");
+
+    let large = vec![b'x'; 1_048_577];
+    let mut fixed = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        large.len()
+    )
+    .into_bytes();
+    fixed.extend_from_slice(&large);
+    let oversized = RawErrorServer::start(fixed, Duration::ZERO).await;
+    let harness = ProxyHarness::start(
+        &["--error-target".to_owned(), oversized.target("/errors/")],
+        &[],
+    )
+    .await;
+    assert_eq!(
+        harness.get("/missing").await.text().await.unwrap(),
+        "Not Found"
+    );
+
+    let mut chunked =
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();
+    chunked.extend_from_slice(format!("{:x}\r\n", large.len()).as_bytes());
+    chunked.extend_from_slice(&large);
+    chunked.extend_from_slice(b"\r\n0\r\n\r\n");
+    let oversized = RawErrorServer::start(chunked, Duration::ZERO).await;
+    let harness = ProxyHarness::start(
+        &["--error-target".to_owned(), oversized.target("/errors/")],
+        &[],
+    )
+    .await;
+    assert_eq!(
+        harness.get("/missing").await.text().await.unwrap(),
+        "Not Found"
+    );
+
+    let oversized_header = format!(
+        "HTTP/1.1 200 OK\r\nX-Oversized: {}\r\nContent-Length: 4\r\nConnection: close\r\n\r\nleak",
+        "h".repeat(20 * 1024)
+    );
+    let oversized = RawErrorServer::start(oversized_header.into_bytes(), Duration::ZERO).await;
+    let harness = ProxyHarness::start(
+        &["--error-target".to_owned(), oversized.target("/errors/")],
+        &[],
+    )
+    .await;
+    assert_eq!(
+        harness.get("/missing").await.text().await.unwrap(),
+        "Not Found"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn network_https_custom_errors_support_insecure_success_and_verified_failure() {
+    let success = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 9\r\nConnection: close\r\n\r\ntls error".to_vec();
+    let (target, server) = https_error_server(success.clone());
+    let harness = ProxyHarness::start(
+        &["--insecure".to_owned(), "--error-target".to_owned(), target],
+        &[],
+    )
+    .await;
+    let response = harness.get("/missing").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.text().await.unwrap(), "tls error");
+    server.join().unwrap();
+
+    let (target, server) = https_error_server(success);
+    let harness = ProxyHarness::start(&["--error-target".to_owned(), target], &[]).await;
+    let response = harness.get("/missing").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.text().await.unwrap(), "Not Found");
+    server.join().unwrap();
+
+    let large = vec![b'x'; 1_048_577];
+    let mut fixed = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        large.len()
+    )
+    .into_bytes();
+    fixed.extend_from_slice(&large);
+    let (target, server) = https_error_server(fixed);
+    let harness = ProxyHarness::start(
+        &["--insecure".to_owned(), "--error-target".to_owned(), target],
+        &[],
+    )
+    .await;
+    assert_eq!(
+        harness.get("/missing").await.text().await.unwrap(),
+        "Not Found"
+    );
+    server.join().unwrap();
+
+    let mut chunked =
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();
+    chunked.extend_from_slice(format!("{:x}\r\n", large.len()).as_bytes());
+    chunked.extend_from_slice(&large);
+    chunked.extend_from_slice(b"\r\n0\r\n\r\n");
+    let (target, server) = https_error_server(chunked);
+    let harness = ProxyHarness::start(
+        &["--insecure".to_owned(), "--error-target".to_owned(), target],
+        &[],
+    )
+    .await;
+    assert_eq!(
+        harness.get("/missing").await.text().await.unwrap(),
+        "Not Found"
+    );
+    server.join().unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial]
+async fn network_error_files_are_bounded_and_cannot_escape_the_configured_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    let outside = tempfile::NamedTempFile::new().unwrap();
+    fs::write(outside.path(), "outside secret").unwrap();
+    std::os::unix::fs::symlink(outside.path(), directory.path().join("404.html")).unwrap();
+    let harness = ProxyHarness::start(
+        &[
+            "--error-path".to_owned(),
+            directory.path().to_string_lossy().into_owned(),
+        ],
+        &[],
+    )
+    .await;
+    assert_eq!(
+        harness.get("/missing").await.text().await.unwrap(),
+        "Not Found"
+    );
+
+    fs::remove_file(directory.path().join("404.html")).unwrap();
+    fs::write(directory.path().join("404.html"), vec![b'x'; 1_048_577]).unwrap();
+    assert_eq!(
+        harness.get("/missing").await.text().await.unwrap(),
+        "Not Found"
+    );
+}
+
+#[cfg(unix)]
+async fn unix_error_server(
+    response: Vec<u8>,
+    delay: Duration,
+) -> (tempfile::TempDir, String, tokio::task::JoinHandle<()>) {
+    let directory = tempfile::tempdir().unwrap();
+    let socket_path = directory.path().join("bounded-errors.sock");
+    let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0; 2048];
+        let _ = stream.read(&mut request).await;
+        tokio::time::sleep(delay).await;
+        let _ = stream.write_all(&response).await;
+    });
+    let encoded = socket_path.to_string_lossy().replace('/', "%2F");
+    (directory, format!("http+unix://{encoded}/errors/"), task)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial]
+async fn network_unix_custom_errors_apply_deadlines_and_fixed_chunked_header_bounds() {
+    let (_directory, target, task) = unix_error_server(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nslow".to_vec(),
+        Duration::from_secs(2),
+    )
+    .await;
+    let harness = ProxyHarness::start(&["--error-target".to_owned(), target], &[]).await;
+    let response = tokio::time::timeout(Duration::from_millis(1500), harness.get("/missing"))
+        .await
+        .expect("Unix custom errors have a total deadline");
+    assert_eq!(response.text().await.unwrap(), "Not Found");
+    task.abort();
+
+    let large = vec![b'x'; 1_048_577];
+    let mut fixed =
+        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", large.len()).into_bytes();
+    fixed.extend_from_slice(&large);
+    let (_directory, target, task) = unix_error_server(fixed, Duration::ZERO).await;
+    let harness = ProxyHarness::start(&["--error-target".to_owned(), target], &[]).await;
+    assert_eq!(
+        harness.get("/missing").await.text().await.unwrap(),
+        "Not Found"
+    );
+    task.await.unwrap();
+
+    let mut chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+    chunked.extend_from_slice(format!("{:x}\r\n", large.len()).as_bytes());
+    chunked.extend_from_slice(&large);
+    chunked.extend_from_slice(b"\r\n0\r\n\r\n");
+    let (_directory, target, task) = unix_error_server(chunked, Duration::ZERO).await;
+    let harness = ProxyHarness::start(&["--error-target".to_owned(), target], &[]).await;
+    assert_eq!(
+        harness.get("/missing").await.text().await.unwrap(),
+        "Not Found"
+    );
+    task.await.unwrap();
+
+    let oversized_header = format!(
+        "HTTP/1.1 200 OK\r\nX-Oversized: {}\r\nContent-Length: 4\r\n\r\nleak",
+        "h".repeat(20 * 1024)
+    );
+    let (_directory, target, task) =
+        unix_error_server(oversized_header.into_bytes(), Duration::ZERO).await;
+    let harness = ProxyHarness::start(&["--error-target".to_owned(), target], &[]).await;
+    assert_eq!(
+        harness.get("/missing").await.text().await.unwrap(),
+        "Not Found"
+    );
+    task.await.unwrap();
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn network_typed_internal_errors_are_500_and_custom_failure_uses_reason_phrase() {
     let invalid = ProxyHarness::start(&[], &[("/invalid", "not a URL".to_owned())]).await;
     let before = invalid.route("/invalid").last_activity;
@@ -650,6 +1485,33 @@ async fn network_typed_internal_errors_are_500_and_custom_failure_uses_reason_ph
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(response.text().await.unwrap(), "Internal Server Error");
     assert_eq!(invalid.route("/invalid").last_activity, before);
+
+    let upstream = EchoServer::start().await;
+    let redirect = ProxyHarness::start(
+        &[
+            "--no-include-prefix".to_owned(),
+            "--auto-rewrite".to_owned(),
+        ],
+        &[("/redirect", upstream.target("/"))],
+    )
+    .await;
+    let url = Url::parse(&redirect.base_url).unwrap();
+    let mut stream = tokio::net::TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
+        .await
+        .unwrap();
+    stream
+        .write_all(
+            b"GET /redirect/redirect HTTP/1.1\r\nHost: bad%host\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    assert!(
+        response.starts_with(b"HTTP/1.1 500"),
+        "an upstream response-filter failure must remain an internal 500: {}",
+        String::from_utf8_lossy(&response)
+    );
 
     let mut unavailable = ReservedPort::new();
     let errors = ProxyHarness::start(
@@ -669,6 +1531,7 @@ async fn network_typed_internal_errors_are_500_and_custom_failure_uses_reason_ph
 
 #[cfg(unix)]
 #[tokio::test]
+#[serial_test::serial]
 async fn network_unix_custom_error_target_uses_get_and_copies_only_content_headers() {
     let directory = tempfile::tempdir().unwrap();
     let socket_path = directory.path().join("errors.sock");
@@ -772,7 +1635,8 @@ async fn activity_memory_update_is_immediate_coalesced_and_survives_persistence_
         attempts: AtomicUsize::new(0),
     });
     let registry = RouteRegistry::load(store.clone()).await.unwrap();
-    let writer = ActivityWriter::start(Arc::clone(&registry), 1);
+    let metrics = Arc::new(Metrics::new());
+    let writer = ActivityWriter::start_with_metrics(Arc::clone(&registry), 1, Arc::clone(&metrics));
     let first = initial + chrono::Duration::seconds(1);
     let newest = initial + chrono::Duration::seconds(3);
 
@@ -789,7 +1653,104 @@ async fn activity_memory_update_is_immediate_coalesced_and_survives_persistence_
     writer.flush().await;
     assert_eq!(store.attempts.load(Ordering::Relaxed), 1);
     assert_eq!(writer.persistence_errors(), 1);
+    assert_eq!(metrics.snapshot().activity_persistence_failures, 1);
     assert_eq!(registry.get(&key).unwrap().last_activity, newest);
+}
+
+struct StalledActivityStore {
+    routes: tokio::sync::RwLock<BTreeMap<RouteKey, RouteData>>,
+    writes: std::sync::Mutex<Vec<(RouteKey, chrono::DateTime<chrono::Utc>)>>,
+    entered: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+
+#[async_trait]
+impl Store for StalledActivityStore {
+    async fn snapshot(&self) -> Result<BTreeMap<RouteKey, RouteData>, StoreError> {
+        Ok(self.routes.read().await.clone())
+    }
+
+    async fn add(
+        &self,
+        _key: RouteKey,
+        _target: String,
+        _extra: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<RouteData, StoreError> {
+        unreachable!("activity test only persists timestamps")
+    }
+
+    async fn put(&self, _key: RouteKey, _data: RouteData) -> Result<(), StoreError> {
+        unreachable!("activity test only persists timestamps")
+    }
+
+    async fn update_activity(
+        &self,
+        key: &RouteKey,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), StoreError> {
+        self.entered.add_permits(1);
+        self.release.acquire().await.unwrap().forget();
+        self.writes.lock().unwrap().push((key.clone(), at));
+        if let Some(route) = self.routes.write().await.get_mut(key) {
+            route.last_activity = at;
+        }
+        Ok(())
+    }
+
+    async fn delete(&self, _key: &RouteKey) -> Result<Option<RouteData>, StoreError> {
+        unreachable!("activity test only persists timestamps")
+    }
+}
+
+#[tokio::test]
+async fn activity_pending_keys_are_bounded_and_recover_with_newest_accepted_timestamp() {
+    let initial = chrono::Utc::now() - chrono::Duration::minutes(1);
+    let keys: Vec<_> = (0..4)
+        .map(|index| RouteKey::parse(&format!("/churn/{index}")).unwrap())
+        .collect();
+    let routes = keys
+        .iter()
+        .cloned()
+        .map(|key| {
+            (
+                key,
+                RouteData {
+                    target: "http://upstream.example".to_owned(),
+                    last_activity: initial,
+                    extra: Default::default(),
+                },
+            )
+        })
+        .collect();
+    let store = Arc::new(StalledActivityStore {
+        routes: tokio::sync::RwLock::new(routes),
+        writes: std::sync::Mutex::new(Vec::new()),
+        entered: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let registry = RouteRegistry::load(store.clone()).await.unwrap();
+    let metrics = Arc::new(Metrics::new());
+    let writer = ActivityWriter::start_with_metrics(Arc::clone(&registry), 2, metrics.clone());
+
+    writer.record_at(&keys[0], initial + chrono::Duration::seconds(1));
+    store.entered.acquire().await.unwrap().forget();
+    writer.record_at(&keys[1], initial + chrono::Duration::seconds(1));
+    let newest = initial + chrono::Duration::seconds(3);
+    writer.record_at(&keys[1], newest);
+    writer.record_at(&keys[2], initial + chrono::Duration::seconds(2));
+    writer.record_at(&keys[3], initial + chrono::Duration::seconds(4));
+
+    assert_eq!(writer.pending_routes(), 2);
+    assert_eq!(writer.dropped_observations(), 1);
+    assert_eq!(metrics.snapshot().activity_dropped, 1);
+
+    store.release.add_permits(3);
+    writer.flush().await;
+    let writes = store.writes.lock().unwrap().clone();
+    assert_eq!(writes.len(), 3);
+    assert!(writes.contains(&(keys[1].clone(), newest)));
+    assert!(writes.iter().all(|(key, _)| key != &keys[3]));
+    assert_eq!(writer.pending_routes(), 0);
 }
 
 fn options(include_prefix: bool, prepend_path: bool) -> ProxyOptions {

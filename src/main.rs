@@ -5,6 +5,7 @@ use clap::Parser;
 use pingora::server::Server;
 use pingora_reverse_proxy::activity::ActivityWriter;
 use pingora_reverse_proxy::config::{AppConfig, Cli, ConfigError, ListenerConfig, StoreConfig};
+use pingora_reverse_proxy::metrics::Metrics;
 use pingora_reverse_proxy::proxy::{ChpProxy, ProxyBuildError};
 use pingora_reverse_proxy::route_table::RouteRegistry;
 use pingora_reverse_proxy::store::memory::MemoryStore;
@@ -64,7 +65,9 @@ fn run() -> Result<(), StartupError> {
     let registry = runtime
         .block_on(RouteRegistry::load(store))
         .map_err(StartupError::Store)?;
-    let activity = runtime.block_on(async { ActivityWriter::start(Arc::clone(&registry), 64) });
+    let metrics = Arc::new(Metrics::new());
+    let activity = runtime
+        .block_on(async { ActivityWriter::start_with_metrics(Arc::clone(&registry), 64, metrics) });
     let proxy = ChpProxy::from_config(registry, &config, activity)?;
 
     let mut server = Server::new(None).map_err(|error| StartupError::Pingora(error.to_string()))?;

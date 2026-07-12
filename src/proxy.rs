@@ -35,6 +35,7 @@ pub struct RequestContext {
     pub error_classification: Option<ProxyErrorClass>,
     upstream_route: Option<UpstreamRoute>,
     stream_data_seen: bool,
+    activity_published: bool,
 }
 
 impl Default for RequestContext {
@@ -47,6 +48,7 @@ impl Default for RequestContext {
             error_classification: None,
             upstream_route: None,
             stream_data_seen: false,
+            activity_published: false,
         }
     }
 }
@@ -104,7 +106,11 @@ impl ChpProxy {
             options: config.proxy.clone(),
             default_target,
             tls,
-            errors: ProxyErrorRenderer::new(config.error_target.clone(), config.error_path.clone()),
+            errors: ProxyErrorRenderer::with_tls_verification(
+                config.error_target.clone(),
+                config.error_path.clone(),
+                config.proxy.verify_upstream_tls,
+            ),
             activity,
             downstream_protocol: if config.public_tls.is_some() {
                 "https"
@@ -159,11 +165,18 @@ impl ChpProxy {
         session.write_response_body(Some(body), true).await
     }
 
-    fn record_stream_activity(&self, ctx: &mut RequestContext) {
+    fn observe_stream_data(&self, ctx: &mut RequestContext) {
         ctx.stream_data_seen = true;
-        ctx.activity_eligible = true;
+        self.publish_activity_if_eligible(ctx);
+    }
+
+    fn publish_activity_if_eligible(&self, ctx: &mut RequestContext) {
+        if !ctx.activity_eligible || ctx.activity_published {
+            return;
+        }
         if let Some(key) = &ctx.resolved_route_key {
             self.activity.record(key);
+            ctx.activity_published = true;
         }
     }
 }
@@ -245,9 +258,6 @@ impl ProxyHttp for ChpProxy {
         let uri = build_upstream_uri(&route, &ctx.original_uri, &self.options)
             .map_err(|_| Self::internal_error(ctx))?;
         let mut headers = upstream_request.headers.clone();
-        apply_request_headers(&mut headers, &route.target, &self.options)
-            .map_err(|_| Self::internal_error(ctx))?;
-
         let client_address = session
             .as_downstream()
             .client_addr()
@@ -276,6 +286,8 @@ impl ProxyHttp for ChpProxy {
             &self.options,
         )
         .map_err(|_| Self::internal_error(ctx))?;
+        apply_request_headers(&mut headers, &route.target, &self.options)
+            .map_err(|_| Self::internal_error(ctx))?;
         replace_request_headers(upstream_request, headers)
             .map_err(|_| Self::internal_error(ctx))?;
         if !session.is_body_empty() && !upstream_request.headers.contains_key(CONTENT_LENGTH) {
@@ -316,6 +328,10 @@ impl ProxyHttp for ChpProxy {
                 upstream_response.remove_header(&LOCATION);
             }
         }
+        ctx.activity_eligible = upstream_response.status.as_u16() < 300;
+        if ctx.stream_data_seen {
+            self.publish_activity_if_eligible(ctx);
+        }
         Ok(())
     }
 
@@ -327,7 +343,7 @@ impl ProxyHttp for ChpProxy {
         ctx: &mut Self::CTX,
     ) -> pingora::Result<()> {
         if body.as_ref().is_some_and(|body| !body.is_empty()) {
-            self.record_stream_activity(ctx);
+            self.observe_stream_data(ctx);
         }
         Ok(())
     }
@@ -340,7 +356,7 @@ impl ProxyHttp for ChpProxy {
         ctx: &mut Self::CTX,
     ) -> pingora::Result<Option<Duration>> {
         if body.as_ref().is_some_and(|body| !body.is_empty()) {
-            self.record_stream_activity(ctx);
+            self.observe_stream_data(ctx);
         }
         Ok(None)
     }
@@ -364,7 +380,9 @@ impl ProxyHttp for ChpProxy {
         ctx: &mut Self::CTX,
         client_reused: bool,
     ) -> Box<Error> {
-        ctx.error_classification = Some(ProxyErrorClass::UnavailableUpstream);
+        if ctx.error_classification.is_none() && error.esource() == &ErrorSource::Upstream {
+            ctx.error_classification = Some(ProxyErrorClass::UnavailableUpstream);
+        }
         error = error.more_context(format!("Peer: {peer}"));
         error
             .retry
@@ -378,6 +396,23 @@ impl ProxyHttp for ChpProxy {
         error: &Error,
         ctx: &mut Self::CTX,
     ) -> FailToProxy {
+        if let Some(response) = session.response_written() {
+            return FailToProxy {
+                error_code: response.status.as_u16(),
+                can_reuse_downstream: false,
+            };
+        }
+        if error.esource() == &ErrorSource::Downstream
+            && matches!(
+                error.etype(),
+                ErrorType::ReadError | ErrorType::WriteError | ErrorType::ConnectionClosed
+            )
+        {
+            return FailToProxy {
+                error_code: 0,
+                can_reuse_downstream: false,
+            };
+        }
         let classification = ctx.error_classification.unwrap_or_else(|| {
             if error.esource() == &ErrorSource::Upstream {
                 ProxyErrorClass::UnavailableUpstream
@@ -403,10 +438,8 @@ impl ProxyHttp for ChpProxy {
                 .response_written()
                 .is_some_and(|response| response.status.as_u16() < 300);
         ctx.activity_eligible |= successful;
-        if successful && !ctx.stream_data_seen {
-            if let Some(key) = &ctx.resolved_route_key {
-                self.activity.record(key);
-            }
+        if successful {
+            self.publish_activity_if_eligible(ctx);
         }
     }
 

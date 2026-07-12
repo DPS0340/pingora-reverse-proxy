@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, Notify};
 
+use crate::metrics::Metrics;
 use crate::route::RouteKey;
 use crate::route_table::RouteRegistry;
 
@@ -14,6 +15,9 @@ struct ActivityState {
     pending: Mutex<BTreeMap<RouteKey, DateTime<Utc>>>,
     in_flight: AtomicUsize,
     persistence_errors: AtomicU64,
+    dropped_observations: AtomicU64,
+    pending_capacity: usize,
+    metrics: Arc<Metrics>,
     idle: Notify,
 }
 
@@ -31,14 +35,27 @@ pub struct ActivityWriter {
 
 impl ActivityWriter {
     /// Start the persistence worker on the current Tokio runtime.
-    pub fn start(registry: Arc<RouteRegistry>, channel_capacity: usize) -> Self {
+    pub fn start(registry: Arc<RouteRegistry>, pending_capacity: usize) -> Self {
+        Self::start_with_metrics(registry, pending_capacity, Arc::new(Metrics::new()))
+    }
+
+    /// Start the worker and report persistence failures and admission drops to process metrics.
+    pub fn start_with_metrics(
+        registry: Arc<RouteRegistry>,
+        pending_capacity: usize,
+        metrics: Arc<Metrics>,
+    ) -> Self {
+        let pending_capacity = pending_capacity.max(1);
         let state = Arc::new(ActivityState {
             pending: Mutex::new(BTreeMap::new()),
             in_flight: AtomicUsize::new(0),
             persistence_errors: AtomicU64::new(0),
+            dropped_observations: AtomicU64::new(0),
+            pending_capacity,
+            metrics,
             idle: Notify::new(),
         });
-        let (wake, mut receiver) = mpsc::channel(channel_capacity.max(1));
+        let (wake, mut receiver) = mpsc::channel(1);
         let worker_registry = Arc::clone(&registry);
         let worker_state = Arc::clone(&state);
         tokio::spawn(async move {
@@ -68,9 +85,16 @@ impl ActivityWriter {
                             .await
                             .is_err()
                         {
-                            worker_state
+                            let previous = worker_state
                                 .persistence_errors
                                 .fetch_add(1, Ordering::Relaxed);
+                            worker_state.metrics.record_activity_persistence_failure();
+                            if (previous + 1).is_power_of_two() {
+                                tracing::warn!(
+                                    failures = previous + 1,
+                                    "activity persistence failed"
+                                );
+                            }
                         }
                         worker_state.in_flight.fetch_sub(1, Ordering::AcqRel);
                     }
@@ -100,24 +124,60 @@ impl ActivityWriter {
             .pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        pending
-            .entry(key.clone())
-            .and_modify(|existing| *existing = (*existing).max(at))
-            .or_insert(at);
+        if let Some(existing) = pending.get_mut(key) {
+            *existing = (*existing).max(at);
+        } else if pending.len() < self.state.pending_capacity {
+            pending.insert(key.clone(), at);
+        } else {
+            let previous = self
+                .state
+                .dropped_observations
+                .fetch_add(1, Ordering::Relaxed);
+            self.state.metrics.record_activity_drop();
+            if (previous + 1).is_power_of_two() {
+                tracing::warn!(
+                    drops = previous + 1,
+                    "activity persistence observation dropped: pending capacity reached"
+                );
+            }
+            return;
+        }
         drop(pending);
         if matches!(
             self.wake.try_send(()),
             Err(mpsc::error::TrySendError::Closed(_))
         ) {
-            self.state
+            let previous = self
+                .state
                 .persistence_errors
                 .fetch_add(1, Ordering::Relaxed);
+            self.state.metrics.record_activity_persistence_failure();
+            if (previous + 1).is_power_of_two() {
+                tracing::warn!(
+                    failures = previous + 1,
+                    "activity persistence worker unavailable"
+                );
+            }
         }
     }
 
     /// Number of failed persistence attempts observed by the worker.
     pub fn persistence_errors(&self) -> u64 {
         self.state.persistence_errors.load(Ordering::Relaxed)
+    }
+
+    /// Number of observations whose new route key could not enter the bounded pending map.
+    pub fn dropped_observations(&self) -> u64 {
+        self.state.dropped_observations.load(Ordering::Relaxed)
+    }
+
+    /// Number of distinct route keys currently waiting for persistence.
+    pub fn pending_routes(&self) -> usize {
+        self.state
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
     }
 
     /// Wait until all activity accepted before this observation has drained.

@@ -808,6 +808,146 @@ async fn registry_delete_missing_is_a_noop_and_delete_returns_prior_route() {
     assert!(registry.resolve("/service/tree").is_none());
 }
 
+#[derive(Clone, Copy)]
+enum GatedManagementOperation {
+    Add,
+    Put,
+    Delete,
+}
+
+struct GatedManagementStore {
+    routes: RwLock<BTreeMap<RouteKey, RouteData>>,
+    operation: GatedManagementOperation,
+    entered: Semaphore,
+    release: Semaphore,
+}
+
+impl GatedManagementStore {
+    fn new(routes: BTreeMap<RouteKey, RouteData>, operation: GatedManagementOperation) -> Self {
+        Self {
+            routes: RwLock::new(routes),
+            operation,
+            entered: Semaphore::new(0),
+            release: Semaphore::new(0),
+        }
+    }
+
+    async fn gate(&self) {
+        self.entered.add_permits(1);
+        self.release.acquire().await.unwrap().forget();
+    }
+}
+
+#[async_trait]
+impl Store for GatedManagementStore {
+    async fn snapshot(&self) -> Result<BTreeMap<RouteKey, RouteData>, StoreError> {
+        Ok(self.routes.read().await.clone())
+    }
+
+    async fn add(
+        &self,
+        key: RouteKey,
+        target: String,
+        extra: Map<String, serde_json::Value>,
+    ) -> Result<RouteData, StoreError> {
+        assert!(matches!(self.operation, GatedManagementOperation::Add));
+        self.gate().await;
+        let data = RouteData {
+            target,
+            last_activity: Utc.timestamp_opt(20, 0).unwrap(),
+            extra,
+        };
+        self.routes.write().await.insert(key, data.clone());
+        Ok(data)
+    }
+
+    async fn put(&self, key: RouteKey, data: RouteData) -> Result<(), StoreError> {
+        assert!(matches!(self.operation, GatedManagementOperation::Put));
+        self.gate().await;
+        self.routes.write().await.insert(key, data);
+        Ok(())
+    }
+
+    async fn update_activity(&self, key: &RouteKey, at: DateTime<Utc>) -> Result<(), StoreError> {
+        if let Some(route) = self.routes.write().await.get_mut(key) {
+            route.last_activity = at;
+        }
+        Ok(())
+    }
+
+    async fn delete(&self, key: &RouteKey) -> Result<Option<RouteData>, StoreError> {
+        assert!(matches!(self.operation, GatedManagementOperation::Delete));
+        self.gate().await;
+        Ok(self.routes.write().await.remove(key))
+    }
+}
+
+async fn assert_blocked_management_preserves_other_route_activity(
+    operation: GatedManagementOperation,
+) {
+    let activity_key = key("/active");
+    let mutation_key = key("/mutated");
+    let initial = BTreeMap::from([
+        (activity_key.clone(), route("http://active.example")),
+        (mutation_key.clone(), route("http://old.example")),
+    ]);
+    let store = Arc::new(GatedManagementStore::new(initial, operation));
+    let registry = RouteRegistry::load(store.clone()).await.unwrap();
+
+    let mutation = {
+        let registry = Arc::clone(&registry);
+        let mutation_key = mutation_key.clone();
+        tokio::spawn(async move {
+            match operation {
+                GatedManagementOperation::Add => registry
+                    .add(mutation_key, "http://added.example".to_owned(), Map::new())
+                    .await
+                    .map(|_| ()),
+                GatedManagementOperation::Put => {
+                    registry
+                        .put(mutation_key, route("http://put.example"))
+                        .await
+                }
+                GatedManagementOperation::Delete => {
+                    registry.delete(&mutation_key).await.map(|_| ())
+                }
+            }
+        })
+    };
+    store.entered.acquire().await.unwrap().forget();
+
+    let observed_at = Utc.timestamp_opt(10, 0).unwrap();
+    assert!(registry.observe_activity(&activity_key, observed_at));
+    assert_eq!(
+        registry.get(&activity_key).unwrap().last_activity,
+        observed_at
+    );
+
+    store.release.add_permits(1);
+    mutation.await.unwrap().unwrap();
+    assert_eq!(
+        registry.get(&activity_key).unwrap().last_activity,
+        observed_at,
+        "a persistence-first management publication must merge with the latest activity snapshot"
+    );
+}
+
+#[tokio::test]
+async fn blocked_add_merges_activity_observed_on_another_route() {
+    assert_blocked_management_preserves_other_route_activity(GatedManagementOperation::Add).await;
+}
+
+#[tokio::test]
+async fn blocked_put_merges_activity_observed_on_another_route() {
+    assert_blocked_management_preserves_other_route_activity(GatedManagementOperation::Put).await;
+}
+
+#[tokio::test]
+async fn blocked_delete_merges_activity_observed_on_another_route() {
+    assert_blocked_management_preserves_other_route_activity(GatedManagementOperation::Delete)
+        .await;
+}
+
 struct GatedPutStore {
     routes: RwLock<BTreeMap<RouteKey, RouteData>>,
     gates: BTreeMap<RouteKey, Arc<Semaphore>>,
