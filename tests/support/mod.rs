@@ -45,11 +45,9 @@ pub async fn test_api(token: Option<&str>) -> TestApi {
 
 /// Build the route management API over a caller-provided persistence double.
 pub async fn test_api_with_store(token: Option<&str>, store: Arc<dyn Store>) -> TestApi {
-    let registry = Arc::new(
-        RouteRegistry::load(store)
-            .await
-            .expect("empty memory store loads"),
-    );
+    let registry = RouteRegistry::load(store)
+        .await
+        .expect("empty memory store loads");
     let metrics = Arc::new(Metrics::new());
     let state = ApiState::new(Arc::clone(&registry), token, Arc::clone(&metrics));
     TestApi {

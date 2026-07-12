@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
-use std::future::Future;
 use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
@@ -271,7 +270,7 @@ async fn atomic_add_failure_leaves_backend_and_registry_unchanged() {
         BTreeMap::from([(route_key.clone(), original.clone())]),
         true,
     ));
-    let registry = Arc::new(RouteRegistry::load(store.clone()).await.unwrap());
+    let registry = RouteRegistry::load(store.clone()).await.unwrap();
     let adding = {
         let registry = Arc::clone(&registry);
         let route_key = route_key.clone();
@@ -298,14 +297,14 @@ async fn atomic_add_failure_leaves_backend_and_registry_unchanged() {
 }
 
 #[tokio::test]
-async fn cancelling_a_pending_atomic_add_leaves_backend_and_registry_unchanged() {
+async fn cancelling_add_before_commit_does_not_cancel_the_registry_owned_mutation() {
     let route_key = key("/service");
     let original = route("http://original.example");
     let store = Arc::new(GatedAtomicAddStore::new(
         BTreeMap::from([(route_key.clone(), original.clone())]),
         false,
     ));
-    let registry = Arc::new(RouteRegistry::load(store.clone()).await.unwrap());
+    let registry = RouteRegistry::load(store.clone()).await.unwrap();
     let adding = {
         let registry = Arc::clone(&registry);
         let route_key = route_key.clone();
@@ -323,20 +322,232 @@ async fn cancelling_a_pending_atomic_add_leaves_backend_and_registry_unchanged()
     store.entered.acquire().await.unwrap().forget();
     adding.abort();
     assert!(adding.await.unwrap_err().is_cancelled());
-    store.release.add_permits(1);
-
     assert_eq!(
         store.snapshot().await.unwrap().get(&route_key),
         Some(&original)
     );
     assert_eq!(registry.get(&route_key), Some(original));
+
+    store.release.add_permits(1);
+    registry.delete(&key("/missing")).await.unwrap();
+
+    let committed = store.snapshot().await.unwrap().remove(&route_key).unwrap();
+    assert_eq!(committed.target, "http://replacement.example");
+    assert_eq!(registry.get(&route_key), Some(committed));
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum GatedMutation {
+    Put,
+    UpdateActivity,
+    Delete,
+}
+
+struct GatedMutationStore {
+    routes: RwLock<BTreeMap<RouteKey, RouteData>>,
+    gated: GatedMutation,
+    entered: Semaphore,
+    release: Semaphore,
+}
+
+impl GatedMutationStore {
+    fn new(gated: GatedMutation, routes: BTreeMap<RouteKey, RouteData>) -> Self {
+        Self {
+            routes: RwLock::new(routes),
+            gated,
+            entered: Semaphore::new(0),
+            release: Semaphore::new(0),
+        }
+    }
+
+    async fn gate(&self, mutation: GatedMutation) {
+        if self.gated == mutation {
+            self.entered.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+        }
+    }
+}
+
+#[async_trait]
+impl Store for GatedMutationStore {
+    async fn snapshot(&self) -> Result<BTreeMap<RouteKey, RouteData>, StoreError> {
+        Ok(self.routes.read().await.clone())
+    }
+
+    async fn add(
+        &self,
+        key: RouteKey,
+        target: String,
+        extra: Map<String, serde_json::Value>,
+    ) -> Result<RouteData, StoreError> {
+        let data = RouteData {
+            target,
+            last_activity: Utc::now(),
+            extra,
+        };
+        self.routes.write().await.insert(key, data.clone());
+        Ok(data)
+    }
+
+    async fn put(&self, key: RouteKey, data: RouteData) -> Result<(), StoreError> {
+        self.gate(GatedMutation::Put).await;
+        self.routes.write().await.insert(key, data);
+        Ok(())
+    }
+
+    async fn update_activity(&self, key: &RouteKey, at: DateTime<Utc>) -> Result<(), StoreError> {
+        self.gate(GatedMutation::UpdateActivity).await;
+        if let Some(route) = self.routes.write().await.get_mut(key) {
+            route.last_activity = at;
+        }
+        Ok(())
+    }
+
+    async fn delete(&self, key: &RouteKey) -> Result<Option<RouteData>, StoreError> {
+        self.gate(GatedMutation::Delete).await;
+        Ok(self.routes.write().await.remove(key))
+    }
+}
+
+#[tokio::test]
+async fn cancelling_put_does_not_cancel_the_registry_owned_mutation() {
+    let route_key = key("/service");
+    let replacement = route("http://replacement.example");
+    let store = Arc::new(GatedMutationStore::new(GatedMutation::Put, BTreeMap::new()));
+    let registry = RouteRegistry::load(store.clone()).await.unwrap();
+    let caller = {
+        let registry = Arc::clone(&registry);
+        let route_key = route_key.clone();
+        let replacement = replacement.clone();
+        tokio::spawn(async move { registry.put(route_key, replacement).await })
+    };
+
+    store.entered.acquire().await.unwrap().forget();
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    store.release.add_permits(1);
+    registry.delete(&key("/missing")).await.unwrap();
+
+    assert_eq!(
+        store.snapshot().await.unwrap().get(&route_key),
+        Some(&replacement)
+    );
+    assert_eq!(registry.get(&route_key), Some(replacement));
+}
+
+#[tokio::test]
+async fn cancelling_activity_update_does_not_cancel_the_registry_owned_mutation() {
+    let route_key = key("/service");
+    let original = route("http://original.example");
+    let activity = Utc.timestamp_opt(999, 0).unwrap();
+    let store = Arc::new(GatedMutationStore::new(
+        GatedMutation::UpdateActivity,
+        BTreeMap::from([(route_key.clone(), original)]),
+    ));
+    let registry = RouteRegistry::load(store.clone()).await.unwrap();
+    let caller = {
+        let registry = Arc::clone(&registry);
+        let route_key = route_key.clone();
+        tokio::spawn(async move { registry.update_activity(&route_key, activity).await })
+    };
+
+    store.entered.acquire().await.unwrap().forget();
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    store.release.add_permits(1);
+    registry.delete(&key("/missing")).await.unwrap();
+
+    assert_eq!(
+        store.snapshot().await.unwrap()[&route_key].last_activity,
+        activity
+    );
+    assert_eq!(registry.get(&route_key).unwrap().last_activity, activity);
+}
+
+#[tokio::test]
+async fn cancelling_delete_does_not_cancel_the_registry_owned_mutation() {
+    let route_key = key("/service");
+    let store = Arc::new(GatedMutationStore::new(
+        GatedMutation::Delete,
+        BTreeMap::from([(route_key.clone(), route("http://original.example"))]),
+    ));
+    let registry = RouteRegistry::load(store.clone()).await.unwrap();
+    let caller = {
+        let registry = Arc::clone(&registry);
+        let route_key = route_key.clone();
+        tokio::spawn(async move { registry.delete(&route_key).await })
+    };
+
+    store.entered.acquire().await.unwrap().forget();
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    store.release.add_permits(1);
+    registry
+        .update_activity(&key("/missing"), Utc::now())
+        .await
+        .unwrap();
+
+    assert!(!store.snapshot().await.unwrap().contains_key(&route_key));
+    assert!(registry.get(&route_key).is_none());
+}
+
+struct TimingOutPutStore;
+
+#[async_trait]
+impl Store for TimingOutPutStore {
+    async fn snapshot(&self) -> Result<BTreeMap<RouteKey, RouteData>, StoreError> {
+        Ok(BTreeMap::new())
+    }
+
+    async fn add(
+        &self,
+        _key: RouteKey,
+        _target: String,
+        _extra: Map<String, serde_json::Value>,
+    ) -> Result<RouteData, StoreError> {
+        Err(StoreError::message("unused add"))
+    }
+
+    async fn put(&self, _key: RouteKey, _data: RouteData) -> Result<(), StoreError> {
+        tokio::time::timeout(Duration::from_millis(10), std::future::pending::<()>())
+            .await
+            .map_err(|_| StoreError::message("backend timeout"))
+    }
+
+    async fn update_activity(&self, _key: &RouteKey, _at: DateTime<Utc>) -> Result<(), StoreError> {
+        Err(StoreError::message("unused activity update"))
+    }
+
+    async fn delete(&self, _key: &RouteKey) -> Result<Option<RouteData>, StoreError> {
+        Err(StoreError::message("unused delete"))
+    }
+}
+
+#[tokio::test]
+async fn backend_timeout_finishes_the_mutation_task_and_releases_the_registry() {
+    let registry = RouteRegistry::load(Arc::new(TimingOutPutStore))
+        .await
+        .unwrap();
+    let registry_lifetime = Arc::downgrade(&registry);
+
+    let error = registry
+        .put(key("/service"), route("http://timeout.example"))
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "backend timeout");
+    drop(registry);
+
+    assert!(
+        registry_lifetime.upgrade().is_none(),
+        "a completed backend timeout must not leave a detached task retaining the registry"
+    );
 }
 
 #[tokio::test]
 async fn slow_atomic_add_stamps_after_delay_and_publishes_exact_committed_data() {
     let route_key = key("/service");
     let store = Arc::new(GatedAtomicAddStore::new(BTreeMap::new(), false));
-    let registry = Arc::new(RouteRegistry::load(store.clone()).await.unwrap());
+    let registry = RouteRegistry::load(store.clone()).await.unwrap();
     let adding = {
         let registry = Arc::clone(&registry);
         let route_key = route_key.clone();
@@ -591,6 +802,7 @@ async fn registry_delete_missing_is_a_noop_and_delete_returns_prior_route() {
 struct GatedPutStore {
     routes: RwLock<BTreeMap<RouteKey, RouteData>>,
     gates: BTreeMap<RouteKey, Arc<Semaphore>>,
+    entered: Semaphore,
     entries: std::sync::Mutex<Vec<RouteKey>>,
 }
 
@@ -602,6 +814,7 @@ impl GatedPutStore {
                 .into_iter()
                 .map(|route_key| (route_key, Arc::new(Semaphore::new(0))))
                 .collect(),
+            entered: Semaphore::new(0),
             entries: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -632,6 +845,7 @@ impl Store for GatedPutStore {
 
     async fn put(&self, key: RouteKey, data: RouteData) -> Result<(), StoreError> {
         self.entries.lock().unwrap().push(key.clone());
+        self.entered.add_permits(1);
         self.gates[&key].acquire().await.unwrap().forget();
         self.routes.write().await.insert(key, data);
         Ok(())
@@ -646,11 +860,6 @@ impl Store for GatedPutStore {
     }
 }
 
-fn poll_once<F: Future>(future: std::pin::Pin<&mut F>) -> Poll<F::Output> {
-    let mut context = Context::from_waker(Waker::noop());
-    future.poll(&mut context)
-}
-
 #[tokio::test]
 async fn concurrent_alias_writers_are_serialized_in_successful_mutation_order() {
     let first_key = key("/service");
@@ -660,12 +869,21 @@ async fn concurrent_alias_writers_are_serialized_in_successful_mutation_order() 
     let first_data = route("http://127.0.0.1:9001/first");
     let second_data = route("http://127.0.0.1:9002/second");
 
-    let mut first = Box::pin(registry.put(first_key.clone(), first_data.clone()));
-    let mut second = Box::pin(registry.put(second_key.clone(), second_data.clone()));
-
-    assert!(poll_once(first.as_mut()).is_pending());
+    let first = {
+        let registry = Arc::clone(&registry);
+        let first_key = first_key.clone();
+        let first_data = first_data.clone();
+        tokio::spawn(async move { registry.put(first_key, first_data).await })
+    };
+    store.entered.acquire().await.unwrap().forget();
     assert_eq!(store.entries(), vec![first_key.clone()]);
-    assert!(poll_once(second.as_mut()).is_pending());
+    let second = {
+        let registry = Arc::clone(&registry);
+        let second_key = second_key.clone();
+        let second_data = second_data.clone();
+        tokio::spawn(async move { registry.put(second_key, second_data).await })
+    };
+    tokio::task::yield_now().await;
     assert_eq!(
         store.entries(),
         vec![first_key.clone()],
@@ -673,11 +891,11 @@ async fn concurrent_alias_writers_are_serialized_in_successful_mutation_order() 
     );
 
     store.release(&first_key);
-    assert!(matches!(poll_once(first.as_mut()), Poll::Ready(Ok(()))));
-    assert!(poll_once(second.as_mut()).is_pending());
+    first.await.unwrap().unwrap();
+    store.entered.acquire().await.unwrap().forget();
     assert_eq!(store.entries(), vec![first_key.clone(), second_key.clone()]);
     store.release(&second_key);
-    assert!(matches!(poll_once(second.as_mut()), Poll::Ready(Ok(()))));
+    second.await.unwrap().unwrap();
 
     let expected = BTreeMap::from([
         (first_key.clone(), first_data.clone()),
@@ -694,7 +912,7 @@ async fn concurrent_alias_writers_are_serialized_in_successful_mutation_order() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_readers_observe_only_complete_snapshots() {
-    let registry = Arc::new(RouteRegistry::load(memory_store()).await.unwrap());
+    let registry = RouteRegistry::load(memory_store()).await.unwrap();
     let route_key = key("/service");
     let old = route("http://old.example/generation-0");
     registry.put(route_key.clone(), old.clone()).await.unwrap();

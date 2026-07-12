@@ -7,6 +7,7 @@ use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
 use crate::route::{RouteData, RouteKey};
 use crate::store::{Store, StoreError};
@@ -114,6 +115,14 @@ impl RouteSnapshot {
 }
 
 /// Persistence-backed registry with lock-free reads from immutable snapshots.
+///
+/// Each mutation runs in a registry-owned Tokio task. Cancelling the caller
+/// detaches its wait for the result but does not cancel persistence, snapshot
+/// reconciliation, or publication. The task retains the registry until the
+/// backend operation finishes; backends therefore need finite operational
+/// timeouts. Normal timeout errors release both the mutation lock and retained
+/// registry reference. Tokio runtime shutdown may cancel outstanding tasks, so
+/// backend mutations must still be atomic at their own persistence boundary.
 pub struct RouteRegistry {
     store: Arc<dyn Store>,
     snapshot: ArcSwap<RouteSnapshot>,
@@ -125,13 +134,13 @@ impl RouteRegistry {
     ///
     /// Because persisted snapshots do not contain runtime mutation history,
     /// initial matcher precedence is deterministic ascending `RouteKey` order.
-    pub async fn load(store: Arc<dyn Store>) -> Result<Self, StoreError> {
+    pub async fn load(store: Arc<dyn Store>) -> Result<Arc<Self>, StoreError> {
         let routes = store.snapshot().await?;
-        Ok(Self {
+        Ok(Arc::new(Self {
             store,
             snapshot: ArcSwap::from_pointee(RouteSnapshot::from_routes(routes)),
             mutation: Mutex::new(()),
-        })
+        }))
     }
 
     /// Return one normalized route record from the current snapshot.
@@ -150,7 +159,15 @@ impl RouteRegistry {
     }
 
     /// Persist a route replacement and publish it atomically on success.
-    pub async fn put(&self, key: RouteKey, data: RouteData) -> Result<(), StoreError> {
+    pub async fn put(self: &Arc<Self>, key: RouteKey, data: RouteData) -> Result<(), StoreError> {
+        let registry = Arc::clone(self);
+        mutation_result(tokio::spawn(
+            async move { registry.put_owned(key, data).await },
+        ))
+        .await
+    }
+
+    async fn put_owned(&self, key: RouteKey, data: RouteData) -> Result<(), StoreError> {
         let _mutation = self.mutation.lock().await;
         let mut routes = self.snapshot.load().routes.clone();
         self.store.put(key.clone(), data.clone()).await?;
@@ -161,6 +178,19 @@ impl RouteRegistry {
 
     /// Publish only the record atomically committed and stamped by the backend.
     pub async fn add(
+        self: &Arc<Self>,
+        key: RouteKey,
+        target: String,
+        extra: Map<String, Value>,
+    ) -> Result<(), StoreError> {
+        let registry = Arc::clone(self);
+        mutation_result(tokio::spawn(async move {
+            registry.add_owned(key, target, extra).await
+        }))
+        .await
+    }
+
+    async fn add_owned(
         &self,
         key: RouteKey,
         target: String,
@@ -176,24 +206,46 @@ impl RouteRegistry {
 
     /// Persist an activity timestamp while retaining all other route fields.
     pub async fn update_activity(
-        &self,
+        self: &Arc<Self>,
         key: &RouteKey,
+        at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let registry = Arc::clone(self);
+        let key = key.clone();
+        mutation_result(tokio::spawn(async move {
+            registry.update_activity_owned(key, at).await
+        }))
+        .await
+    }
+
+    async fn update_activity_owned(
+        &self,
+        key: RouteKey,
         at: DateTime<Utc>,
     ) -> Result<(), StoreError> {
         let _mutation = self.mutation.lock().await;
         let mut routes = self.snapshot.load().routes.clone();
-        self.store.update_activity(key, at).await?;
-        routes.update_activity(key, at);
+        self.store.update_activity(&key, at).await?;
+        routes.update_activity(&key, at);
         self.publish(routes);
         Ok(())
     }
 
     /// Persist deletion and return the record reported by the backing store.
-    pub async fn delete(&self, key: &RouteKey) -> Result<Option<RouteData>, StoreError> {
+    pub async fn delete(self: &Arc<Self>, key: &RouteKey) -> Result<Option<RouteData>, StoreError> {
+        let registry = Arc::clone(self);
+        let key = key.clone();
+        mutation_result(tokio::spawn(
+            async move { registry.delete_owned(key).await },
+        ))
+        .await
+    }
+
+    async fn delete_owned(&self, key: RouteKey) -> Result<Option<RouteData>, StoreError> {
         let _mutation = self.mutation.lock().await;
         let mut routes = self.snapshot.load().routes.clone();
-        let deleted = self.store.delete(key).await?;
-        routes.remove(key);
+        let deleted = self.store.delete(&key).await?;
+        routes.remove(&key);
         self.publish(routes);
         Ok(deleted)
     }
@@ -201,6 +253,15 @@ impl RouteRegistry {
     fn publish(&self, routes: OrderedRoutes) {
         self.snapshot
             .store(Arc::new(RouteSnapshot::from_ordered_routes(routes)));
+    }
+}
+
+async fn mutation_result<T>(task: JoinHandle<Result<T, StoreError>>) -> Result<T, StoreError> {
+    match task.await {
+        Ok(result) => result,
+        Err(error) => Err(StoreError::message(format!(
+            "route mutation task failed: {error}"
+        ))),
     }
 }
 

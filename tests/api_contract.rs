@@ -490,6 +490,70 @@ struct GatedAtomicAddStore {
     release: Semaphore,
 }
 
+struct CommitThenReturnAddStore {
+    routes: RwLock<BTreeMap<RouteKey, RouteData>>,
+    committed: Semaphore,
+    return_response: Semaphore,
+}
+
+impl CommitThenReturnAddStore {
+    fn new() -> Self {
+        Self {
+            routes: RwLock::new(BTreeMap::new()),
+            committed: Semaphore::new(0),
+            return_response: Semaphore::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl Store for CommitThenReturnAddStore {
+    async fn snapshot(&self) -> Result<BTreeMap<RouteKey, RouteData>, StoreError> {
+        Ok(self.routes.read().await.clone())
+    }
+
+    async fn add(
+        &self,
+        key: RouteKey,
+        target: String,
+        extra: serde_json::Map<String, Value>,
+    ) -> Result<RouteData, StoreError> {
+        let data = RouteData {
+            target,
+            last_activity: Utc::now(),
+            extra,
+        };
+        self.routes.write().await.insert(key, data.clone());
+        self.committed.add_permits(1);
+        self.return_response
+            .acquire()
+            .await
+            .expect("test gate open")
+            .forget();
+        Ok(data)
+    }
+
+    async fn put(&self, key: RouteKey, data: RouteData) -> Result<(), StoreError> {
+        self.routes.write().await.insert(key, data);
+        Ok(())
+    }
+
+    async fn update_activity(
+        &self,
+        key: &RouteKey,
+        at: chrono::DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        if let Some(route) = self.routes.write().await.get_mut(key) {
+            route.last_activity = at;
+        }
+        Ok(())
+    }
+
+    async fn delete(&self, key: &RouteKey) -> Result<Option<RouteData>, StoreError> {
+        Ok(self.routes.write().await.remove(key))
+    }
+}
+
 impl GatedAtomicAddStore {
     fn new() -> Self {
         Self {
@@ -574,6 +638,35 @@ async fn post_publishes_the_timestamp_returned_after_slow_atomic_persistence() {
     );
 }
 
+#[tokio::test]
+async fn cancelling_post_after_store_commit_does_not_cancel_registry_publication() {
+    let route_key = RouteKey::parse("/committed").unwrap();
+    let missing_key = RouteKey::parse("/missing").unwrap();
+    let store = Arc::new(CommitThenReturnAddStore::new());
+    let app = test_api_with_store(None, store.clone()).await;
+    let request_app = app.clone();
+    let posting =
+        tokio::spawn(
+            async move { post_route(&request_app, "/api/routes/committed", TARGET).await },
+        );
+
+    store.committed.acquire().await.unwrap().forget();
+    posting.abort();
+    assert!(posting.await.unwrap_err().is_cancelled());
+    assert!(app.registry.get(&route_key).is_none());
+
+    let mut queued_mutation = Box::pin(app.registry.delete(&missing_key));
+    assert!(
+        poll_once(queued_mutation.as_mut()).is_pending(),
+        "the registry-owned add must retain the mutation lock after caller cancellation"
+    );
+    store.return_response.add_permits(1);
+    assert_eq!(queued_mutation.await.unwrap(), None);
+
+    let committed = store.snapshot().await.unwrap().remove(&route_key).unwrap();
+    assert_eq!(app.registry.get(&route_key), Some(committed));
+}
+
 fn poll_once<F: Future>(future: std::pin::Pin<&mut F>) -> Poll<F::Output> {
     let mut context = Context::from_waker(Waker::noop());
     future.poll(&mut context)
@@ -596,8 +689,9 @@ async fn concurrent_post_then_delete_is_serialized_through_the_registry() {
         None,
         None,
     ));
-    // DELETE has no await before `RouteRegistry::delete`. A pending first poll
-    // therefore proves it reached and queued on the mutation mutex held by POST.
+    // POST has already entered its store while holding the registry mutation
+    // mutex. Polling DELETE starts its registry-owned task, which must serialize
+    // behind that POST mutation before it can reach persistence.
     assert!(poll_once(deleting.as_mut()).is_pending());
     store.release.add_permits(1);
 

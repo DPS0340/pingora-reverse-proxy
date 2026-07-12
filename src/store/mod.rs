@@ -31,12 +31,13 @@ pub trait Store: Send + Sync {
     async fn snapshot(&self) -> Result<BTreeMap<RouteKey, RouteData>, StoreError>;
     /// Atomically add or replace a route and assign its final activity stamp.
     ///
-    /// Backends perform any fallible or asynchronous persistence work before
-    /// the stamp-and-commit step. Returning `Err`, or cancellation while the
-    /// future is pending, must leave the stored route unchanged. After commit,
-    /// implementations must return the exact committed record without another
-    /// yield point. This boundary maps to a Redis Lua script or atomic sidecar
-    /// operation without exposing a partially updated route to the registry.
+    /// The target, metadata, and final activity stamp must be committed as one
+    /// atomic backend mutation, and success must return that exact record.
+    /// Remote implementations may yield between their commit and returning the
+    /// record. Caller-cancellation safety across that interval is owned by
+    /// `RouteRegistry`, which executes the complete logical mutation in its own
+    /// task. Backends should apply finite operation timeouts so registry-owned
+    /// tasks do not remain pending indefinitely.
     async fn add(
         &self,
         key: RouteKey,
