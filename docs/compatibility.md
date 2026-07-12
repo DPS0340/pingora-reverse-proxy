@@ -94,6 +94,12 @@ readiness, and acknowledges exit. A real non-listener descriptor contract
 exercises Pingora's listener-build failure path. Each `RequestContext` owns its
 traffic-admission token and releases it through one take-once path used by the
 completion callback and `Drop`, including panic and cancellation unwinding.
+The non-owning raw-FD guard remains armed after table insertion until Pingora's
+listener construction has completed; successful adoption explicitly disarms
+it. UDS prebinding opens the canonical parent before bind and continues through
+its descriptor-backed stable path if the configured parent alias is replaced.
+Failures while constructing a private cleanup namespace remove only the
+identity-matching empty namespace and never delete a foreign replacement.
 
 | CHP long option | Classification | Configuration behavior and contract test |
 |---|---|---|

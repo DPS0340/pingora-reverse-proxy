@@ -549,3 +549,50 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo check --all-targets --all-features
 git diff --check
 ```
+
+### Task 8 listener-adoption window closure (2026-07-13)
+
+The interrupted worktree based on `98ea4b8` was preserved. The three previously
+reported TLS/Unix integration failures were first rerun individually with
+`--nocapture`; each passed `1/1` with `22` tests filtered out. The complete
+TLS/Unix executable then passed `23/23` under default parallelism.
+
+A consolidated default-parallel unit run exposed the remaining test-only FD
+race: the successful-adoption assertion used `dup2` after Pingora had closed
+its listener descriptor, so another parallel test could already own the reused
+number. That run aborted with Rust's exact `IO Safety violation: owned file
+descriptor already closed` diagnostic. The assertion now directly observes
+that successful Pingora adoption disarms the handoff guard. A separate
+self-contained identity test replaces an open descriptor atomically and proves
+that an armed late guard does not close the replacement.
+
+Production retains a raw-FD identity guard from insertion into Pingora's
+non-owning FD table until listener construction is observed. Cancellation and
+panic while Pingora waits for its second FD-table lock close the original
+descriptor, withhold readiness, acknowledge public exit, and unwind PID/UDS
+owners. UDS prebinding captures the parent before bind and uses its stable
+descriptor-backed path after alias replacement. Faults during private cleanup
+namespace setup remove only the matching empty namespace and preserve foreign
+replacements.
+
+The new stress axes passed `20/20`: cancellation at the second FD-table lock,
+panic at that lock, successful adoption disarm, late replacement identity,
+pre-bind parent capture, and all four namespace-fault stages per iteration. The
+three previously reported integration axes also each passed `20/20`: injected
+public build failure, public/API/metrics UDS service and cleanup, and listener
+alias/replacement cleanup.
+
+Final focused verification passed `32/32` unit tests and `27/27` Task 8
+integration tests (`23` TLS/Unix and `4` WebSocket). Default-parallel
+`PROPTEST_CASES=256 cargo test --all-targets --all-features -- --nocapture`
+passed `244/244`: library `32`, binary `0`, API `33`, config `27`, proxy `69`,
+routes `11`, store `45`, TLS/Unix `23`, and WebSocket `4`. The dedicated
+`PROPTEST_CASES=512` route suite passed `11/11`.
+
+Mechanical closure reran `cargo test --test tls_unix_contract` under default
+parallelism (`23/23`) and `PROPTEST_CASES=256 cargo test --all-targets
+--all-features` (`244/244`, with the same per-executable counts above). The
+requested target name `routes_contract` does not exist in this repository;
+Cargo lists the suite as `route_properties`, and `PROPTEST_CASES=512 cargo test
+--test route_properties` passed `11/11`. Formatting, warnings-denied Clippy,
+all-target/all-feature checking, and whitespace validation also passed.

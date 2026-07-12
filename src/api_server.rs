@@ -30,9 +30,9 @@ use openssl::pkey::{PKey, Private};
 use openssl::ssl::{Ssl, SslAcceptor, SslAcceptorBuilder, SslMethod};
 use openssl::ssl::{SslVerifyMode, SslVersion};
 use pingora::listeners::tls::TlsSettings;
-#[cfg(unix)]
-use pingora::server::ListenFds;
 use pingora::server::ShutdownWatch;
+#[cfg(unix)]
+use pingora::server::{Fds, ListenFds};
 use pingora::services::background::BackgroundService;
 use pingora::services::listening::Service;
 use pingora::services::ServiceReadyNotifier;
@@ -46,7 +46,7 @@ use tokio_openssl::SslStream;
 use crate::config::{ListenerConfig, TlsConfig};
 use crate::metrics::Metrics;
 #[cfg(unix)]
-use crate::path_ownership::OwnedPath;
+use crate::path_ownership::{AnchoredDirectory, OwnedPath};
 
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_CONCURRENT_TLS_HANDSHAKES: usize = 64;
@@ -72,18 +72,18 @@ pub enum ListenerError {
 pub fn ensure_public_startup_supported() -> Result<(), ListenerError> {
     #[cfg(any(
         target_os = "linux",
+        target_os = "android",
         target_os = "macos",
         target_os = "ios",
-        target_os = "redox"
     ))]
     {
         Ok(())
     }
     #[cfg(not(any(
         target_os = "linux",
+        target_os = "android",
         target_os = "macos",
         target_os = "ios",
-        target_os = "redox"
     )))]
     {
         Err(ListenerError::PublicUnsupported)
@@ -172,6 +172,105 @@ impl FailClosedReadyNotifier {
     }
 }
 
+/// Non-owning cleanup for the interval after the descriptor is entered in
+/// Pingora's non-owning FD table and before Pingora constructs its listener.
+/// Identity validation makes a late drop harmless if the numeric FD was reused.
+#[cfg(unix)]
+struct RawFdHandoffGuard {
+    fd: std::os::fd::RawFd,
+    device: libc::dev_t,
+    inode: libc::ino_t,
+    socket_address: Option<Vec<u8>>,
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl RawFdHandoffGuard {
+    fn new(fd: std::os::fd::RawFd) -> io::Result<Self> {
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            fd,
+            device: stat.st_dev,
+            inode: stat.st_ino,
+            socket_address: socket_address_identity(fd)?,
+            armed: false,
+        })
+    }
+
+    fn arm(&mut self) {
+        self.armed = true;
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RawFdHandoffGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(self.fd, &mut stat) } == 0
+            && stat.st_dev == self.device
+            && stat.st_ino == self.inode
+            && socket_address_identity(self.fd).ok() == Some(self.socket_address.clone())
+        {
+            unsafe {
+                libc::close(self.fd);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn socket_address_identity(fd: std::os::fd::RawFd) -> io::Result<Option<Vec<u8>>> {
+    let mut address: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    if unsafe { libc::getsockname(fd, std::ptr::addr_of_mut!(address).cast(), &mut length) } != 0 {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ENOTSOCK) {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    let bytes = unsafe {
+        std::slice::from_raw_parts(std::ptr::addr_of!(address).cast::<u8>(), length as usize)
+    };
+    Ok(Some(bytes.to_vec()))
+}
+
+#[cfg(unix)]
+struct PublicServiceFutureState<F> {
+    future: Option<Pin<Box<F>>>,
+    handoff: Option<RawFdHandoffGuard>,
+}
+
+#[cfg(unix)]
+impl<F> PublicServiceFutureState<F> {
+    fn finish(mut self) -> Option<RawFdHandoffGuard> {
+        drop(self.future.take());
+        self.handoff.take()
+    }
+}
+
+#[cfg(unix)]
+impl<F> Drop for PublicServiceFutureState<F> {
+    fn drop(&mut self) {
+        // Pingora may already have constructed an owning listener from the raw
+        // descriptor. Always destroy that future/listener before an armed
+        // guard conditionally closes the pre-adoption descriptor.
+        drop(self.future.take());
+        drop(self.handoff.take());
+    }
+}
+
 #[cfg(unix)]
 impl Drop for FailClosedReadyNotifier {
     fn drop(&mut self) {
@@ -188,18 +287,55 @@ async fn run_public_service_future<F>(
     future: F,
     ready_notifier: ServiceReadyNotifier,
     traffic: Arc<TrafficLifecycle>,
-) -> PublicServiceOutcome
+    mut initial_adoption_lock: Option<tokio::sync::OwnedMutexGuard<pingora::server::Fds>>,
+    handoff: Option<RawFdHandoffGuard>,
+    #[cfg(test)] mut after_blocked_adoption_poll: Option<Box<dyn FnOnce() + Send>>,
+) -> (PublicServiceOutcome, Option<RawFdHandoffGuard>)
 where
     F: Future<Output = ()>,
 {
     let _exit = PublicExitGuard { traffic };
     let mut ready_notifier = FailClosedReadyNotifier(Some(ready_notifier));
-    let mut future = Box::pin(std::panic::AssertUnwindSafe(future).catch_unwind());
+    let mut state = PublicServiceFutureState {
+        future: Some(Box::pin(
+            std::panic::AssertUnwindSafe(future).catch_unwind(),
+        )),
+        handoff,
+    };
     let first_poll = std::future::poll_fn(|context| {
-        Poll::Ready(match future.as_mut().poll(context) {
-            Poll::Pending => None,
-            Poll::Ready(result) => Some(result),
-        })
+        let poll = {
+            let future = state.future.as_mut().expect("public future is present");
+            future.as_mut().poll(context)
+        };
+        match poll {
+            Poll::Ready(result) => Poll::Ready(Some(result)),
+            Poll::Pending if state.handoff.is_none() => Poll::Ready(None),
+            Poll::Pending => {
+                #[cfg(test)]
+                if let Some(hook) = after_blocked_adoption_poll.take() {
+                    hook();
+                    return Poll::Pending;
+                }
+                drop(
+                    initial_adoption_lock
+                        .take()
+                        .expect("the first guarded Pingora poll holds its private FD table"),
+                );
+                let poll = {
+                    let future = state.future.as_mut().expect("public future is present");
+                    future.as_mut().poll(context)
+                };
+                state
+                    .handoff
+                    .as_mut()
+                    .expect("public handoff guard is present")
+                    .disarm();
+                Poll::Ready(match poll {
+                    Poll::Pending => None,
+                    Poll::Ready(result) => Some(result),
+                })
+            }
+        }
     })
     .await;
 
@@ -207,20 +343,30 @@ where
         None => ready_notifier.notify_ready(),
         Some(Ok(())) => {
             tracing::error!("public listener service exited before endpoint build completed");
-            return PublicServiceOutcome::FailedBeforeReady;
+            let handoff = state.finish();
+            return (PublicServiceOutcome::FailedBeforeReady, handoff);
         }
         Some(Err(_)) => {
             tracing::error!("public listener endpoint adoption/build panicked");
-            return PublicServiceOutcome::FailedBeforeReady;
+            let handoff = state.finish();
+            return (PublicServiceOutcome::FailedBeforeReady, handoff);
         }
     }
 
-    if future.await.is_err() {
+    let panicked = state
+        .future
+        .as_mut()
+        .expect("public future is present")
+        .await
+        .is_err();
+    let handoff = state.finish();
+    let outcome = if panicked {
         tracing::error!("public listener service panicked after startup");
         PublicServiceOutcome::PanickedAfterReady
     } else {
         PublicServiceOutcome::Exited
-    }
+    };
+    (outcome, handoff)
 }
 
 #[cfg(unix)]
@@ -668,18 +814,23 @@ struct SocketOwner {
 
 #[cfg(unix)]
 impl SocketOwner {
+    #[cfg(test)]
     fn from_path(path: PathBuf) -> io::Result<Self> {
         Ok(Self {
             owned: OwnedPath::from_path(path)?,
         })
     }
 
+    fn from_owned(owned: OwnedPath) -> Self {
+        Self { owned }
+    }
+
     fn path(&self) -> &Path {
         self.owned.path()
     }
 
-    fn publish_as(&mut self, path: PathBuf) -> io::Result<()> {
-        self.owned.publish_as(path)
+    fn publish_as(&mut self, path: PathBuf, name: std::ffi::OsString) -> io::Result<()> {
+        self.owned.publish_as(path, name)
     }
 
     #[cfg(test)]
@@ -708,6 +859,10 @@ pub struct PreboundPublicService<A> {
     startup_failed: Arc<AtomicBool>,
     #[cfg(test)]
     before_fd_table_lock: Option<Box<dyn FnOnce(std::os::fd::RawFd) + Send + Sync>>,
+    #[cfg(test)]
+    after_blocked_adoption_poll: Option<Box<dyn FnOnce() + Send + Sync>>,
+    #[cfg(test)]
+    before_handoff_guard_drop: Option<Box<dyn FnOnce(bool) + Send + Sync>>,
 }
 
 #[cfg(unix)]
@@ -788,13 +943,24 @@ fn bind_unix_socket(path: PathBuf) -> Result<(socket2::Socket, SocketOwner), Lis
 #[cfg(unix)]
 fn bind_unix_socket_with_hook<F>(
     path: PathBuf,
-    after_bind_before_publish: F,
+    after_parent_capture_before_bind: F,
 ) -> Result<(socket2::Socket, SocketOwner), ListenerError>
 where
     F: FnOnce(),
 {
+    let public_name = path
+        .file_name()
+        .ok_or_else(|| {
+            ListenerError::UnixBind(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Unix socket path has no file name",
+            ))
+        })?
+        .to_owned();
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut after_bind_before_publish = Some(after_bind_before_publish);
+    let anchor = AnchoredDirectory::capture(parent).map_err(ListenerError::UnixBind)?;
+    after_parent_capture_before_bind();
+    let stable_parent = anchor.stable_path().map_err(ListenerError::UnixBind)?;
     for _ in 0..4 {
         let mut random = [0_u8; 16];
         openssl::rand::rand_bytes(&mut random).map_err(|_| {
@@ -803,7 +969,8 @@ where
             ))
         })?;
         let random: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
-        let temporary = parent.join(format!(".chp-{random}.sock"));
+        let temporary_name = std::ffi::OsString::from(format!(".c{random}"));
+        let temporary = stable_parent.join(&temporary_name);
         let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
             .map_err(ListenerError::UnixBind)?;
         let address = socket2::SockAddr::unix(&temporary).map_err(ListenerError::UnixBind)?;
@@ -812,15 +979,20 @@ where
             Err(error) if error.kind() == io::ErrorKind::AddrInUse => continue,
             Err(error) => return Err(ListenerError::UnixBind(error)),
         }
-        let mut owner = SocketOwner::from_path(temporary).map_err(ListenerError::UnixBind)?;
+        let mut owner = match anchor.own_entry(temporary.clone(), temporary_name.clone()) {
+            Ok(owned) => SocketOwner::from_owned(owned),
+            Err(error) => {
+                anchor.remove_entry(&temporary_name);
+                return Err(ListenerError::UnixBind(error));
+            }
+        };
         socket.listen(1024).map_err(ListenerError::UnixBind)?;
         socket
             .set_nonblocking(true)
             .map_err(ListenerError::UnixBind)?;
-        after_bind_before_publish
-            .take()
-            .expect("publication hook is called once")();
-        owner.publish_as(path).map_err(ListenerError::UnixBind)?;
+        owner
+            .publish_as(path, public_name.clone())
+            .map_err(ListenerError::UnixBind)?;
         return Ok((socket, owner));
     }
     Err(ListenerError::UnixBind(io::Error::new(
@@ -844,6 +1016,10 @@ impl<A> PreboundPublicService<A> {
             startup_failed,
             #[cfg(test)]
             before_fd_table_lock: None,
+            #[cfg(test)]
+            after_blocked_adoption_poll: None,
+            #[cfg(test)]
+            before_handoff_guard_drop: None,
         })
     }
 
@@ -853,6 +1029,22 @@ impl<A> PreboundPublicService<A> {
         F: FnOnce(std::os::fd::RawFd) + Send + Sync + 'static,
     {
         self.before_fd_table_lock = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn set_after_blocked_adoption_poll_hook<F>(&mut self, hook: F)
+    where
+        F: FnOnce() + Send + Sync + 'static,
+    {
+        self.after_blocked_adoption_poll = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn set_before_handoff_guard_drop_hook<F>(&mut self, hook: F)
+    where
+        F: FnOnce(bool) + Send + Sync + 'static,
+    {
+        self.before_handoff_guard_drop = Some(Box::new(hook));
     }
 }
 
@@ -912,28 +1104,52 @@ where
         if let Some(hook) = self.before_fd_table_lock.take() {
             hook(fd);
         }
+        let mut handoff = match RawFdHandoffGuard::new(fd) {
+            Ok(handoff) => handoff,
+            Err(error) => {
+                tracing::error!(%error, "pre-bound public listener descriptor identity failed");
+                signal_public_startup_failure(&self.startup_failed);
+                return;
+            }
+        };
+        let adoption_fds: ListenFds = Arc::new(tokio::sync::Mutex::new(Fds::new()));
+        let mut adoption_lock = Arc::clone(&adoption_fds).lock_owned().await;
         {
             let mut table = fds.lock().await;
-            table.add(key, fd);
-            let transferred_fd = descriptor.into_raw_fd();
-            debug_assert_eq!(fd, transferred_fd);
+            table.add(key.clone(), fd);
         }
+        adoption_lock.add(key, fd);
+        handoff.arm();
+        let transferred_fd = descriptor.into_raw_fd();
+        debug_assert_eq!(fd, transferred_fd);
         tracing::debug!(listeners_per_fd, "starting Pingora public listener service");
         let shutdown_observer = shutdown.clone();
-        let outcome = run_public_service_future(
+        let (outcome, returned_handoff) = run_public_service_future(
             <Service<A> as pingora::services::Service>::start_service(
                 &mut service,
-                Some(fds),
+                Some(adoption_fds),
                 shutdown,
                 listeners_per_fd,
             ),
             ready_notifier.take(),
             Arc::clone(&self.traffic),
+            Some(adoption_lock),
+            Some(handoff),
+            #[cfg(test)]
+            self.after_blocked_adoption_poll
+                .take()
+                .map(|hook| hook as Box<dyn FnOnce() + Send>),
         )
         .await;
+        let handoff = returned_handoff.expect("public handoff guard is returned");
         if outcome != PublicServiceOutcome::Exited || !*shutdown_observer.borrow() {
             signal_public_startup_failure(&self.startup_failed);
         }
+        #[cfg(test)]
+        if let Some(hook) = self.before_handoff_guard_drop.take() {
+            hook(handoff.armed);
+        }
+        drop(handoff);
         tracing::debug!("Pingora public listener service stopped");
         drop(owner);
     }
@@ -1226,16 +1442,16 @@ mod tests {
         let result = super::ensure_public_startup_supported();
         #[cfg(any(
             target_os = "linux",
+            target_os = "android",
             target_os = "macos",
             target_os = "ios",
-            target_os = "redox"
         ))]
         assert!(result.is_ok());
         #[cfg(not(any(
             target_os = "linux",
+            target_os = "android",
             target_os = "macos",
             target_os = "ios",
-            target_os = "redox"
         )))]
         assert!(matches!(
             result,
@@ -1252,8 +1468,6 @@ mod tests {
         let socket_owner = SocketOwner::from_path(socket_path.clone()).expect("own socket entry");
         let pid_path = directory.path().join("proxy.pid");
         let pid_guard = PidFileGuard::acquire(&pid_path).expect("own PID entry");
-        let api = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind test API");
-        let api_address = api.local_addr().expect("test API address");
         let traffic = Arc::new(TrafficLifecycle::new());
         let (ready_sender, ready_watch) = tokio::sync::watch::channel(false);
 
@@ -1261,9 +1475,12 @@ mod tests {
             async { panic!("injected public endpoint build failure") },
             ServiceReadyNotifier::new(ready_sender),
             Arc::clone(&traffic),
+            None,
+            None,
+            None,
         )
         .await;
-        drop((socket_owner, pid_guard, api));
+        drop((socket_owner, pid_guard));
 
         assert!(
             !*ready_watch.borrow(),
@@ -1272,7 +1489,6 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), traffic.wait_for_accepts_stopped())
             .await
             .expect("public exit acknowledgement did not fire");
-        assert!(std::net::TcpStream::connect(api_address).is_err());
         assert!(!socket_path.exists());
         assert!(!pid_path.exists());
     }
@@ -1286,6 +1502,9 @@ mod tests {
             std::future::pending::<()>(),
             ServiceReadyNotifier::new(ready_sender),
             Arc::clone(&traffic),
+            None,
+            None,
+            None,
         ));
         ready_watch
             .wait_for(|ready| *ready)
@@ -1301,8 +1520,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn cancellation_while_fd_table_is_locked_closes_and_unwinds_before_ready() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_while_pingora_waits_for_its_second_fd_table_lock_closes_every_owner() {
         use pingora::server::{Fds, ListenFds};
         use pingora::services::ServiceWithDependents;
         use std::os::fd::RawFd;
@@ -1342,9 +1561,13 @@ mod tests {
                 reached_lock.notify_one();
             }
         });
+        let blocked_adoption = Arc::new(tokio::sync::Notify::new());
+        public.set_after_blocked_adoption_poll_hook({
+            let blocked_adoption = Arc::clone(&blocked_adoption);
+            move || blocked_adoption.notify_one()
+        });
 
         let fds: ListenFds = Arc::new(tokio::sync::Mutex::new(Fds::new()));
-        let table_guard = fds.lock().await;
         let (_shutdown_sender, shutdown) = tokio::sync::watch::channel(false);
         let (ready_sender, ready_watch) = tokio::sync::watch::channel(false);
         let task = tokio::spawn({
@@ -1361,12 +1584,11 @@ mod tests {
                     .await;
             }
         });
-        tokio::time::timeout(Duration::from_secs(1), reached_lock.notified())
+        tokio::time::timeout(Duration::from_secs(1), blocked_adoption.notified())
             .await
-            .expect("public handoff did not reach the held FD-table lock");
+            .expect("Pingora did not block on its private adoption table");
         task.abort();
         let _ = task.await;
-        drop(table_guard);
 
         assert!(!*ready_watch.borrow(), "cancelled handoff announced ready");
         tokio::time::timeout(Duration::from_secs(1), traffic.wait_for_accepts_stopped())
@@ -1390,6 +1612,157 @@ mod tests {
         } else {
             assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn panic_while_pingora_waits_for_its_second_fd_table_lock_closes_every_owner() {
+        use pingora::server::{Fds, ListenFds};
+        use pingora::services::ServiceWithDependents;
+        use std::os::fd::RawFd;
+        use std::sync::atomic::{AtomicI32, Ordering};
+
+        let directory = tempfile::tempdir_in("/tmp").expect("temporary panic handoff directory");
+        let socket_path = directory.path().join("public.sock");
+        let pid_path = directory.path().join("proxy.pid");
+        let pid_guard = PidFileGuard::acquire(&pid_path).expect("own PID entry");
+        let traffic = Arc::new(TrafficLifecycle::new());
+        let mut service =
+            pingora::services::listening::Service::new("test public".to_string(), TestServerApp);
+        service.add_uds(socket_path.to_str().expect("UTF-8 socket path"), None);
+        let mut public = super::PreboundPublicService::new(
+            service,
+            &crate::config::ListenerConfig::Unix(socket_path.clone()),
+            Arc::clone(&traffic),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .expect("prebind public UDS");
+        let reached_handoff = Arc::new(tokio::sync::Notify::new());
+        let observed_fd = Arc::new(AtomicI32::new(-1));
+        let observed_identity = Arc::new(std::sync::Mutex::new(None));
+        public.set_before_fd_table_lock_hook({
+            let reached_handoff = Arc::clone(&reached_handoff);
+            let observed_fd = Arc::clone(&observed_fd);
+            let observed_identity = Arc::clone(&observed_identity);
+            move |fd: RawFd| {
+                let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+                assert_eq!(unsafe { libc::fstat(fd, &mut stat) }, 0);
+                *observed_identity
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some((stat.st_dev, stat.st_ino));
+                observed_fd.store(fd, Ordering::Release);
+                reached_handoff.notify_one();
+            }
+        });
+        public.set_after_blocked_adoption_poll_hook(|| {
+            panic!("injected panic while Pingora awaits FD adoption")
+        });
+
+        let fds: ListenFds = Arc::new(tokio::sync::Mutex::new(Fds::new()));
+        let (_shutdown_sender, shutdown) = tokio::sync::watch::channel(false);
+        let (ready_sender, ready_watch) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn({
+            let fds = Arc::clone(&fds);
+            async move {
+                let _pid_guard = pid_guard;
+                public
+                    .start_service(
+                        Some(fds),
+                        shutdown,
+                        1,
+                        ServiceReadyNotifier::new(ready_sender),
+                    )
+                    .await;
+            }
+        });
+        assert!(task.await.is_err(), "injected adoption panic was swallowed");
+
+        assert!(!*ready_watch.borrow(), "panicked handoff announced ready");
+        tokio::time::timeout(Duration::from_secs(1), traffic.wait_for_accepts_stopped())
+            .await
+            .expect("panicked handoff did not acknowledge exit");
+        assert!(!socket_path.exists(), "panicked public UDS owner leaked");
+        assert!(!pid_path.exists(), "panicked PID owner leaked");
+        let fd = observed_fd.load(Ordering::Acquire);
+        let identity = observed_identity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("capture descriptor identity");
+        let mut current: libc::stat = unsafe { std::mem::zeroed() };
+        assert!(
+            unsafe { libc::fstat(fd, &mut current) } != 0
+                || (current.st_dev, current.st_ino) != identity,
+            "panicked handoff leaked the transferred descriptor"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_pingora_adoption_disarms_the_handoff_guard() {
+        use pingora::server::{Fds, ListenFds};
+        use pingora::services::ServiceWithDependents;
+
+        let traffic = Arc::new(TrafficLifecycle::new());
+        let mut service =
+            pingora::services::listening::Service::new("test public".to_string(), TestServerApp);
+        service.add_tcp("127.0.0.1:0");
+        let mut public = super::PreboundPublicService::new(
+            service,
+            &crate::config::ListenerConfig::Tcp("127.0.0.1:0".to_string()),
+            traffic,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .expect("prebind public TCP");
+        public.set_before_handoff_guard_drop_hook(|armed| {
+            assert!(!armed, "successful Pingora adoption left its guard armed");
+        });
+        let fds: ListenFds = Arc::new(tokio::sync::Mutex::new(Fds::new()));
+        let (shutdown_sender, shutdown) = tokio::sync::watch::channel(false);
+        let (ready_sender, mut ready_watch) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move {
+            public
+                .start_service(
+                    Some(fds),
+                    shutdown,
+                    1,
+                    ServiceReadyNotifier::new(ready_sender),
+                )
+                .await;
+        });
+        ready_watch
+            .wait_for(|ready| *ready)
+            .await
+            .expect("Pingora adoption readiness");
+        shutdown_sender
+            .send(true)
+            .expect("signal listener shutdown");
+        task.await.expect("successful Pingora service task");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn armed_handoff_guard_does_not_close_a_replaced_descriptor() {
+        use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+
+        let original =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind original listener");
+        let fd = original.into_raw_fd();
+        let mut handoff = super::RawFdHandoffGuard::new(fd).expect("capture descriptor identity");
+        handoff.arm();
+        let source =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind replacement listener");
+        assert_eq!(unsafe { libc::dup2(source.as_raw_fd(), fd) }, fd);
+        let replacement = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+
+        drop(handoff);
+
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::fstat(replacement.as_raw_fd(), &mut stat) },
+            0,
+            "armed handoff guard closed a replacement descriptor"
+        );
     }
 
     #[cfg(unix)]
@@ -1480,6 +1853,13 @@ mod tests {
         let configured = public_parent.join("public.sock");
 
         let (socket, owner) = super::bind_unix_socket_with_hook(configured.clone(), || {
+            assert_eq!(
+                fs::read_dir(&public_parent)
+                    .expect("list parent before bind")
+                    .count(),
+                0,
+                "temporary socket was bound before the parent-capture hook"
+            );
             fs::rename(&public_parent, &captured_parent).expect("rename captured parent");
             fs::create_dir(&public_parent).expect("replace configured parent alias");
             fs::write(&configured, b"foreign destination").expect("install foreign destination");

@@ -76,6 +76,13 @@ ordinary cleanup removes its private directory. Processes sharing the service
 UID are not isolated by Unix file permissions; same-UID namespace attackers
 are outside this enforceable trust boundary.
 
+Public UDS prebinding captures that parent before bind and uses a
+descriptor-backed stable path across configured-alias replacement. The raw
+listener FD remains identity-guarded from Pingora table insertion through
+listener construction; cancellation or panic closes it without readiness, and
+successful adoption disarms the guard. Private-namespace setup faults remove
+only matching empty debris and preserve foreign replacements.
+
 ## `requests_api` timing divergence
 
 Task 5 does not provide exact CHP parity for the timing of

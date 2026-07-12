@@ -5,6 +5,9 @@ use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+
 const QUARANTINE_ATTEMPTS: usize = 8;
 
 #[derive(Clone, Copy)]
@@ -92,6 +95,86 @@ pub(crate) struct OwnedPath {
     public_name: OsString,
 }
 
+/// An opened parent directory and entry name captured before any pathname use.
+#[cfg(unix)]
+pub(crate) struct AnchoredDirectory {
+    directory: File,
+    directory_path: PathBuf,
+}
+
+#[cfg(unix)]
+impl AnchoredDirectory {
+    pub(crate) fn capture(parent: &Path) -> io::Result<Self> {
+        let directory_path = fs::canonicalize(parent)?;
+        let directory = open_directory(&directory_path)?;
+        Ok(Self {
+            directory,
+            directory_path,
+        })
+    }
+
+    pub(crate) fn stable_path(&self) -> io::Result<PathBuf> {
+        stable_directory_path(&self.directory)
+    }
+
+    pub(crate) fn own_entry(
+        &self,
+        public_path: PathBuf,
+        public_name: OsString,
+    ) -> io::Result<OwnedPath> {
+        let stat = rustix::fs::statat(
+            &self.directory,
+            &public_name,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+        Ok(OwnedPath {
+            public_path,
+            identity: FileIdentity {
+                device: stat.st_dev as u64,
+                inode: stat.st_ino,
+            },
+            active: true,
+            directory: self.directory.try_clone()?,
+            directory_path: self.directory_path.clone(),
+            public_name,
+        })
+    }
+
+    pub(crate) fn remove_entry(&self, name: &OsStr) {
+        let _ = rustix::fs::unlinkat(&self.directory, name, rustix::fs::AtFlags::empty());
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn stable_directory_path(directory: &File) -> io::Result<PathBuf> {
+    fs::read_link(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+}
+
+#[cfg(target_vendor = "apple")]
+fn stable_directory_path(directory: &File) -> io::Result<PathBuf> {
+    use std::ffi::CStr;
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut path = [0 as libc::c_char; libc::PATH_MAX as usize];
+    if unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_GETPATH, path.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let bytes = unsafe { CStr::from_ptr(path.as_ptr()) }.to_bytes().to_vec();
+    Ok(PathBuf::from(OsString::from_vec(bytes)))
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+))]
+fn stable_directory_path(_directory: &File) -> io::Result<PathBuf> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "stable path resolution from a directory descriptor is unavailable on this Unix target",
+    ))
+}
+
 impl OwnedPath {
     pub(crate) fn create_new_file(path: PathBuf) -> io::Result<(File, Self)> {
         #[cfg(unix)]
@@ -140,6 +223,7 @@ impl OwnedPath {
     }
 
     #[cfg(unix)]
+    #[cfg(test)]
     pub(crate) fn from_path(path: PathBuf) -> io::Result<Self> {
         let public_name = path
             .file_name()
@@ -189,13 +273,11 @@ impl OwnedPath {
     }
 
     #[cfg(unix)]
-    pub(crate) fn publish_as(&mut self, path: PathBuf) -> io::Result<()> {
-        let destination_name = path
-            .file_name()
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "owned path has no file name")
-            })?
-            .to_owned();
+    pub(crate) fn publish_as(
+        &mut self,
+        path: PathBuf,
+        destination_name: OsString,
+    ) -> io::Result<()> {
         rename_relative_noreplace(
             &self.directory,
             &self.public_name,
@@ -274,6 +356,14 @@ impl OwnedPath {
 
     #[cfg(unix)]
     fn quarantine_entry(&self) -> io::Result<Option<UnixQuarantine>> {
+        self.quarantine_entry_with_fault(|_| Ok(()))
+    }
+
+    #[cfg(unix)]
+    fn quarantine_entry_with_fault<F>(&self, mut fault: F) -> io::Result<Option<UnixQuarantine>>
+    where
+        F: FnMut(NamespaceStage) -> io::Result<()>,
+    {
         for _ in 0..QUARANTINE_ATTEMPTS {
             let private_name = random_private_name()?;
             match rustix::fs::mkdirat(
@@ -285,6 +375,22 @@ impl OwnedPath {
                 Err(error) if error == rustix::io::Errno::EXIST => continue,
                 Err(error) => return Err(io::Error::from_raw_os_error(error.raw_os_error())),
             }
+            let created = rustix::fs::statat(
+                &self.directory,
+                &private_name,
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+            let mut namespace_guard = PrivateNamespaceGuard {
+                parent: &self.directory,
+                name: private_name.clone(),
+                identity: FileIdentity {
+                    device: created.st_dev as u64,
+                    inode: created.st_ino,
+                },
+                armed: true,
+            };
+            fault(NamespaceStage::Open)?;
             let private_directory = match rustix::fs::openat(
                 &self.directory,
                 &private_name,
@@ -299,14 +405,17 @@ impl OwnedPath {
                     return Err(io::Error::from_raw_os_error(error.raw_os_error()));
                 }
             };
+            fault(NamespaceStage::Chmod)?;
             rustix::fs::fchmod(&private_directory, rustix::fs::Mode::from_raw_mode(0o700))
                 .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+            fault(NamespaceStage::Identity)?;
             let directory_identity = FileIdentity::from_file(&private_directory)?;
             let quarantine = UnixQuarantine {
                 name: private_name,
                 directory: private_directory,
                 identity: directory_identity,
             };
+            fault(NamespaceStage::Rename)?;
             let result = rename_relative_noreplace(
                 &self.directory,
                 &self.public_name,
@@ -314,9 +423,11 @@ impl OwnedPath {
                 OsStr::new(PRIVATE_CANDIDATE_NAME),
             );
             match result {
-                Ok(()) => return Ok(Some(quarantine)),
+                Ok(()) => {
+                    namespace_guard.armed = false;
+                    return Ok(Some(quarantine));
+                }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    self.remove_private_directory(&quarantine)?;
                     return Ok(None);
                 }
                 Err(error) => return Err(error),
@@ -326,6 +437,21 @@ impl OwnedPath {
             io::ErrorKind::AlreadyExists,
             "could not reserve a private cleanup quarantine",
         ))
+    }
+
+    #[cfg(all(test, unix))]
+    fn cleanup_with_namespace_fault_for_test(&mut self, stage: NamespaceStage) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        let _ = self.quarantine_entry_with_fault(|current| {
+            if current == stage {
+                Err(io::Error::other("injected private namespace fault"))
+            } else {
+                Ok(())
+            }
+        });
     }
 
     #[cfg(not(unix))]
@@ -446,6 +572,44 @@ struct UnixQuarantine {
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum NamespaceStage {
+    Open,
+    Chmod,
+    Identity,
+    Rename,
+}
+
+#[cfg(unix)]
+struct PrivateNamespaceGuard<'a> {
+    parent: &'a File,
+    name: OsString,
+    identity: FileIdentity,
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl Drop for PrivateNamespaceGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let matches = rustix::fs::statat(
+            self.parent,
+            &self.name,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .ok()
+        .is_some_and(|stat| {
+            self.identity.device == stat.st_dev as u64 && self.identity.inode == stat.st_ino
+        });
+        if matches {
+            let _ = rustix::fs::unlinkat(self.parent, &self.name, rustix::fs::AtFlags::REMOVEDIR);
+        }
+    }
+}
+
+#[cfg(unix)]
 fn open_directory(path: &Path) -> io::Result<File> {
     rustix::fs::open(
         path,
@@ -475,9 +639,9 @@ fn random_private_name() -> io::Result<OsString> {
 
 #[cfg(any(
     target_os = "linux",
+    target_os = "android",
     target_os = "macos",
-    target_os = "ios",
-    target_os = "redox"
+    target_os = "ios"
 ))]
 fn rename_relative_noreplace(
     source_directory: &File,
@@ -499,9 +663,9 @@ fn rename_relative_noreplace(
     unix,
     not(any(
         target_os = "linux",
+        target_os = "android",
         target_os = "macos",
-        target_os = "ios",
-        target_os = "redox"
+        target_os = "ios"
     ))
 ))]
 fn rename_relative_noreplace(
@@ -533,8 +697,51 @@ fn rename_noreplace(_source: &Path, _destination: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::OwnedPath;
+    use super::{NamespaceStage, OwnedPath};
     use std::fs;
+
+    #[cfg(unix)]
+    fn assert_namespace_fault_leaves_no_private_debris(stage: NamespaceStage) {
+        let root = tempfile::tempdir().expect("temporary namespace fault root");
+        let public = root.path().join("owned.sock");
+        fs::write(&public, b"owned").expect("create owned entry");
+        let mut owner = OwnedPath::from_path(public.clone()).expect("capture owned entry");
+
+        owner.cleanup_with_namespace_fault_for_test(stage);
+
+        assert_eq!(fs::read(&public).expect("owned entry remains"), b"owned");
+        assert_eq!(
+            fs::read_dir(root.path())
+                .expect("list namespace fault root")
+                .count(),
+            1,
+            "fault left a private cleanup namespace"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn openat_fault_removes_empty_private_namespace() {
+        assert_namespace_fault_leaves_no_private_debris(NamespaceStage::Open);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fchmod_fault_removes_empty_private_namespace() {
+        assert_namespace_fault_leaves_no_private_debris(NamespaceStage::Chmod);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_fault_removes_empty_private_namespace() {
+        assert_namespace_fault_leaves_no_private_debris(NamespaceStage::Identity);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_fault_removes_empty_private_namespace() {
+        assert_namespace_fault_leaves_no_private_debris(NamespaceStage::Rename);
+    }
 
     #[cfg(unix)]
     #[test]
