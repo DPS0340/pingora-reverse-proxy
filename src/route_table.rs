@@ -197,12 +197,25 @@ pub struct MutationDrainOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MutationStatus {
     pub sealed: bool,
+    pub seal: MutationSeal,
     pub active_mutations: usize,
+}
+
+/// Terminal mutation-admission state exposed by [`RouteRegistry::mutation_status`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MutationSeal {
+    Open,
+    Shutdown,
+    BackendPanic,
 }
 
 /// Fixed error returned by every mutation attempted after shutdown sealing.
 pub const MUTATION_ADMISSION_SEALED_ERROR: &str =
     "route registry is shutting down; mutation admission is sealed";
+
+/// Fixed error returned after a supervised backend panic terminally seals a registry.
+pub const MUTATION_PANIC_SEALED_ERROR: &str =
+    "route registry is terminally sealed after a backend panic";
 
 /// Maximum detached mutation diagnostics retained between drains.
 ///
@@ -217,7 +230,7 @@ enum DetachedMutationDiagnostic {
 }
 
 struct MutationTrackerState {
-    sealed: bool,
+    seal: MutationSeal,
     active: usize,
     diagnostics: VecDeque<DetachedMutationDiagnostic>,
     dropped_detached_failures: usize,
@@ -227,7 +240,7 @@ struct MutationTrackerState {
 impl Default for MutationTrackerState {
     fn default() -> Self {
         Self {
-            sealed: false,
+            seal: MutationSeal::Open,
             active: 0,
             diagnostics: VecDeque::with_capacity(DETACHED_MUTATION_DIAGNOSTIC_CAPACITY),
             dropped_detached_failures: 0,
@@ -252,8 +265,14 @@ impl MutationTracker {
 
     fn begin(self: &Arc<Self>, operation: MutationOperation) -> Result<ActiveMutation, StoreError> {
         let mut state = self.state();
-        if state.sealed {
-            return Err(StoreError::message(MUTATION_ADMISSION_SEALED_ERROR));
+        match state.seal {
+            MutationSeal::Open => {}
+            MutationSeal::Shutdown => {
+                return Err(StoreError::message(MUTATION_ADMISSION_SEALED_ERROR));
+            }
+            MutationSeal::BackendPanic => {
+                return Err(StoreError::message(MUTATION_PANIC_SEALED_ERROR));
+            }
         }
         state.active = state.active.saturating_add(1);
         drop(state);
@@ -285,15 +304,29 @@ impl MutationTracker {
     fn status(&self) -> MutationStatus {
         let state = self.state();
         MutationStatus {
-            sealed: state.sealed,
+            sealed: state.seal != MutationSeal::Open,
+            seal: state.seal,
             active_mutations: state.active,
         }
+    }
+
+    fn panic_seal(&self) {
+        self.state().seal = MutationSeal::BackendPanic;
+    }
+
+    fn reject_if_panic_sealed(&self) -> Result<(), StoreError> {
+        if self.state().seal == MutationSeal::BackendPanic {
+            return Err(StoreError::message(MUTATION_PANIC_SEALED_ERROR));
+        }
+        Ok(())
     }
 
     async fn seal_and_drain(&self, timeout: Duration) -> MutationDrainOutcome {
         {
             let mut state = self.state();
-            state.sealed = true;
+            if state.seal == MutationSeal::Open {
+                state.seal = MutationSeal::Shutdown;
+            }
             if state.active == 0 {
                 return state.take_outcome(false);
             }
@@ -402,6 +435,7 @@ impl Drop for ActiveMutation {
 
 struct CatchUnwindFuture<F> {
     future: Pin<Box<F>>,
+    tracker: Arc<MutationTracker>,
 }
 
 struct MutationResponse<T> {
@@ -410,9 +444,10 @@ struct MutationResponse<T> {
 }
 
 impl<F> CatchUnwindFuture<F> {
-    fn new(future: F) -> Self {
+    fn new(future: F, tracker: Arc<MutationTracker>) -> Self {
         Self {
             future: Box::pin(future),
+            tracker,
         }
     }
 }
@@ -428,6 +463,9 @@ impl<F: Future> Future for CatchUnwindFuture<F> {
             Ok(Poll::Ready(output)) => Poll::Ready(Ok(output)),
             Ok(Poll::Pending) => Poll::Pending,
             Err(payload) => {
+                // The supervisor retains the mutation mutex outside this caught
+                // future, so queued operations cannot pass their fence first.
+                self.tracker.panic_seal();
                 // A panic payload is arbitrary user/backend code. Dropping it can
                 // panic again after the supervised poll scope has unwound, which
                 // would bypass mutation redaction and may abort on a double panic.
@@ -501,7 +539,7 @@ impl RouteSnapshot {
 pub struct RouteRegistry {
     store: Arc<dyn Store>,
     snapshot: ArcSwap<RouteSnapshot>,
-    mutation: Mutex<()>,
+    mutation: Arc<Mutex<()>>,
     mutations: Arc<MutationTracker>,
 }
 
@@ -515,7 +553,7 @@ impl RouteRegistry {
         Ok(Arc::new(Self {
             store,
             snapshot: ArcSwap::from_pointee(RouteSnapshot::from_routes(routes)),
-            mutation: Mutex::new(()),
+            mutation: Arc::new(Mutex::new(())),
             mutations: Arc::new(MutationTracker::default()),
         }))
     }
@@ -545,7 +583,6 @@ impl RouteRegistry {
     }
 
     async fn put_owned(&self, key: RouteKey, data: RouteData) -> Result<(), StoreError> {
-        let _mutation = self.mutation.lock().await;
         let mut routes = self.snapshot.load().routes.clone();
         self.store.put(key.clone(), data.clone()).await?;
         routes.replace(key, data);
@@ -573,7 +610,6 @@ impl RouteRegistry {
         target: String,
         extra: Map<String, Value>,
     ) -> Result<(), StoreError> {
-        let _mutation = self.mutation.lock().await;
         let mut routes = self.snapshot.load().routes.clone();
         let data = self.store.add(key.clone(), target, extra).await?;
         routes.replace(key, data);
@@ -600,7 +636,6 @@ impl RouteRegistry {
         key: RouteKey,
         at: DateTime<Utc>,
     ) -> Result<(), StoreError> {
-        let _mutation = self.mutation.lock().await;
         let mut routes = self.snapshot.load().routes.clone();
         self.store.update_activity(&key, at).await?;
         routes.update_activity(&key, at);
@@ -619,7 +654,6 @@ impl RouteRegistry {
     }
 
     async fn delete_owned(&self, key: RouteKey) -> Result<Option<RouteData>, StoreError> {
-        let _mutation = self.mutation.lock().await;
         let mut routes = self.snapshot.load().routes.clone();
         let deleted = self.store.delete(&key).await?;
         routes.remove(&key);
@@ -668,9 +702,16 @@ impl RouteRegistry {
             }
         };
         let (response, receiver) = oneshot::channel();
+        let mutation_lock = Arc::clone(&self.mutation);
+        let tracker = Arc::clone(&self.mutations);
         let spawned = catch_unwind(AssertUnwindSafe(|| {
             runtime.spawn(async move {
-                match CatchUnwindFuture::new(mutation).await {
+                let _mutation_guard = mutation_lock.lock().await;
+                let supervised = match tracker.reject_if_panic_sealed() {
+                    Ok(()) => CatchUnwindFuture::new(mutation, Arc::clone(&tracker)).await,
+                    Err(error) => Ok(Err(error)),
+                };
+                match supervised {
                     Ok(result) => {
                         let detached_error = result.as_ref().err().cloned();
                         let (acknowledged, acknowledgment) = oneshot::channel();

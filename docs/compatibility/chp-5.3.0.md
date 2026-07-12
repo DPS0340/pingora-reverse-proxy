@@ -34,6 +34,13 @@ with output errors ignored and without formatting the payload or `Debug` data.
 Without explicit installation, the registry does not claim process-hook payload
 redaction.
 
+The first caught backend panic atomically installs a terminal backend-panic
+seal while the registry mutation mutex is still held. Already-admitted queued
+work and all later mutations then fail before another store call. The opaque
+panic payload is intentionally quarantined instead of dropped because payload
+`Drop` is arbitrary code and can panic again; mutex serialization plus the
+terminal fence bounds this quarantine to one payload per registry.
+
 The task holds the registry alive until the backend operation finishes. Store
 implementations must use finite operation timeouts; an ordinary timeout returns
 an error, releases the mutation lock, and drops the task's registry reference.

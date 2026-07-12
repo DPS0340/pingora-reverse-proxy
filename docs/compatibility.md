@@ -35,6 +35,15 @@ once; still-active tasks report later outcomes to the next drain. Panic
 diagnostics contain only the operation kind and fixed text, while debug
 formatting redacts detached backend error text.
 
+A caught backend panic terminally changes that registry to
+`MutationSeal::BackendPanic`. The mutation mutex remains held while the panic
+fence is installed, so already-admitted work queued behind the failing
+operation and every later mutation are rejected before entering the store.
+Consequently an opaque panic payload is quarantined with `mem::forget` at most
+once per registry; arbitrary payload `Drop` code is never executed, and the
+quarantine cannot grow per management request. This is a fail-stop store
+contract violation, distinct from the normal graceful-shutdown seal.
+
 `RouteRegistry::load` never installs or replaces a process panic hook. The
 application must explicitly call
 `install_route_mutation_panic_hook_at_startup()` once, after its other

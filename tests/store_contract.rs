@@ -10,8 +10,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use pingora_reverse_proxy::route::{RouteData, RouteKey};
 use pingora_reverse_proxy::route_table::{
-    install_route_mutation_panic_hook_at_startup, MutationOperation, RouteMatch, RouteRegistry,
-    DETACHED_MUTATION_DIAGNOSTIC_CAPACITY, MUTATION_ADMISSION_SEALED_ERROR,
+    install_route_mutation_panic_hook_at_startup, MutationOperation, MutationSeal, RouteMatch,
+    RouteRegistry, DETACHED_MUTATION_DIAGNOSTIC_CAPACITY, MUTATION_ADMISSION_SEALED_ERROR,
+    MUTATION_PANIC_SEALED_ERROR,
 };
 use pingora_reverse_proxy::store::memory::MemoryStore;
 use pingora_reverse_proxy::store::{Store, StoreError};
@@ -1314,6 +1315,186 @@ impl Store for AdmissionCountingStore {
         self.mutation_calls.fetch_add(1, Ordering::SeqCst);
         Ok(None)
     }
+}
+
+struct FirstMutationPanicStore {
+    mutation_calls: AtomicUsize,
+    first_entered: Semaphore,
+    release_first: Semaphore,
+}
+
+impl FirstMutationPanicStore {
+    fn new() -> Self {
+        Self {
+            mutation_calls: AtomicUsize::new(0),
+            first_entered: Semaphore::new(0),
+            release_first: Semaphore::new(0),
+        }
+    }
+
+    fn enter(&self) -> bool {
+        self.mutation_calls.fetch_add(1, Ordering::SeqCst) == 0
+    }
+}
+
+#[async_trait]
+impl Store for FirstMutationPanicStore {
+    async fn snapshot(&self) -> Result<BTreeMap<RouteKey, RouteData>, StoreError> {
+        Ok(BTreeMap::new())
+    }
+
+    async fn add(
+        &self,
+        _key: RouteKey,
+        target: String,
+        extra: Map<String, serde_json::Value>,
+    ) -> Result<RouteData, StoreError> {
+        assert!(!self.enter(), "the first store mutation must be put");
+        Ok(RouteData {
+            target,
+            last_activity: Utc::now(),
+            extra,
+        })
+    }
+
+    async fn put(&self, _key: RouteKey, _data: RouteData) -> Result<(), StoreError> {
+        if self.enter() {
+            self.first_entered.add_permits(1);
+            self.release_first.acquire().await.unwrap().forget();
+            std::panic::panic_any(PanickingPayloadDrop);
+        }
+        Ok(())
+    }
+
+    async fn update_activity(&self, _key: &RouteKey, _at: DateTime<Utc>) -> Result<(), StoreError> {
+        assert!(!self.enter(), "the first store mutation must be put");
+        Ok(())
+    }
+
+    async fn delete(&self, _key: &RouteKey) -> Result<Option<RouteData>, StoreError> {
+        assert!(!self.enter(), "the first store mutation must be put");
+        Ok(None)
+    }
+}
+
+#[tokio::test]
+async fn first_backend_panic_terminally_seals_queued_and_later_mutations() {
+    let store = Arc::new(FirstMutationPanicStore::new());
+    let registry = RouteRegistry::load(store.clone()).await.unwrap();
+    let first = tokio::spawn({
+        let registry = Arc::clone(&registry);
+        async move {
+            registry
+                .put(key("/panic/first"), route("http://panic-first.example"))
+                .await
+                .map(|_| ())
+        }
+    });
+    store.first_entered.acquire().await.unwrap().forget();
+
+    let queued = [
+        tokio::spawn({
+            let registry = Arc::clone(&registry);
+            async move {
+                registry
+                    .add(
+                        key("/panic/queued-add"),
+                        "http://queued-add.example".to_owned(),
+                        Map::new(),
+                    )
+                    .await
+                    .map(|_| ())
+            }
+        }),
+        tokio::spawn({
+            let registry = Arc::clone(&registry);
+            async move {
+                registry
+                    .put(key("/panic/queued-put"), route("http://queued-put.example"))
+                    .await
+                    .map(|_| ())
+            }
+        }),
+        tokio::spawn({
+            let registry = Arc::clone(&registry);
+            async move {
+                registry
+                    .update_activity(&key("/panic/queued-activity"), Utc::now())
+                    .await
+                    .map(|_| ())
+            }
+        }),
+        tokio::spawn({
+            let registry = Arc::clone(&registry);
+            async move {
+                registry
+                    .delete(&key("/panic/queued-delete"))
+                    .await
+                    .map(|_| ())
+            }
+        }),
+    ];
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if registry.mutation_status().active_mutations == 5 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    store.release_first.add_permits(1);
+
+    assert_eq!(
+        first.await.unwrap().unwrap_err().to_string(),
+        "route put mutation task panicked"
+    );
+    for mutation in queued {
+        assert_eq!(
+            mutation.await.unwrap().unwrap_err().to_string(),
+            MUTATION_PANIC_SEALED_ERROR
+        );
+    }
+
+    let status = registry.mutation_status();
+    assert!(status.sealed);
+    assert_eq!(status.seal, MutationSeal::BackendPanic);
+    assert_eq!(status.active_mutations, 0);
+
+    let later_key = key("/panic/later");
+    let later_errors = [
+        registry
+            .add(
+                later_key.clone(),
+                "http://later-add.example".to_owned(),
+                Map::new(),
+            )
+            .await
+            .unwrap_err(),
+        registry
+            .put(later_key.clone(), route("http://later-put.example"))
+            .await
+            .unwrap_err(),
+        registry
+            .update_activity(&later_key, Utc::now())
+            .await
+            .unwrap_err(),
+        registry.delete(&later_key).await.unwrap_err(),
+    ];
+    assert!(later_errors
+        .iter()
+        .all(|error| error.to_string() == MUTATION_PANIC_SEALED_ERROR));
+
+    let drained = registry.drain_mutations(Duration::ZERO).await;
+    assert!(!drained.timed_out);
+    assert_eq!(drained.active_mutations, 0);
+    assert!(drained.detached_failures.is_empty());
+    assert!(drained.detached_panics.is_empty());
+    assert_eq!(registry.mutation_status().seal, MutationSeal::BackendPanic);
+    assert_eq!(store.mutation_calls.load(Ordering::SeqCst), 1);
+    assert!(registry.all().is_empty());
 }
 
 #[tokio::test]
