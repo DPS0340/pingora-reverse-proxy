@@ -77,11 +77,18 @@ UID are not isolated by Unix file permissions; same-UID namespace attackers
 are outside this enforceable trust boundary.
 
 Public UDS prebinding captures that parent before bind and uses a
-descriptor-backed stable path across configured-alias replacement. The raw
-listener FD remains identity-guarded from Pingora table insertion through
-listener construction; cancellation or panic closes it without readiness, and
-successful adoption disarms the guard. Private-namespace setup faults remove
-only matching empty debris and preserve foreign replacements.
+descriptor-backed stable published path as Pingora's own `ListenAddr`, so
+Pingora's UDS permission update cannot follow a replaced configured alias.
+Before readiness, a reopened configured parent and descriptor-relative basename
+lookup must match the captured parent and socket identities; otherwise startup
+fails closed and only the anchored socket is cleaned. The raw listener FD
+remains identity-guarded from Pingora table insertion through listener
+construction; cancellation or panic closes it without readiness, and successful
+adoption disarms the guard. Immediately after `mkdirat`, private-namespace
+cleanup opens the directory without following links, captures its descriptor
+identity, then arms cleanup before pathname verification. Initial-`statat`
+faults remove matching empty debris; open failures and unknown or foreign
+identities are preserved.
 
 ## `requests_api` timing divergence
 

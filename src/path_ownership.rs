@@ -10,7 +10,7 @@ use std::os::fd::AsRawFd;
 
 const QUARANTINE_ATTEMPTS: usize = 8;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) struct FileIdentity {
     #[cfg(unix)]
     device: u64,
@@ -148,7 +148,10 @@ impl AnchoredDirectory {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn stable_directory_path(directory: &File) -> io::Result<PathBuf> {
-    fs::read_link(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+    Ok(PathBuf::from(format!(
+        "/proc/self/fd/{}",
+        directory.as_raw_fd()
+    )))
 }
 
 #[cfg(target_vendor = "apple")]
@@ -268,8 +271,25 @@ impl OwnedPath {
     }
 
     #[cfg(unix)]
-    pub(crate) fn path(&self) -> &Path {
-        &self.public_path
+    pub(crate) fn stable_entry_path(&self) -> io::Result<PathBuf> {
+        Ok(stable_directory_path(&self.directory)?.join(&self.public_name))
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn configured_entry_matches(&self) -> io::Result<bool> {
+        let parent = self.public_path.parent().unwrap_or_else(|| Path::new("."));
+        let reopened_path = fs::canonicalize(parent)?;
+        let reopened = open_directory(&reopened_path)?;
+        if FileIdentity::from_file(&reopened)? != FileIdentity::from_file(&self.directory)? {
+            return Ok(false);
+        }
+        let stat = rustix::fs::statat(
+            &reopened,
+            &self.public_name,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+        Ok(self.identity.device == stat.st_dev as u64 && self.identity.inode == stat.st_ino)
     }
 
     #[cfg(unix)]
@@ -375,21 +395,6 @@ impl OwnedPath {
                 Err(error) if error == rustix::io::Errno::EXIST => continue,
                 Err(error) => return Err(io::Error::from_raw_os_error(error.raw_os_error())),
             }
-            let created = rustix::fs::statat(
-                &self.directory,
-                &private_name,
-                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-            )
-            .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
-            let mut namespace_guard = PrivateNamespaceGuard {
-                parent: &self.directory,
-                name: private_name.clone(),
-                identity: FileIdentity {
-                    device: created.st_dev as u64,
-                    inode: created.st_ino,
-                },
-                armed: true,
-            };
             fault(NamespaceStage::Open)?;
             let private_directory = match rustix::fs::openat(
                 &self.directory,
@@ -405,11 +410,33 @@ impl OwnedPath {
                     return Err(io::Error::from_raw_os_error(error.raw_os_error()));
                 }
             };
+            let directory_identity = FileIdentity::from_file(&private_directory)?;
+            let mut namespace_guard = PrivateNamespaceGuard {
+                parent: &self.directory,
+                name: private_name.clone(),
+                identity: directory_identity,
+                armed: true,
+            };
+            fault(NamespaceStage::InitialStat)?;
+            let created = rustix::fs::statat(
+                &self.directory,
+                &private_name,
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+            let published_identity = FileIdentity {
+                device: created.st_dev as u64,
+                inode: created.st_ino,
+            };
+            if published_identity != directory_identity {
+                return Err(io::Error::other(
+                    "private cleanup namespace changed before verification",
+                ));
+            }
             fault(NamespaceStage::Chmod)?;
             rustix::fs::fchmod(&private_directory, rustix::fs::Mode::from_raw_mode(0o700))
                 .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
             fault(NamespaceStage::Identity)?;
-            let directory_identity = FileIdentity::from_file(&private_directory)?;
             let quarantine = UnixQuarantine {
                 name: private_name,
                 directory: private_directory,
@@ -574,6 +601,7 @@ struct UnixQuarantine {
 #[cfg(unix)]
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum NamespaceStage {
+    InitialStat,
     Open,
     Chmod,
     Identity,
@@ -698,7 +726,7 @@ fn rename_noreplace(_source: &Path, _destination: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{NamespaceStage, OwnedPath};
-    use std::fs;
+    use std::{fs, io};
 
     #[cfg(unix)]
     fn assert_namespace_fault_leaves_no_private_debris(stage: NamespaceStage) {
@@ -721,8 +749,79 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn openat_fault_removes_empty_private_namespace() {
-        assert_namespace_fault_leaves_no_private_debris(NamespaceStage::Open);
+    fn openat_fault_preserves_unverified_private_namespace() {
+        let root = tempfile::tempdir().expect("temporary open fault root");
+        let public = root.path().join("owned.sock");
+        fs::write(&public, b"owned").expect("create owned entry");
+        let mut owner = OwnedPath::from_path(public.clone()).expect("capture owned entry");
+
+        owner.cleanup_with_namespace_fault_for_test(NamespaceStage::Open);
+
+        assert_eq!(fs::read(&public).expect("owned entry remains"), b"owned");
+        let private_namespace = fs::read_dir(root.path())
+            .expect("list open fault root")
+            .find_map(|entry| {
+                let entry = entry.expect("read open fault entry");
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".chp-cleanup-")
+                    .then_some(entry.path())
+            })
+            .expect("unverified private namespace was removed");
+        assert!(private_namespace.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initial_statat_fault_removes_empty_private_namespace() {
+        assert_namespace_fault_leaves_no_private_debris(NamespaceStage::InitialStat);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_at_initial_statat_boundary_is_preserved() {
+        let root = tempfile::tempdir().expect("temporary initial-stat replacement root");
+        let public = root.path().join("owned.sock");
+        let displaced = root.path().join("displaced-private");
+        fs::write(&public, b"owned").expect("create owned entry");
+        let owner = OwnedPath::from_path(public.clone()).expect("capture owned entry");
+
+        let result = owner.quarantine_entry_with_fault(|stage| {
+            if stage != NamespaceStage::InitialStat {
+                return Ok(());
+            }
+            let private_namespace = fs::read_dir(root.path())
+                .expect("list cleanup root")
+                .find_map(|entry| {
+                    let entry = entry.expect("read cleanup entry");
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".chp-cleanup-")
+                        .then_some(entry.path())
+                })
+                .expect("private namespace exists");
+            fs::rename(&private_namespace, &displaced).expect("displace private namespace");
+            fs::create_dir(&private_namespace).expect("install empty foreign replacement");
+            Err(io::Error::other("injected initial statat fault"))
+        });
+
+        assert!(result.is_err(), "injected initial statat fault succeeded");
+        let replacement = fs::read_dir(root.path())
+            .expect("list cleanup root after replacement")
+            .find_map(|entry| {
+                let entry = entry.expect("read replacement entry");
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".chp-cleanup-")
+                    .then_some(entry.path())
+            })
+            .expect("empty foreign replacement was removed");
+        assert!(replacement.is_dir());
+        assert!(displaced.is_dir(), "owned namespace was not displaced");
+        assert_eq!(fs::read(&public).expect("owned entry remains"), b"owned");
     }
 
     #[cfg(unix)]

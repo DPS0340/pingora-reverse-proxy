@@ -98,8 +98,16 @@ The non-owning raw-FD guard remains armed after table insertion until Pingora's
 listener construction has completed; successful adoption explicitly disarms
 it. UDS prebinding opens the canonical parent before bind and continues through
 its descriptor-backed stable path if the configured parent alias is replaced.
-Failures while constructing a private cleanup namespace remove only the
-identity-matching empty namespace and never delete a foreign replacement.
+Pingora receives that anchored published path, never the configured alias, for
+its mandatory UDS permission update. Immediately before real readiness is
+forwarded, the configured parent is reopened and the basename is checked
+relative to it against both the captured parent and owned socket identities;
+an alias change therefore exits without readiness and cleans only the anchored
+socket. Immediately after `mkdirat`, private cleanup opens the new directory
+with `O_DIRECTORY|O_NOFOLLOW`, captures its descriptor identity, and arms
+cleanup before pathname verification. Initial-`statat` faults therefore remove
+the identity-matching empty namespace; open failures and foreign or unknown
+identities are preserved.
 
 | CHP long option | Classification | Configuration behavior and contract test |
 |---|---|---|

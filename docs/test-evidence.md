@@ -470,9 +470,11 @@ Non-Unix public startup now fails synchronously before PID, API, metrics, or
 redirect binding. On Unix, management listeners depend on actual public
 readiness. The public wrapper polls Pingora's service through its synchronous FD
 adoption/listener-build prefix before forwarding `ServiceReadyNotifier`, catches
-panics, and uses an RAII exit guard for panic and cancellation. A debug-only
-injected build failure proves no readiness, nonzero orderly exit, public/API/PID
-cleanup, no operational API, and no publication/quarantine debris. The
+panics, and uses an RAII exit guard for panic and cancellation. At this
+checkpoint, a debug-only injected build failure proved no readiness, nonzero
+orderly exit, public/API/PID cleanup, no operational API, and no
+publication/quarantine debris; that debug hook was removed by the later
+anchored-readiness finalization below. The
 `process::exit` bypass was removed. Traffic admission remains single-release:
 the request context takes its token in logging and its `Drop` fallback owns
 cancellation/panic cleanup.
@@ -505,9 +507,11 @@ was added.
 ### Task 8 final atomic-ownership and shutdown-bound wave (2026-07-13)
 
 The interrupted worktree based on `c34ddd4` was preserved and audited. Focused
-unit verification passed `25/25`. The Task 8 integration command passed `27/27`
-(`23` TLS/Unix/listener/lifecycle and `4` WebSocket), including a real Pingora
-listener-build failure produced by adopting `/dev/null` as a non-listener FD.
+unit verification passed `25/25`. At this checkpoint, the Task 8 integration
+command passed `27/27` (`23` TLS/Unix/listener/lifecycle and `4` WebSocket),
+including a real Pingora listener-build failure produced by adopting `/dev/null`
+as a non-listener FD. That integration injection was removed by the later
+anchored-readiness finalization below.
 
 The final-wave stress axes each passed 20 consecutive runs:
 
@@ -596,3 +600,61 @@ requested target name `routes_contract` does not exist in this repository;
 Cargo lists the suite as `route_properties`, and `PROPTEST_CASES=512 cargo test
 --test route_properties` passed `11/11`. Formatting, warnings-denied Clippy,
 all-target/all-feature checking, and whitespace validation also passed.
+
+### Task 8 anchored Unix readiness finalization (2026-07-13)
+
+The final review found that public UDS prebinding published through the captured
+parent, but Pingora still received the original configured pathname and applied
+its mandatory socket permissions through that alias. Deterministic tests now
+replace the parent (a) after capture and before bind and (b) after bind but
+before readiness, then run the real Pingora 0.8.1 FD-adoption/listener builder.
+In both cases the configured foreign entry retains its exact bytes and mode,
+readiness is withheld, exit is acknowledged, only the anchored owned socket is
+removed, and no temporary or quarantine entry remains.
+
+Pingora's UDS `ListenAddr` is now resolved from the retained directory
+descriptor plus the published basename at adoption. The original configured
+path remains separate and is reopened only for a descriptor-relative parent and
+socket identity check immediately before forwarding readiness. Immediately
+after `mkdirat`, private cleanup opens the directory with
+`O_DIRECTORY|O_NOFOLLOW`, captures its descriptor identity, and then arms RAII
+cleanup before the injected and real `statat` verification. An initial-`statat`
+fault cleans the identity-matching directory, an open failure preserves the
+unverified entry, and a replacement at the verification boundary is retained.
+
+The former `CHP_TASK8_INJECT_PUBLIC_BUILD_FAILURE` debug-binary environment
+hook and `/dev/null` integration dependency were removed. A `cfg(test)`-only
+unique temporary-file descriptor instead traverses Pingora's real listener
+builder, proves its non-socket panic is caught, withholds readiness, records
+startup failure, acknowledges exit, and closes the unique descriptor. Ordinary
+debug binaries contain no corresponding injection surface.
+
+The final audit preserved base `7140efc` and corrected one remaining namespace
+boundary before verification. The regression test first demonstrated that the
+old recovery path could re-stat an empty foreign replacement by name, adopt its
+identity, and unlink it. The implementation now performs
+`mkdirat -> openat(O_DIRECTORY|O_NOFOLLOW) -> fstat -> arm guard -> statat`.
+Consequently an open failure with no captured identity preserves the unverified
+entry, an injected initial-`statat` failure removes the identity-matching owned
+directory, and replacement between descriptor capture and pathname verification
+is preserved. The guard has no identity-absent unlink branch.
+
+Final focused verification passed library unit tests `37/37`, TLS/Unix contracts
+`22/22`, and WebSocket contracts `4/4`. The lower TLS/Unix count is intentional:
+the removed debug-environment integration test is replaced by the library-level
+unique-descriptor contract that traverses Pingora's real listener builder.
+
+Each new alias/readiness and ownership axis passed `20/20`: parent replacement
+after capture but before bind, parent replacement after bind but before
+readiness, identity-captured initial-`statat` cleanup, replacement preservation
+at that boundary, real non-socket listener-build failure, cancellation and panic
+at Pingora's second FD-table lock, successful handoff disarm, and late numeric-FD
+replacement safety. The complete 37-test library suite also passed `100/100`
+runs under Cargo's default parallel scheduler.
+
+`PROPTEST_CASES=256 cargo test --all-targets --all-features` passed `248/248`:
+library `37`, binary `0`, API `33`, config `27`, proxy `69`, routes `11`, store
+`45`, TLS/Unix `22`, and WebSocket `4`. `PROPTEST_CASES=512 cargo test --test
+route_properties` passed `11/11`. Formatting, warnings-denied Clippy,
+all-target/all-feature checking, whitespace validation, final diff review, and
+status review all passed. No Task 9 implementation or broad refactor was added.

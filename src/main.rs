@@ -11,8 +11,8 @@ use pingora_reverse_proxy::api::{router as api_router, ApiState};
 #[cfg(unix)]
 use pingora_reverse_proxy::api_server::PreboundPublicService;
 use pingora_reverse_proxy::api_server::{
-    ensure_listener_paths_distinct, ensure_public_startup_supported, install_listener,
-    metrics_router, redirect_router, ApiServer, ListenerError, ManagementLifecycle,
+    ensure_listener_paths_distinct, ensure_public_startup_supported, metrics_router,
+    redirect_router, ApiServer, ListenerError, ManagementLifecycle,
 };
 use pingora_reverse_proxy::config::{
     AppConfig, Cli, ConfigError, ListenerConfig, LogLevel, StoreConfig,
@@ -162,17 +162,13 @@ fn run() -> Result<(), StartupError> {
     }
     server.bootstrap();
 
-    let mut public = pingora::proxy::http_proxy_service(&server.configuration, proxy);
-    install_listener(
-        &mut public,
-        config.public_listener.clone(),
-        config.public_tls.clone(),
-    )?;
+    let public = pingora::proxy::http_proxy_service(&server.configuration, proxy);
     #[cfg(unix)]
     {
         let public_handle = server.add_service(PreboundPublicService::new(
             public,
             &config.public_listener,
+            config.public_tls.clone(),
             Arc::clone(&traffic),
             Arc::clone(&public_service_failed),
         )?);

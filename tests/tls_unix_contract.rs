@@ -219,60 +219,6 @@ fn every_public_api_metrics_tcp_collision_fails_before_startup() {
     }
 }
 
-#[cfg(unix)]
-#[test]
-#[serial]
-fn injected_public_build_failure_exits_nonzero_without_ready_api_or_owned_files() {
-    use std::os::unix::net::UnixStream;
-
-    let directory = tempfile::tempdir().expect("temporary injected startup directory");
-    let public = directory.path().join("public.sock");
-    let api = directory.path().join("api.sock");
-    let pid = directory.path().join("proxy.pid");
-    let mut binary = Binary::spawn_with_env(
-        &[
-            "--socket".into(),
-            public.display().to_string(),
-            "--api-socket".into(),
-            api.display().to_string(),
-            "--pid-file".into(),
-            pid.display().to_string(),
-        ],
-        &[("CHP_TASK8_INJECT_PUBLIC_BUILD_FAILURE", "1")],
-    );
-
-    assert!(
-        !binary.wait_for_graceful_exit().success(),
-        "injected public build failure exited successfully"
-    );
-    assert!(
-        binary.stderr_text().contains("Failed to build listeners"),
-        "missing real Pingora listener-build diagnostic: {}",
-        binary.stderr_text()
-    );
-    assert!(
-        binary
-            .stderr_text()
-            .contains("Socket operation on non-socket"),
-        "injection did not exercise Pingora adoption/build with a real non-listener FD: {}",
-        binary.stderr_text()
-    );
-    assert!(
-        UnixStream::connect(&api).is_err(),
-        "API remained operational"
-    );
-    assert!(!public.exists(), "public UDS owner leaked");
-    assert!(!api.exists(), "API UDS owner leaked");
-    assert!(!pid.exists(), "PID owner leaked");
-    assert_eq!(
-        fs::read_dir(directory.path())
-            .expect("list injected startup directory")
-            .count(),
-        0,
-        "private publication or quarantine entry leaked"
-    );
-}
-
 fn tcp_http(port: u16, request: &[u8]) -> Vec<u8> {
     let deadline = Instant::now() + IO_TIMEOUT;
     let mut stream = loop {
