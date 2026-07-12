@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use clap::{ArgAction, Parser};
 use thiserror::Error;
-use url::Url;
+use url::{Position, Url};
 
 const CHP_DEFAULT_KEEP_ALIVE_TIMEOUT_MS: u64 = 5000;
 const CHP_5_3_0_DEFAULT_TLS_CIPHERS: &str = "ECDHE-RSA-AES128-GCM-SHA256:\
@@ -436,7 +436,7 @@ impl TryFrom<Cli> for AppConfig {
         );
 
         let default_target = parse_target(cli.default_target, "default target")?;
-        let error_target = parse_target(cli.error_target, "error target")?;
+        let error_target = parse_error_target(cli.error_target)?;
         let log_level = parse_log_level(cli.log_level)?;
         let store = parse_store(cli.storage_backend)?;
         let custom_headers = parse_custom_headers(cli.custom_header)?;
@@ -469,13 +469,11 @@ impl TryFrom<Cli> for AppConfig {
                 host_routing: cli.host_routing,
                 timeout_ms: cli.timeout,
                 proxy_timeout_ms: cli.proxy_timeout,
-                keep_alive_timeout_ms: cli.keep_alive_timeout.map(|timeout| {
-                    if timeout == 0 {
-                        CHP_DEFAULT_KEEP_ALIVE_TIMEOUT_MS
-                    } else {
-                        timeout
-                    }
-                }),
+                keep_alive_timeout_ms: Some(
+                    cli.keep_alive_timeout
+                        .filter(|timeout| *timeout != 0)
+                        .unwrap_or(CHP_DEFAULT_KEEP_ALIVE_TIMEOUT_MS),
+                ),
             },
         })
     }
@@ -549,13 +547,25 @@ fn parse_target(value: Option<String>, kind: &'static str) -> Result<Option<Url>
     })?;
     let valid = match url.scheme() {
         "http" | "https" => url.host_str().is_some_and(|host| !host.is_empty()),
-        "http+unix" | "unix+http" => url.host_str().is_some_and(is_percent_encoded_socket_host),
+        "http+unix" | "unix+http" => {
+            is_percent_encoded_socket_host(&url[Position::BeforeHost..Position::AfterPort])
+        }
         _ => false,
     };
     if !valid {
         return Err(ConfigError::InvalidTarget { kind, value });
     }
     Ok(Some(url))
+}
+
+fn parse_error_target(value: Option<String>) -> Result<Option<Url>, ConfigError> {
+    let value = value.map(|mut target| {
+        if !target.ends_with('/') {
+            target.push('/');
+        }
+        target
+    });
+    parse_target(value, "error target")
 }
 
 fn is_percent_encoded_socket_host(host: &str) -> bool {

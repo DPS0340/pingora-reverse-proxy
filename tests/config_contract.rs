@@ -131,6 +131,13 @@ fn timeout_zero_semantics_match_chp() {
 }
 
 #[test]
+fn omitted_keep_alive_timeout_uses_chp_runtime_default() {
+    let cfg = parse_ok(["proxy"]);
+
+    assert_eq!(cfg.proxy.keep_alive_timeout_ms, Some(5000));
+}
+
+#[test]
 fn explicit_api_port_avoids_public_port_overflow() {
     let cfg = parse_ok(["proxy", "--port", "65535", "--api-port", "8001"]);
     assert_eq!(
@@ -460,9 +467,54 @@ fn default_and_error_targets_accept_valid_unix_http_urls() {
             } else {
                 cfg.error_target
             };
-            assert_eq!(parsed.unwrap().as_str(), target);
+            let expected = if option == "--error-target" {
+                format!("{target}/")
+            } else {
+                target.to_owned()
+            };
+            assert_eq!(parsed.unwrap().as_str(), expected);
         }
     }
+}
+
+#[test]
+fn non_root_error_targets_gain_a_trailing_slash_like_chp() {
+    for (target, expected) in [
+        ("http://errors.example/base", "http://errors.example/base/"),
+        (
+            "https://errors.example/nested/path",
+            "https://errors.example/nested/path/",
+        ),
+        (
+            "http+unix://%2Ftmp%2Fproxy.sock/base",
+            "http+unix://%2Ftmp%2Fproxy.sock/base/",
+        ),
+        (
+            "unix+http://%2Ftmp%2Fproxy.sock/errors",
+            "unix+http://%2Ftmp%2Fproxy.sock/errors/",
+        ),
+        (
+            "http://errors.example/base?code=500",
+            "http://errors.example/base?code=500/",
+        ),
+    ] {
+        let cfg = parse_ok(["proxy", "--error-target", target]);
+        assert_eq!(cfg.error_target.unwrap().as_str(), expected);
+    }
+}
+
+#[test]
+fn unix_http_validation_includes_the_whatwg_host_port_suffix() {
+    let target = "http+unix://%2Ftmp%2Fproxy.sock:123/base";
+
+    let default = parse_ok(["proxy", "--default-target", target]);
+    assert_eq!(default.default_target.unwrap().as_str(), target);
+
+    let error = parse_ok(["proxy", "--error-target", target]);
+    assert_eq!(
+        error.error_target.unwrap().as_str(),
+        "http+unix://%2Ftmp%2Fproxy.sock:123/base/"
+    );
 }
 
 #[test]
