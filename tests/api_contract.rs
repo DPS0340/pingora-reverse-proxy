@@ -1,9 +1,14 @@
 mod support;
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
+use pingora_reverse_proxy::store::{Store, StoreError};
 use proptest::prelude::*;
 use serde_json::{json, Value};
-use url::Url;
+use tokio::sync::{RwLock, Semaphore};
 
 use pingora_reverse_proxy::route::{RouteData, RouteKey};
 use support::*;
@@ -78,6 +83,12 @@ async fn get_all_returns_the_complete_route_table_and_iso_timestamp() {
     assert!(routes["/user/alice"]["last_activity"]
         .as_str()
         .is_some_and(|timestamp| timestamp.ends_with('Z')));
+    let timestamp = routes["/user/alice"]["last_activity"].as_str().unwrap();
+    assert_eq!(
+        timestamp.split_once('.').unwrap().1.len(),
+        4,
+        "CHP always emits exactly three fractional digits followed by Z: {timestamp}"
+    );
 }
 
 #[tokio::test]
@@ -149,18 +160,49 @@ async fn malformed_post_bodies_match_chp_errors_and_do_not_publish() {
         assert_eq!(read_text(response).await, "Must specify 'target' as string");
     }
 
-    let response = request_raw(
-        &app,
-        "POST",
-        "/api/routes/rejected",
-        Some(b"{ definitely not json".to_vec()),
-        None,
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert!(read_text(response)
-        .await
-        .starts_with("Body not valid JSON: "));
+    let pinned_v8_errors = [
+        ("", "SyntaxError: Unexpected end of JSON input"),
+        (
+            "{",
+            "SyntaxError: Expected property name or '}' in JSON at position 1 (line 1 column 2)",
+        ),
+        (
+            r#"{"target":"x",}"#,
+            "SyntaxError: Expected double-quoted property name in JSON at position 14 (line 1 column 15)",
+        ),
+        (
+            "[1,]",
+            "SyntaxError: Unexpected token ']', \"[1,]\" is not valid JSON",
+        ),
+        (
+            "{ definitely not json",
+            "SyntaxError: Expected property name or '}' in JSON at position 2 (line 1 column 3)",
+        ),
+        (
+            "null trailing",
+            "SyntaxError: Unexpected non-whitespace character after JSON at position 5 (line 1 column 6)",
+        ),
+        (
+            "\"unterminated",
+            "SyntaxError: Unterminated string in JSON at position 13 (line 1 column 14)",
+        ),
+    ];
+    for (body, oracle_error) in pinned_v8_errors {
+        let response = request_raw(
+            &app,
+            "POST",
+            "/api/routes/rejected",
+            Some(body.as_bytes().to_vec()),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body:?}");
+        assert_eq!(
+            read_text(response).await,
+            format!("Body not valid JSON: {oracle_error}"),
+            "{body:?}"
+        );
+    }
     assert_eq!(get_json(&app, "/api/routes").await, json!({}));
 }
 
@@ -191,6 +233,502 @@ async fn method_and_path_errors_match_chp_bodies() {
 }
 
 #[tokio::test]
+async fn head_is_an_explicit_405_instead_of_axums_automatic_get() {
+    let app = test_api(None).await;
+
+    for path in ["/api/routes", "/api/routes/missing"] {
+        let response = request(&app, "HEAD", path, None, None).await;
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED, "{path}");
+        assert!(read_bytes(response).await.is_empty(), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn post_parses_json_and_enforces_the_body_limit_before_authentication() {
+    let app = test_api(Some("secret")).await;
+
+    let malformed = request_raw(
+        &app,
+        "POST",
+        "/api/routes/rejected",
+        Some(b"{".to_vec()),
+        Some("token wrong"),
+    )
+    .await;
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        read_text(malformed).await,
+        "Body not valid JSON: SyntaxError: Expected property name or '}' in JSON at position 1 (line 1 column 2)"
+    );
+
+    let prefix = br#"{"target":""#;
+    let suffix = br#""}"#;
+    let mut at_limit = Vec::with_capacity(1024 * 1024);
+    at_limit.extend_from_slice(prefix);
+    at_limit.resize(1024 * 1024 - suffix.len(), b'x');
+    at_limit.extend_from_slice(suffix);
+    assert_eq!(at_limit.len(), 1024 * 1024);
+
+    let accepted_size = request_raw(
+        &app,
+        "POST",
+        "/api/routes/large",
+        Some(at_limit.clone()),
+        Some("token wrong"),
+    )
+    .await;
+    assert_eq!(accepted_size.status(), StatusCode::FORBIDDEN);
+
+    at_limit.push(b' ');
+    let too_large = request_raw(
+        &app,
+        "POST",
+        "/api/routes/large",
+        Some(at_limit),
+        Some("token wrong"),
+    )
+    .await;
+    assert_eq!(too_large.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    let snapshot = app.metrics.snapshot();
+    assert_eq!(snapshot.requests_api.get(&400), Some(&1));
+    assert_eq!(snapshot.requests_api.get(&403), Some(&1));
+    assert_eq!(snapshot.requests_api.get(&413), Some(&1));
+}
+
+#[tokio::test]
+async fn every_string_target_is_accepted_and_round_trips_verbatim() {
+    let app = test_api(None).await;
+    let targets = [
+        "",
+        "not a URL",
+        ":::",
+        "HTTP://Example.COM:80/a/../b?x=%2f",
+        "unix+http://%2Ftmp%2Fsocket",
+    ];
+
+    for (index, target) in targets.into_iter().enumerate() {
+        let path = format!("/api/routes/target/{index}");
+        let response = post_route(&app, &path, target).await;
+        assert_eq!(response.status(), StatusCode::CREATED, "{target:?}");
+        assert_eq!(get_json(&app, &path).await["target"], target);
+    }
+}
+
+#[tokio::test]
+async fn inactive_since_uses_explicit_pinned_date_parse_compatibility_fixtures() {
+    // Captured from Date.parse under the pinned CHP runtime.
+    let accepted = [
+        ("2020-01-01", "2020-01-01T00:00:00.000Z"),
+        ("2020-01-01T12:34:56.789Z", "2020-01-01T12:34:56.789Z"),
+        ("2020-01-01T12:34:56+09:00", "2020-01-01T03:34:56.000Z"),
+        ("Wed, 01 Jan 2020 00:00:00 GMT", "2020-01-01T00:00:00.000Z"),
+        ("2020-01-01 00:00:00Z", "2020-01-01T00:00:00.000Z"),
+    ];
+    for (input, oracle_iso) in accepted {
+        let app = test_api(None).await;
+        let boundary = chrono::DateTime::parse_from_rfc3339(oracle_iso)
+            .unwrap()
+            .with_timezone(&Utc);
+        for (key, last_activity) in [
+            ("/before", boundary - chrono::Duration::milliseconds(1)),
+            ("/boundary", boundary),
+        ] {
+            app.registry
+                .put(
+                    RouteKey::parse(key).unwrap(),
+                    RouteData {
+                        target: TARGET.to_owned(),
+                        last_activity,
+                        extra: serde_json::Map::new(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let encoded: String = url::form_urlencoded::byte_serialize(input.as_bytes()).collect();
+        let response = request(
+            &app,
+            "GET",
+            &format!("/api/routes?inactiveSince={encoded}"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "Date.parse({input:?})");
+        let filtered = read_json(response).await;
+        assert!(filtered.get("/before").is_some(), "{input:?}: {filtered}");
+        assert!(filtered.get("/boundary").is_none(), "{input:?}: {filtered}");
+    }
+}
+
+#[tokio::test]
+async fn api_route_cleaning_adds_and_removes_at_most_one_outer_slash() {
+    let app = test_api(None).await;
+    let fixtures = [
+        ("/api/routes//double//", "//double"),
+        ("/api/routes/%2Fescaped%2F", "//escaped"),
+        ("/api/routes///triple///", "///triple/"),
+    ];
+
+    for (path, _) in fixtures {
+        assert_eq!(
+            post_route(&app, path, "x").await.status(),
+            StatusCode::CREATED
+        );
+    }
+
+    let routes = get_json(&app, "/api/routes").await;
+    for (_, expected_key) in fixtures {
+        assert!(
+            routes.get(expected_key).is_some(),
+            "missing {expected_key:?}: {routes}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn delete_uses_chps_single_lookup_cleaning_pass() {
+    let app = test_api(None).await;
+    let path = "/api/routes/delete-double//";
+
+    assert_eq!(
+        post_route(&app, path, "x").await.status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        request(&app, "DELETE", path, None, None).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(get_json(&app, path).await["target"], "x");
+}
+
+#[tokio::test]
+async fn empty_configured_token_disables_auth_and_nbsp_is_javascript_whitespace() {
+    let disabled = test_api(Some("")).await;
+    assert_eq!(
+        request(&disabled, "GET", "/api/routes", None, None)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let protected = test_api(Some("secret")).await;
+    for authorization in ["token\u{00a0}secret", "prefix token\u{00a0}secret trailing"] {
+        assert_eq!(
+            request(&protected, "GET", "/api/routes", None, Some(authorization))
+                .await
+                .status(),
+            StatusCode::OK,
+            "{authorization:?}"
+        );
+    }
+}
+
+struct GatedPutStore {
+    routes: RwLock<BTreeMap<RouteKey, RouteData>>,
+    entered: Semaphore,
+    release: Semaphore,
+}
+
+impl GatedPutStore {
+    fn new() -> Self {
+        Self {
+            routes: RwLock::new(BTreeMap::new()),
+            entered: Semaphore::new(0),
+            release: Semaphore::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl Store for GatedPutStore {
+    async fn snapshot(&self) -> Result<BTreeMap<RouteKey, RouteData>, StoreError> {
+        Ok(self.routes.read().await.clone())
+    }
+
+    async fn put(&self, key: RouteKey, data: RouteData) -> Result<(), StoreError> {
+        self.entered.add_permits(1);
+        self.release
+            .acquire()
+            .await
+            .expect("test gate open")
+            .forget();
+        self.routes.write().await.insert(key, data);
+        Ok(())
+    }
+
+    async fn update_activity(
+        &self,
+        key: &RouteKey,
+        at: chrono::DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        if let Some(route) = self.routes.write().await.get_mut(key) {
+            route.last_activity = at;
+        }
+        Ok(())
+    }
+
+    async fn delete(&self, key: &RouteKey) -> Result<Option<RouteData>, StoreError> {
+        Ok(self.routes.write().await.remove(key))
+    }
+}
+
+#[tokio::test]
+async fn post_sets_last_activity_only_after_slow_put_persistence_finishes() {
+    let store = Arc::new(GatedPutStore::new());
+    let app = test_api_with_store(None, store.clone()).await;
+    let request_app = app.clone();
+    let posting =
+        tokio::spawn(async move { post_route(&request_app, "/api/routes/slow", TARGET).await });
+
+    store.entered.acquire().await.unwrap().forget();
+    let persistence_finished_after = Utc::now();
+    store.release.add_permits(1);
+    assert_eq!(posting.await.unwrap().status(), StatusCode::CREATED);
+
+    let route = app
+        .registry
+        .get(&RouteKey::parse("/slow").unwrap())
+        .unwrap();
+    assert!(
+        route.last_activity >= persistence_finished_after,
+        "last_activity={} was captured before persistence completed at {}",
+        route.last_activity,
+        persistence_finished_after
+    );
+}
+
+#[tokio::test]
+async fn concurrent_post_then_delete_is_serialized_through_the_registry() {
+    let store = Arc::new(GatedPutStore::new());
+    let app = test_api_with_store(None, store.clone()).await;
+    let post_app = app.clone();
+    let posting =
+        tokio::spawn(async move { post_route(&post_app, "/api/routes/race", TARGET).await });
+
+    store.entered.acquire().await.unwrap().forget();
+    let delete_app = app.clone();
+    let deleting = tokio::spawn(async move {
+        request(&delete_app, "DELETE", "/api/routes/race", None, None).await
+    });
+    tokio::task::yield_now().await;
+    store.release.add_permits(1);
+
+    assert_eq!(posting.await.unwrap().status(), StatusCode::CREATED);
+    assert_eq!(deleting.await.unwrap().status(), StatusCode::NO_CONTENT);
+    assert!(app
+        .registry
+        .get(&RouteKey::parse("/race").unwrap())
+        .is_none());
+}
+
+struct FailingMutationStore {
+    routes: BTreeMap<RouteKey, RouteData>,
+}
+
+struct ActivityFailureStore {
+    routes: RwLock<BTreeMap<RouteKey, RouteData>>,
+}
+
+#[async_trait]
+impl Store for ActivityFailureStore {
+    async fn snapshot(&self) -> Result<BTreeMap<RouteKey, RouteData>, StoreError> {
+        Ok(self.routes.read().await.clone())
+    }
+
+    async fn put(&self, key: RouteKey, data: RouteData) -> Result<(), StoreError> {
+        self.routes.write().await.insert(key, data);
+        Ok(())
+    }
+
+    async fn update_activity(
+        &self,
+        _key: &RouteKey,
+        _at: chrono::DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::message("injected activity failure"))
+    }
+
+    async fn delete(&self, key: &RouteKey) -> Result<Option<RouteData>, StoreError> {
+        Ok(self.routes.write().await.remove(key))
+    }
+}
+
+#[async_trait]
+impl Store for FailingMutationStore {
+    async fn snapshot(&self) -> Result<BTreeMap<RouteKey, RouteData>, StoreError> {
+        Ok(self.routes.clone())
+    }
+
+    async fn put(&self, _key: RouteKey, _data: RouteData) -> Result<(), StoreError> {
+        Err(StoreError::message("injected put failure"))
+    }
+
+    async fn update_activity(
+        &self,
+        _key: &RouteKey,
+        _at: chrono::DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::message("injected activity failure"))
+    }
+
+    async fn delete(&self, _key: &RouteKey) -> Result<Option<RouteData>, StoreError> {
+        Err(StoreError::message("injected delete failure"))
+    }
+}
+
+#[tokio::test]
+async fn metrics_match_completed_responses_and_successful_operation_promises() {
+    let app = test_api(None).await;
+
+    assert_eq!(
+        request(&app, "GET", "/api/routes", None, None)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        request(&app, "GET", "/api/routes/missing", None, None)
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        post_route(&app, "/api/routes/metrics", TARGET)
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        request(&app, "DELETE", "/api/routes/metrics", None, None)
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        request(&app, "DELETE", "/api/routes/metrics", None, None)
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    let snapshot = app.metrics.snapshot();
+    assert_eq!(snapshot.requests_api.get(&200), Some(&1));
+    assert_eq!(snapshot.requests_api.get(&201), Some(&1));
+    assert_eq!(snapshot.requests_api.get(&204), Some(&1));
+    assert_eq!(snapshot.requests_api.get(&404), Some(&2));
+    assert_eq!(snapshot.api_route_get, 1);
+    assert_eq!(snapshot.api_route_add, 1);
+    assert_eq!(snapshot.api_route_delete, 2);
+}
+
+#[tokio::test]
+async fn failed_store_operations_count_500_responses_but_not_route_operations() {
+    let existing_key = RouteKey::parse("/existing").unwrap();
+    let store: Arc<dyn Store> = Arc::new(FailingMutationStore {
+        routes: BTreeMap::from([(
+            existing_key,
+            RouteData {
+                target: TARGET.to_owned(),
+                last_activity: Utc.timestamp_opt(1, 0).unwrap(),
+                extra: serde_json::Map::new(),
+            },
+        )]),
+    });
+    let app = test_api_with_store(None, store).await;
+
+    assert_eq!(
+        post_route(&app, "/api/routes/new", TARGET).await.status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        request(&app, "DELETE", "/api/routes/existing", None, None)
+            .await
+            .status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+
+    let snapshot = app.metrics.snapshot();
+    assert_eq!(snapshot.requests_api.get(&500), Some(&2));
+    assert_eq!(snapshot.api_route_add, 0);
+    assert_eq!(snapshot.api_route_delete, 0);
+    assert!(app
+        .registry
+        .get(&RouteKey::parse("/existing").unwrap())
+        .is_some());
+    assert!(app
+        .registry
+        .get(&RouteKey::parse("/new").unwrap())
+        .is_none());
+}
+
+#[tokio::test]
+async fn failed_post_activity_persistence_never_publishes_or_counts_the_route() {
+    let store = Arc::new(ActivityFailureStore {
+        routes: RwLock::new(BTreeMap::new()),
+    });
+    let app = test_api_with_store(None, store.clone()).await;
+
+    assert_eq!(
+        post_route(&app, "/api/routes/activity-failure", TARGET)
+            .await
+            .status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+
+    assert!(app
+        .registry
+        .get(&RouteKey::parse("/activity-failure").unwrap())
+        .is_none());
+    assert!(store
+        .snapshot()
+        .await
+        .unwrap()
+        .contains_key(&RouteKey::parse("/activity-failure").unwrap()));
+    let snapshot = app.metrics.snapshot();
+    assert_eq!(snapshot.requests_api.get(&500), Some(&1));
+    assert_eq!(snapshot.api_route_add, 0);
+}
+
+#[tokio::test]
+async fn requests_api_counts_auth_parse_method_and_fallback_responses() {
+    let app = test_api(Some("secret")).await;
+
+    assert_eq!(
+        request(&app, "GET", "/api/routes", None, None)
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        request_raw(&app, "POST", "/api/routes/bad", Some(b"{".to_vec()), None,)
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        request(&app, "PUT", "/api/routes", None, None)
+            .await
+            .status(),
+        StatusCode::METHOD_NOT_ALLOWED
+    );
+    assert_eq!(
+        request(&app, "GET", "/api/unknown", None, None)
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    let snapshot = app.metrics.snapshot();
+    assert_eq!(snapshot.requests_api.get(&400), Some(&1));
+    assert_eq!(snapshot.requests_api.get(&403), Some(&1));
+    assert_eq!(snapshot.requests_api.get(&404), Some(&1));
+    assert_eq!(snapshot.requests_api.get(&405), Some(&1));
+}
+
+#[tokio::test]
 async fn both_inactivity_query_spellings_filter_strictly_older_routes() {
     let app = test_api(None).await;
     for (path, seconds) in [("/old", 10), ("/boundary", 20), ("/new", 30)] {
@@ -198,7 +736,7 @@ async fn both_inactivity_query_spellings_filter_strictly_older_routes() {
             .put(
                 RouteKey::parse(path).unwrap(),
                 RouteData {
-                    target: Url::parse(TARGET).unwrap(),
+                    target: TARGET.to_owned(),
                     last_activity: Utc.timestamp_opt(seconds, 0).unwrap(),
                     extra: serde_json::Map::new(),
                 },
@@ -288,7 +826,12 @@ proptest! {
             let app = test_api(None).await;
             let path = format!("/api/routes/{suffix}");
             let response = request(&app, "GET", &path, None, None).await;
-            prop_assert!(response.status().as_u16() >= 200);
+            match response.status() {
+                StatusCode::OK => prop_assert!(suffix.is_empty()),
+                StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND => {},
+                status => prop_assert!(false, "unexpected status {status} for {suffix:?}"),
+            }
+            prop_assert!(app.registry.all().is_empty());
             Ok(())
         })?;
     }
@@ -321,13 +864,14 @@ proptest! {
 }
 
 #[test]
-fn generated_valid_target_objects_are_the_only_successful_post_class() {
+fn generated_string_target_objects_are_the_only_successful_post_class() {
     let mut runner = proptest::test_runner::TestRunner::default();
     let strategy = prop_oneof![
         Just(json!({})),
         any::<i64>().prop_map(|target| json!({ "target": target })),
         "[a-z]{1,16}".prop_map(|target| json!({ "other": target })),
-        (1024u16..65535).prop_map(|port| json!({ "target": format!("http://127.0.0.1:{port}/") })),
+        prop::collection::vec(any::<char>(), 0..32)
+            .prop_map(|characters| json!({ "target": characters.into_iter().collect::<String>() })),
     ];
 
     runner

@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
+use serde_json::{Map, Value};
 use tokio::sync::Mutex;
 
 use crate::route::{RouteData, RouteKey};
@@ -106,6 +107,29 @@ impl RouteRegistry {
         let _mutation = self.mutation.lock().await;
         let mut routes = self.snapshot.load().routes.clone();
         self.store.put(key.clone(), data.clone()).await?;
+        routes.insert(key, data);
+        self.publish(routes);
+        Ok(())
+    }
+
+    /// Persist a newly configured route, then stamp activity at completion like CHP.
+    pub async fn add(
+        &self,
+        key: RouteKey,
+        target: String,
+        extra: Map<String, Value>,
+    ) -> Result<(), StoreError> {
+        let _mutation = self.mutation.lock().await;
+        let mut routes = self.snapshot.load().routes.clone();
+        let mut data = RouteData {
+            target,
+            last_activity: Utc::now(),
+            extra,
+        };
+
+        self.store.put(key.clone(), data.clone()).await?;
+        data.last_activity = Utc::now();
+        self.store.update_activity(&key, data.last_activity).await?;
         routes.insert(key, data);
         self.publish(routes);
         Ok(())

@@ -3,22 +3,36 @@
 use std::sync::Arc;
 
 use axum::body::{to_bytes, Body};
-use axum::extract::{Path, RawQuery, Request, State};
+use axum::extract::{OriginalUri, RawQuery, Request, State};
 use axum::http::header::AUTHORIZATION;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, Uri};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use constant_time_eq::constant_time_eq;
 use serde_json::{Map, Value};
-use url::Url;
 
 use crate::metrics::Metrics;
-use crate::route::{RouteData, RouteKey};
+use crate::route::RouteKey;
 use crate::route_table::RouteRegistry;
 
 const MAX_JSON_BODY_BYTES: usize = 1024 * 1024;
+
+enum RoutePathError {
+    BadRequest,
+    NotFound,
+}
+
+impl IntoResponse for RoutePathError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::BadRequest => text(StatusCode::BAD_REQUEST, "Bad Request"),
+            Self::NotFound => text(StatusCode::NOT_FOUND, "Not Found"),
+        }
+    }
+}
 
 /// Shared dependencies for route-management requests.
 #[derive(Clone)]
@@ -36,7 +50,9 @@ impl ApiState {
     ) -> Self {
         Self {
             registry,
-            auth_token: auth_token.map(|token| Arc::from(token.as_bytes())),
+            auth_token: auth_token
+                .filter(|token| !token.is_empty())
+                .map(|token| Arc::from(token.as_bytes())),
             metrics,
         }
     }
@@ -44,28 +60,41 @@ impl ApiState {
 
 /// Build the CHP route-management HTTP surface.
 pub fn router(state: ApiState) -> Router {
+    let metrics = Arc::clone(&state.metrics);
     Router::new()
         .route(
             "/api/routes",
             get(get_all_routes)
                 .post(post_root_route)
-                .delete(delete_root_route),
+                .delete(delete_root_route)
+                .head(method_not_allowed),
         )
         .route(
             "/api/routes/",
             get(get_all_routes)
                 .post(post_root_route)
-                .delete(delete_root_route),
+                .delete(delete_root_route)
+                .head(method_not_allowed),
         )
         .route(
             "/api/routes/{*route}",
             get(get_one_route)
                 .post(post_one_route)
-                .delete(delete_one_route),
+                .delete(delete_one_route)
+                .head(method_not_allowed),
         )
         .method_not_allowed_fallback(method_not_allowed)
         .fallback(not_found)
+        .layer(middleware::from_fn(move |request, next| {
+            record_completed_request(Arc::clone(&metrics), request, next)
+        }))
         .with_state(state)
+}
+
+async fn record_completed_request(metrics: Arc<Metrics>, request: Request, next: Next) -> Response {
+    let response = next.run(request).await;
+    metrics.record_api_request(response.status().as_u16());
+    response
 }
 
 async fn get_all_routes(
@@ -93,13 +122,16 @@ async fn get_all_routes(
 async fn get_one_route(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Path(route): Path<String>,
+    OriginalUri(uri): OriginalUri,
 ) -> Response {
     if !authorized(&state, &headers) {
         return empty(StatusCode::FORBIDDEN);
     }
 
-    let key = route_key(&route);
+    let key = match route_key_from_uri(&uri, 2) {
+        Ok(key) => key,
+        Err(error) => return error.into_response(),
+    };
     match state.registry.get(&key) {
         Some(route) => Json(route).into_response(),
         None => empty(StatusCode::NOT_FOUND),
@@ -112,18 +144,19 @@ async fn post_root_route(State(state): State<ApiState>, request: Request) -> Res
 
 async fn post_one_route(
     State(state): State<ApiState>,
-    Path(route): Path<String>,
+    OriginalUri(uri): OriginalUri,
     request: Request,
 ) -> Response {
-    post_route(state, route_key(&route), request).await
+    let key = match route_key_from_uri(&uri, 2) {
+        Ok(key) => key,
+        Err(error) => return error.into_response(),
+    };
+    post_route(state, key, request).await
 }
 
 async fn post_route(state: ApiState, key: RouteKey, request: Request) -> Response {
-    if !authorized(&state, request.headers()) {
-        return empty(StatusCode::FORBIDDEN);
-    }
-
-    let body = match to_bytes(request.into_body(), MAX_JSON_BODY_BYTES).await {
+    let (parts, body) = request.into_parts();
+    let body = match to_bytes(body, MAX_JSON_BODY_BYTES).await {
         Ok(body) => body,
         Err(_) => return empty(StatusCode::PAYLOAD_TOO_LARGE),
     };
@@ -132,10 +165,16 @@ async fn post_route(state: ApiState, key: RouteKey, request: Request) -> Respons
         Err(error) => {
             return text(
                 StatusCode::BAD_REQUEST,
-                format!("Body not valid JSON: {error}"),
+                format!(
+                    "Body not valid JSON: {}",
+                    javascript_json_error(&body, &error)
+                ),
             );
         }
     };
+    if !authorized(&state, &parts.headers) {
+        return empty(StatusCode::FORBIDDEN);
+    }
     let mut object = match value {
         Value::Object(object) => object,
         _ => Map::new(),
@@ -146,18 +185,8 @@ async fn post_route(state: ApiState, key: RouteKey, request: Request) -> Respons
     }) else {
         return text(StatusCode::BAD_REQUEST, "Must specify 'target' as string");
     };
-    let target = match Url::parse(&target) {
-        Ok(target) => target,
-        Err(_) => return text(StatusCode::BAD_REQUEST, "Invalid target URL"),
-    };
-
     object.remove("last_activity");
-    let route = RouteData {
-        target,
-        last_activity: Utc::now(),
-        extra: object,
-    };
-    if state.registry.put(key, route).await.is_err() {
+    if state.registry.add(key, target, object).await.is_err() {
         return text(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
     }
 
@@ -172,9 +201,13 @@ async fn delete_root_route(State(state): State<ApiState>, headers: HeaderMap) ->
 async fn delete_one_route(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Path(route): Path<String>,
+    OriginalUri(uri): OriginalUri,
 ) -> Response {
-    delete_route(state, route_key(&route), &headers).await
+    let key = match route_key_from_uri(&uri, 1) {
+        Ok(key) => key,
+        Err(error) => return error.into_response(),
+    };
+    delete_route(state, key, &headers).await
 }
 
 async fn delete_route(state: ApiState, key: RouteKey, headers: &HeaderMap) -> Response {
@@ -187,7 +220,9 @@ async fn delete_route(state: ApiState, key: RouteKey, headers: &HeaderMap) -> Re
         Ok(None) => StatusCode::NOT_FOUND,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    state.metrics.record_api_route_delete();
+    if !status.is_server_error() {
+        state.metrics.record_api_route_delete();
+    }
     empty(status)
 }
 
@@ -235,14 +270,14 @@ fn extract_token(header: &[u8]) -> Option<&[u8]> {
     {
         let after_marker = offset + found + marker.len();
         let mut start = after_marker;
-        while header.get(start).is_some_and(|byte| is_whitespace(*byte)) {
-            start += 1;
+        while let Some(width) = javascript_whitespace_width(&header[start..]) {
+            start += width;
         }
         if start > after_marker {
-            let end = header[start..]
-                .iter()
-                .position(|byte| is_whitespace(*byte))
-                .map_or(header.len(), |length| start + length);
+            let mut end = start;
+            while end < header.len() && javascript_whitespace_width(&header[end..]).is_none() {
+                end += 1;
+            }
             if end > start {
                 return Some(&header[start..end]);
             }
@@ -252,8 +287,26 @@ fn extract_token(header: &[u8]) -> Option<&[u8]> {
     None
 }
 
-fn is_whitespace(byte: u8) -> bool {
-    matches!(byte, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+fn javascript_whitespace_width(input: &[u8]) -> Option<usize> {
+    let first = *input.first()?;
+    if matches!(first, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r' | 0xa0) {
+        return Some(1);
+    }
+
+    let text = std::str::from_utf8(input).ok()?;
+    let character = text.chars().next()?;
+    matches!(
+        character,
+        '\u{00a0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200a}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202f}'
+                | '\u{205f}'
+                | '\u{3000}'
+                | '\u{feff}'
+    )
+    .then_some(character.len_utf8())
 }
 
 fn inactive_since(query: Option<&str>) -> Result<Option<DateTime<Utc>>, String> {
@@ -268,9 +321,153 @@ fn inactive_since(query: Option<&str>) -> Result<Option<DateTime<Utc>>, String> 
         return Ok(None);
     };
 
-    DateTime::parse_from_rfc3339(raw)
-        .map(|timestamp| Some(timestamp.with_timezone(&Utc)))
+    parse_javascript_date(raw)
+        .map(Some)
         .map_err(|_| format!("Invalid datestamp '{raw}' must be ISO8601."))
+}
+
+fn parse_javascript_date(raw: &str) -> Result<DateTime<Utc>, ()> {
+    if let Ok(timestamp) = DateTime::parse_from_rfc3339(raw) {
+        return Ok(timestamp.with_timezone(&Utc));
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
+        return date
+            .and_hms_opt(0, 0, 0)
+            .map(|value| value.and_utc())
+            .ok_or(());
+    }
+    if let Ok(timestamp) = DateTime::parse_from_rfc2822(raw) {
+        return Ok(timestamp.with_timezone(&Utc));
+    }
+    DateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f%#z")
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|_| ())
+}
+
+fn route_key_from_uri(uri: &Uri, clean_count: usize) -> Result<RouteKey, RoutePathError> {
+    let Some(raw) = uri.path().strip_prefix("/api/routes") else {
+        return Err(RoutePathError::NotFound);
+    };
+    let decoded = percent_decode(raw).ok_or(RoutePathError::BadRequest)?;
+    // CHP cleans GET/POST paths in the handler and store, while DELETE's
+    // existence lookup has only reached the store layer.
+    let mut key = route_key(if decoded.is_empty() { "/" } else { &decoded });
+    for _ in 1..clean_count {
+        key = route_key(key.as_str());
+    }
+    Ok(key)
+}
+
+fn percent_decode(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = hex_value(*bytes.get(index + 1)?)?;
+            let low = hex_value(*bytes.get(index + 2)?)?;
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn javascript_json_error(body: &[u8], error: &serde_json::Error) -> String {
+    let Ok(text) = std::str::from_utf8(body) else {
+        return format!("SyntaxError: {error}");
+    };
+    let trimmed = text.trim_end();
+
+    if has_unterminated_string(trimmed) {
+        return syntax_error_at("Unterminated string in JSON", text, text.len());
+    }
+    if trimmed.ends_with("{") {
+        return syntax_error_at("Expected property name or '}' in JSON", text, trimmed.len());
+    }
+    if error.is_eof() {
+        return "SyntaxError: Unexpected end of JSON input".to_owned();
+    }
+    if let Some(position) = trailing_data_position(text) {
+        return syntax_error_at(
+            "Unexpected non-whitespace character after JSON",
+            text,
+            position,
+        );
+    }
+    if trimmed.ends_with(",}") {
+        let position = trimmed.len() - 1;
+        return syntax_error_at(
+            "Expected double-quoted property name in JSON",
+            text,
+            position,
+        );
+    }
+    if trimmed.ends_with(",]") {
+        let quoted = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_owned());
+        return format!("SyntaxError: Unexpected token ']', {quoted} is not valid JSON");
+    }
+    if let Some(position) = unquoted_property_position(text) {
+        return syntax_error_at("Expected property name or '}' in JSON", text, position);
+    }
+
+    format!("SyntaxError: {error}")
+}
+
+fn has_unterminated_string(input: &str) -> bool {
+    let mut escaped = false;
+    let mut quotes = 0;
+    for character in input.chars() {
+        if character == '"' && !escaped {
+            quotes += 1;
+        }
+        escaped = character == '\\' && !escaped;
+        if character != '\\' {
+            escaped = false;
+        }
+    }
+    quotes % 2 == 1
+}
+
+fn trailing_data_position(input: &str) -> Option<usize> {
+    let mut stream = serde_json::Deserializer::from_str(input).into_iter::<Value>();
+    stream.next()?.ok()?;
+    let offset = stream.byte_offset();
+    input[offset..]
+        .char_indices()
+        .find(|(_, character)| !character.is_whitespace())
+        .map(|(position, _)| offset + position)
+}
+
+fn unquoted_property_position(input: &str) -> Option<usize> {
+    let open = input.find('{')?;
+    input[open + 1..]
+        .char_indices()
+        .find(|(_, character)| !character.is_whitespace())
+        .and_then(|(position, character)| {
+            (character != '"' && character != '}').then_some(open + 1 + position)
+        })
+}
+
+fn syntax_error_at(message: &str, input: &str, position: usize) -> String {
+    let prefix = &input[..position.min(input.len())];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let column = prefix
+        .rsplit_once('\n')
+        .map_or(prefix.len() + 1, |(_, tail)| tail.len() + 1);
+    format!("SyntaxError: {message} at position {position} (line {line} column {column})")
 }
 
 fn first_value<'a>(

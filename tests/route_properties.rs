@@ -6,11 +6,10 @@ use pingora_reverse_proxy::route_table::{RouteMatch, RouteSnapshot};
 use proptest::collection::btree_map;
 use proptest::prelude::*;
 use serde_json::{json, Map, Value};
-use url::Url;
 
 fn route_data(id: usize) -> RouteData {
     RouteData {
-        target: Url::parse(&format!("http://upstream-{id}.example/")).unwrap(),
+        target: format!("http://upstream-{id}.example/"),
         last_activity: Utc.timestamp_opt(id as i64, 0).unwrap(),
         extra: Map::from_iter([("route_id".to_owned(), json!(id))]),
     }
@@ -103,14 +102,25 @@ fn route_key_normalizes_leading_and_trailing_slashes() {
     let cases = [
         ("", "/"),
         ("/", "/"),
+        ("//", "/"),
+        ("///", "//"),
         ("route", "/route"),
+        ("//route", "//route"),
         ("/route/", "/route"),
-        ("/route///", "/route"),
+        ("/route///", "/route//"),
     ];
 
     for (raw, expected) in cases {
         assert_eq!(RouteKey::parse(raw).unwrap().as_str(), expected);
     }
+}
+
+#[test]
+fn matcher_uses_chp_trie_segments_while_preserving_cleaned_storage_key() {
+    let snapshot = snapshot_with(["//service//"]);
+
+    let matched = snapshot.resolve("///service/request///").unwrap();
+    assert_eq!(matched.key.as_str(), "//service/");
 }
 
 #[test]
@@ -125,7 +135,9 @@ fn route_data_round_trips_unknown_fields() {
     let route: RouteData = serde_json::from_value(source.clone()).unwrap();
 
     assert_eq!(route.extra["hub_user"], Value::String("alice".to_owned()));
-    assert_eq!(serde_json::to_value(route).unwrap(), source);
+    let mut expected = source;
+    expected["last_activity"] = json!("2026-07-12T10:30:00.000Z");
+    assert_eq!(serde_json::to_value(route).unwrap(), expected);
 }
 
 #[test]
@@ -180,10 +192,17 @@ fn route_match_carries_shared_route_data() {
 
 proptest! {
     #[test]
-    fn normalization_is_idempotent(raw in route_key_strategy()) {
-        let once = RouteKey::parse(&raw).unwrap();
-        let twice = RouteKey::parse(once.as_str()).unwrap();
-        prop_assert_eq!(once, twice);
+    fn normalization_matches_one_chp_clean_path_pass(raw in route_key_strategy()) {
+        let mut expected = raw.clone();
+        if expected.is_empty() || !expected.starts_with('/') {
+            expected.insert(0, '/');
+        }
+        if expected.len() > 1 && expected.ends_with('/') {
+            expected.pop();
+        }
+
+        let actual = RouteKey::parse(&raw).unwrap();
+        prop_assert_eq!(actual.as_str(), expected);
     }
 
     #[test]

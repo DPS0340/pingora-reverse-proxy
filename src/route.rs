@@ -2,17 +2,16 @@
 
 use std::convert::Infallible;
 
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Deserializer, Serialize};
+use chrono::{DateTime, SecondsFormat, Utc};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
-use url::Url;
 
 /// Error returned while parsing a route key.
 ///
 /// CHP route-key cleanup is infallible, so this type currently has no values.
 pub type RouteError = Infallible;
 
-/// A route key normalized to one leading slash and no trailing slash except at root.
+/// A route key cleaned with CHP's single-leading/single-trailing-slash rules.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct RouteKey(String);
@@ -24,12 +23,13 @@ impl RouteKey {
     }
 
     fn normalize(input: &str) -> Self {
-        let path = input.trim_matches('/');
-        let normalized = if path.is_empty() {
-            "/".to_owned()
-        } else {
-            format!("/{path}")
-        };
+        let mut normalized = input.to_owned();
+        if normalized.is_empty() || !normalized.starts_with('/') {
+            normalized.insert(0, '/');
+        }
+        if normalized.len() > 1 && normalized.ends_with('/') {
+            normalized.pop();
+        }
 
         Self(normalized)
     }
@@ -53,8 +53,16 @@ impl<'de> Deserialize<'de> for RouteKey {
 /// Persisted data for a route, including CHP-compatible extension fields.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct RouteData {
-    pub target: Url,
+    pub target: String,
+    #[serde(serialize_with = "serialize_chp_date")]
     pub last_activity: DateTime<Utc>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+fn serialize_chp_date<S>(value: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(&value.to_rfc3339_opts(SecondsFormat::Millis, true))
 }

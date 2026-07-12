@@ -12,7 +12,6 @@ use pingora_reverse_proxy::store::{Store, StoreError};
 use proptest::prelude::*;
 use serde_json::{json, Map};
 use tokio::sync::{Barrier, RwLock, Semaphore};
-use url::Url;
 
 fn key(path: &str) -> RouteKey {
     RouteKey::parse(path).unwrap()
@@ -20,7 +19,7 @@ fn key(path: &str) -> RouteKey {
 
 fn route(target: &str) -> RouteData {
     RouteData {
-        target: Url::parse(target).unwrap(),
+        target: target.to_owned(),
         last_activity: Utc.timestamp_opt(1, 0).unwrap(),
         extra: Map::from_iter([("owner".to_owned(), json!("jupyterhub"))]),
     }

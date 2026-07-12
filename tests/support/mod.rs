@@ -23,10 +23,12 @@ pub use http::StatusCode;
 
 /// A built router plus the token it was configured with, so `get_json` can
 /// authenticate itself without the caller repeating the credential.
+#[derive(Clone)]
 pub struct TestApi {
     pub router: Router,
     pub token: Option<String>,
     pub registry: Arc<RouteRegistry>,
+    pub metrics: Arc<Metrics>,
 }
 
 impl TestApi {
@@ -38,17 +40,23 @@ impl TestApi {
 /// Build the route management API backed by an empty in-memory store.
 pub async fn test_api(token: Option<&str>) -> TestApi {
     let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+    test_api_with_store(token, store).await
+}
+
+/// Build the route management API over a caller-provided persistence double.
+pub async fn test_api_with_store(token: Option<&str>, store: Arc<dyn Store>) -> TestApi {
     let registry = Arc::new(
         RouteRegistry::load(store)
             .await
             .expect("empty memory store loads"),
     );
     let metrics = Arc::new(Metrics::new());
-    let state = ApiState::new(Arc::clone(&registry), token, metrics);
+    let state = ApiState::new(Arc::clone(&registry), token, Arc::clone(&metrics));
     TestApi {
         router: router(state),
         token: token.map(str::to_owned),
         registry,
+        metrics,
     }
 }
 
