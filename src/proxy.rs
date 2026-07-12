@@ -170,6 +170,14 @@ impl ChpProxy {
         session.write_response_body(Some(body), true).await
     }
 
+    async fn send_empty(session: &mut Session, status: StatusCode) -> pingora::Result<()> {
+        let mut response = ResponseHeader::build(status.as_u16(), Some(1))?;
+        response.set_content_length(0)?;
+        session
+            .write_response_header(Box::new(response), true)
+            .await
+    }
+
     fn observe_stream_data(&self, ctx: &mut RequestContext) {
         ctx.stream_data_seen = true;
         self.publish_activity_if_eligible(ctx);
@@ -426,6 +434,13 @@ impl ProxyHttp for ChpProxy {
             }
         });
         let status = classification.status();
+        if session.is_upgrade_req() {
+            let _ = Self::send_empty(session, status).await;
+            return FailToProxy {
+                error_code: status.as_u16(),
+                can_reuse_downstream: false,
+            };
+        }
         let original = ctx
             .original_uri
             .path_and_query()

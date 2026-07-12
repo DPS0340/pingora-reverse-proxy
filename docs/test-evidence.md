@@ -319,3 +319,56 @@ git diff --check
 ```
 
 All four exited `0`. No dependency was added.
+
+## Task 8 listener, TLS, WebSocket, and shutdown evidence
+
+The new real-binary contracts were observed RED before listener assembly. The
+initial `cargo test --test websocket_contract --test tls_unix_contract --
+--nocapture` run produced four listener/PID failures, and the direct WebSocket
+run produced two exact-readiness failures because the API listener did not
+exist. No contract was ignored, runtime-skipped, or weakened.
+
+After implementation, the focused Task 8 suite passed:
+
+```bash
+cargo test --test websocket_contract --test tls_unix_contract -- --nocapture
+```
+
+Exit code: `0`. Results: TLS/Unix/listener/lifecycle `12 passed`, WebSocket `2
+passed`; no failures, ignores, measured, or filtered tests. Coverage includes
+public WebSocket echo and empty unavailable 503 handshake; public/API/metrics
+TCP and UDS; public/API HTTPS with encrypted listener keys; required API client
+certificate; positive and negative private upstream CA verification; upstream
+client certificate; exact redirect 400/301 behavior; active-response SIGTERM
+drain; and atomic PID refusal/cleanup on normal and startup-error paths.
+The API TLS listener also rejects a silent handshake after a fixed one-second
+bound so a stalled client cannot block later exact API requests indefinitely;
+this regression was observed failing before the bound was added.
+
+The requested existing suite counts passed with 256 property cases: library
+`8`, proxy `69`, store `45`, API `33`, config `26`, and route `11`. The route
+suite separately passed all `11` contracts with `PROPTEST_CASES=512`.
+
+The complete host-macOS verification passed:
+
+```bash
+PROPTEST_CASES=256 cargo test --all-targets --all-features -- --nocapture
+```
+
+Exit code: `0`; `206 passed` total with no failures or ignores (library `8`,
+binary `0`, API `33`, config `26`, proxy `69`, route `11`, store `45`, Task 8
+TLS/Unix `12`, and WebSocket `2`). Unix contracts are compile-time gated with
+`#[cfg(unix)]`.
+
+Final quality gates:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo check --all-targets --all-features
+git diff --check
+```
+
+All four exited `0`. Docker was unavailable and was not used. Runtime
+`openssl`/`tokio-openssl` support Axum TLS listeners; `futures-util` is test-only
+for WebSocket frame assertions.
