@@ -17,6 +17,39 @@ struct Node {
     route: Option<RouteMatch>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct OrderedRoutes {
+    by_key: BTreeMap<RouteKey, RouteData>,
+    mutation_order: Vec<RouteKey>,
+}
+
+impl OrderedRoutes {
+    fn from_sorted(by_key: BTreeMap<RouteKey, RouteData>) -> Self {
+        let mutation_order = by_key.keys().cloned().collect();
+        Self {
+            by_key,
+            mutation_order,
+        }
+    }
+
+    fn replace(&mut self, key: RouteKey, data: RouteData) {
+        self.mutation_order.retain(|existing| existing != &key);
+        self.mutation_order.push(key.clone());
+        self.by_key.insert(key, data);
+    }
+
+    fn update_activity(&mut self, key: &RouteKey, at: DateTime<Utc>) {
+        if let Some(route) = self.by_key.get_mut(key) {
+            route.last_activity = at;
+        }
+    }
+
+    fn remove(&mut self, key: &RouteKey) {
+        self.by_key.remove(key);
+        self.mutation_order.retain(|existing| existing != key);
+    }
+}
+
 /// A matched normalized key and shared immutable route data.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RouteMatch {
@@ -28,15 +61,26 @@ pub struct RouteMatch {
 #[derive(Clone, Debug, Default)]
 pub struct RouteSnapshot {
     root: Node,
-    routes: BTreeMap<RouteKey, RouteData>,
+    routes: OrderedRoutes,
 }
 
 impl RouteSnapshot {
-    /// Build a new immutable matcher from a complete logical route map.
+    /// Build a matcher using ascending `RouteKey` order.
+    ///
+    /// This deterministic order is also used for initial store loads, where
+    /// no successful runtime mutation history is available.
     pub fn from_routes(routes: BTreeMap<RouteKey, RouteData>) -> Self {
+        Self::from_ordered_routes(OrderedRoutes::from_sorted(routes))
+    }
+
+    fn from_ordered_routes(routes: OrderedRoutes) -> Self {
         let mut root = Node::default();
 
-        for (key, data) in &routes {
+        for key in &routes.mutation_order {
+            let Some(data) = routes.by_key.get(key) else {
+                debug_assert!(false, "ordered route key must exist in the route map");
+                continue;
+            };
             let mut node = &mut root;
             for segment in segments(key.as_str()) {
                 node = node.children.entry(segment.to_owned()).or_default();
@@ -77,7 +121,10 @@ pub struct RouteRegistry {
 }
 
 impl RouteRegistry {
-    /// Load and validate the complete persisted route map before publication.
+    /// Load the complete persisted map before publication.
+    ///
+    /// Because persisted snapshots do not contain runtime mutation history,
+    /// initial matcher precedence is deterministic ascending `RouteKey` order.
     pub async fn load(store: Arc<dyn Store>) -> Result<Self, StoreError> {
         let routes = store.snapshot().await?;
         Ok(Self {
@@ -89,12 +136,12 @@ impl RouteRegistry {
 
     /// Return one normalized route record from the current snapshot.
     pub fn get(&self, key: &RouteKey) -> Option<RouteData> {
-        self.snapshot.load().routes.get(key).cloned()
+        self.snapshot.load().routes.by_key.get(key).cloned()
     }
 
     /// Return a complete clone of the current logical route map.
     pub fn all(&self) -> BTreeMap<RouteKey, RouteData> {
-        self.snapshot.load().routes.clone()
+        self.snapshot.load().routes.by_key.clone()
     }
 
     /// Resolve a runtime request path against the current immutable snapshot.
@@ -107,12 +154,12 @@ impl RouteRegistry {
         let _mutation = self.mutation.lock().await;
         let mut routes = self.snapshot.load().routes.clone();
         self.store.put(key.clone(), data.clone()).await?;
-        routes.insert(key, data);
+        routes.replace(key, data);
         self.publish(routes);
         Ok(())
     }
 
-    /// Persist a newly configured route, then stamp activity at completion like CHP.
+    /// Publish only the record atomically committed and stamped by the backend.
     pub async fn add(
         &self,
         key: RouteKey,
@@ -121,16 +168,8 @@ impl RouteRegistry {
     ) -> Result<(), StoreError> {
         let _mutation = self.mutation.lock().await;
         let mut routes = self.snapshot.load().routes.clone();
-        let mut data = RouteData {
-            target,
-            last_activity: Utc::now(),
-            extra,
-        };
-
-        self.store.put(key.clone(), data.clone()).await?;
-        data.last_activity = Utc::now();
-        self.store.update_activity(&key, data.last_activity).await?;
-        routes.insert(key, data);
+        let data = self.store.add(key.clone(), target, extra).await?;
+        routes.replace(key, data);
         self.publish(routes);
         Ok(())
     }
@@ -144,9 +183,7 @@ impl RouteRegistry {
         let _mutation = self.mutation.lock().await;
         let mut routes = self.snapshot.load().routes.clone();
         self.store.update_activity(key, at).await?;
-        if let Some(route) = routes.get_mut(key) {
-            route.last_activity = at;
-        }
+        routes.update_activity(key, at);
         self.publish(routes);
         Ok(())
     }
@@ -161,9 +198,9 @@ impl RouteRegistry {
         Ok(deleted)
     }
 
-    fn publish(&self, routes: BTreeMap<RouteKey, RouteData>) {
+    fn publish(&self, routes: OrderedRoutes) {
         self.snapshot
-            .store(Arc::new(RouteSnapshot::from_routes(routes)));
+            .store(Arc::new(RouteSnapshot::from_ordered_routes(routes)));
     }
 }
 

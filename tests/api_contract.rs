@@ -1,7 +1,9 @@
 mod support;
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
 
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
@@ -316,8 +318,9 @@ async fn every_string_target_is_accepted_and_round_trips_verbatim() {
 }
 
 #[tokio::test]
-async fn inactive_since_uses_explicit_pinned_date_parse_compatibility_fixtures() {
-    // Captured from Date.parse under the pinned CHP runtime.
+async fn inactive_since_accepts_the_pinned_timezone_stable_date_parse_subset() {
+    // Captured from Date.parse under the pinned CHP runtime. Every accepted
+    // form has timezone-independent semantics.
     let accepted = [
         ("2020-01-01", "2020-01-01T00:00:00.000Z"),
         ("2020-01-01T12:34:56.789Z", "2020-01-01T12:34:56.789Z"),
@@ -360,6 +363,61 @@ async fn inactive_since_uses_explicit_pinned_date_parse_compatibility_fixtures()
         let filtered = read_json(response).await;
         assert!(filtered.get("/before").is_some(), "{input:?}: {filtered}");
         assert!(filtered.get("/boundary").is_none(), "{input:?}: {filtered}");
+    }
+}
+
+#[tokio::test]
+async fn inactive_since_rejects_locale_and_local_time_dependent_date_forms() {
+    let app = test_api(None).await;
+
+    for input in ["January 1, 2020", "01/02/2020", "2020-01-01T00:00:00"] {
+        let encoded: String = url::form_urlencoded::byte_serialize(input.as_bytes()).collect();
+        let response = request(
+            &app,
+            "GET",
+            &format!("/api/routes?inactiveSince={encoded}"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{input:?}");
+    }
+}
+
+#[tokio::test]
+async fn route_methods_apply_whatwg_pathname_dot_segments_before_decoding() {
+    // Pinned Node WHATWG URL pathname oracle fixtures, sent through Request URI
+    // construction without client-side path normalization.
+    let fixtures = [
+        ("/api/routes/a/../b", "/api/routes/b"),
+        ("/api/routes/a/%2e%2e/b", "/api/routes/b"),
+        ("/api/routes/a/%2E/b", "/api/routes/a/b"),
+    ];
+
+    for (path_as_is, normalized) in fixtures {
+        let app = test_api(None).await;
+        assert_eq!(
+            post_route(&app, path_as_is, path_as_is).await.status(),
+            StatusCode::CREATED,
+            "POST {path_as_is}"
+        );
+        assert_eq!(
+            get_json(&app, path_as_is).await["target"],
+            path_as_is,
+            "GET {path_as_is}"
+        );
+        assert_eq!(get_json(&app, normalized).await["target"], path_as_is);
+        assert_eq!(
+            request(&app, "DELETE", path_as_is, None, None)
+                .await
+                .status(),
+            StatusCode::NO_CONTENT,
+            "DELETE {path_as_is}"
+        );
+        assert_eq!(
+            request(&app, "GET", normalized, None, None).await.status(),
+            StatusCode::NOT_FOUND
+        );
     }
 }
 
@@ -426,13 +484,13 @@ async fn empty_configured_token_disables_auth_and_nbsp_is_javascript_whitespace(
     }
 }
 
-struct GatedPutStore {
+struct GatedAtomicAddStore {
     routes: RwLock<BTreeMap<RouteKey, RouteData>>,
     entered: Semaphore,
     release: Semaphore,
 }
 
-impl GatedPutStore {
+impl GatedAtomicAddStore {
     fn new() -> Self {
         Self {
             routes: RwLock::new(BTreeMap::new()),
@@ -443,18 +501,34 @@ impl GatedPutStore {
 }
 
 #[async_trait]
-impl Store for GatedPutStore {
+impl Store for GatedAtomicAddStore {
     async fn snapshot(&self) -> Result<BTreeMap<RouteKey, RouteData>, StoreError> {
         Ok(self.routes.read().await.clone())
     }
 
-    async fn put(&self, key: RouteKey, data: RouteData) -> Result<(), StoreError> {
+    async fn add(
+        &self,
+        key: RouteKey,
+        target: String,
+        extra: serde_json::Map<String, Value>,
+    ) -> Result<RouteData, StoreError> {
         self.entered.add_permits(1);
         self.release
             .acquire()
             .await
             .expect("test gate open")
             .forget();
+        let mut routes = self.routes.write().await;
+        let data = RouteData {
+            target,
+            last_activity: Utc::now(),
+            extra,
+        };
+        routes.insert(key, data.clone());
+        Ok(data)
+    }
+
+    async fn put(&self, key: RouteKey, data: RouteData) -> Result<(), StoreError> {
         self.routes.write().await.insert(key, data);
         Ok(())
     }
@@ -476,8 +550,8 @@ impl Store for GatedPutStore {
 }
 
 #[tokio::test]
-async fn post_sets_last_activity_only_after_slow_put_persistence_finishes() {
-    let store = Arc::new(GatedPutStore::new());
+async fn post_publishes_the_timestamp_returned_after_slow_atomic_persistence() {
+    let store = Arc::new(GatedAtomicAddStore::new());
     let app = test_api_with_store(None, store.clone()).await;
     let request_app = app.clone();
     let posting =
@@ -500,9 +574,14 @@ async fn post_sets_last_activity_only_after_slow_put_persistence_finishes() {
     );
 }
 
+fn poll_once<F: Future>(future: std::pin::Pin<&mut F>) -> Poll<F::Output> {
+    let mut context = Context::from_waker(Waker::noop());
+    future.poll(&mut context)
+}
+
 #[tokio::test]
 async fn concurrent_post_then_delete_is_serialized_through_the_registry() {
-    let store = Arc::new(GatedPutStore::new());
+    let store = Arc::new(GatedAtomicAddStore::new());
     let app = test_api_with_store(None, store.clone()).await;
     let post_app = app.clone();
     let posting =
@@ -510,14 +589,20 @@ async fn concurrent_post_then_delete_is_serialized_through_the_registry() {
 
     store.entered.acquire().await.unwrap().forget();
     let delete_app = app.clone();
-    let deleting = tokio::spawn(async move {
-        request(&delete_app, "DELETE", "/api/routes/race", None, None).await
-    });
-    tokio::task::yield_now().await;
+    let mut deleting = Box::pin(request(
+        &delete_app,
+        "DELETE",
+        "/api/routes/race",
+        None,
+        None,
+    ));
+    // DELETE has no await before `RouteRegistry::delete`. A pending first poll
+    // therefore proves it reached and queued on the mutation mutex held by POST.
+    assert!(poll_once(deleting.as_mut()).is_pending());
     store.release.add_permits(1);
 
     assert_eq!(posting.await.unwrap().status(), StatusCode::CREATED);
-    assert_eq!(deleting.await.unwrap().status(), StatusCode::NO_CONTENT);
+    assert_eq!(deleting.await.status(), StatusCode::NO_CONTENT);
     assert!(app
         .registry
         .get(&RouteKey::parse("/race").unwrap())
@@ -528,14 +613,23 @@ struct FailingMutationStore {
     routes: BTreeMap<RouteKey, RouteData>,
 }
 
-struct ActivityFailureStore {
+struct AtomicAddFailureStore {
     routes: RwLock<BTreeMap<RouteKey, RouteData>>,
 }
 
 #[async_trait]
-impl Store for ActivityFailureStore {
+impl Store for AtomicAddFailureStore {
     async fn snapshot(&self) -> Result<BTreeMap<RouteKey, RouteData>, StoreError> {
         Ok(self.routes.read().await.clone())
+    }
+
+    async fn add(
+        &self,
+        _key: RouteKey,
+        _target: String,
+        _extra: serde_json::Map<String, Value>,
+    ) -> Result<RouteData, StoreError> {
+        Err(StoreError::message("injected atomic add failure"))
     }
 
     async fn put(&self, key: RouteKey, data: RouteData) -> Result<(), StoreError> {
@@ -560,6 +654,15 @@ impl Store for ActivityFailureStore {
 impl Store for FailingMutationStore {
     async fn snapshot(&self) -> Result<BTreeMap<RouteKey, RouteData>, StoreError> {
         Ok(self.routes.clone())
+    }
+
+    async fn add(
+        &self,
+        _key: RouteKey,
+        _target: String,
+        _extra: serde_json::Map<String, Value>,
+    ) -> Result<RouteData, StoreError> {
+        Err(StoreError::message("injected add failure"))
     }
 
     async fn put(&self, _key: RouteKey, _data: RouteData) -> Result<(), StoreError> {
@@ -665,8 +768,8 @@ async fn failed_store_operations_count_500_responses_but_not_route_operations() 
 }
 
 #[tokio::test]
-async fn failed_post_activity_persistence_never_publishes_or_counts_the_route() {
-    let store = Arc::new(ActivityFailureStore {
+async fn failed_atomic_post_persistence_never_mutates_publishes_or_counts() {
+    let store = Arc::new(AtomicAddFailureStore {
         routes: RwLock::new(BTreeMap::new()),
     });
     let app = test_api_with_store(None, store.clone()).await;
@@ -682,7 +785,7 @@ async fn failed_post_activity_persistence_never_publishes_or_counts_the_route() 
         .registry
         .get(&RouteKey::parse("/activity-failure").unwrap())
         .is_none());
-    assert!(store
+    assert!(!store
         .snapshot()
         .await
         .unwrap()

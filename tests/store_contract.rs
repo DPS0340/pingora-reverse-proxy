@@ -31,6 +31,22 @@ fn memory_store() -> Arc<dyn Store> {
 
 async fn assert_store_contract(store: Arc<dyn Store>) {
     let route_key = key("//user/alice///");
+    let add_started_at = Utc::now();
+    let added = store
+        .add(
+            route_key.clone(),
+            "http://127.0.0.1:8999/added".to_owned(),
+            Map::from_iter([("owner".to_owned(), json!("added"))]),
+        )
+        .await
+        .unwrap();
+    assert!(added.last_activity >= add_started_at);
+    assert_eq!(
+        store.snapshot().await.unwrap().get(&route_key),
+        Some(&added),
+        "add must return the exact atomically committed record"
+    );
+
     let original = route("http://127.0.0.1:9000/base");
     store
         .put(route_key.clone(), original.clone())
@@ -151,6 +167,15 @@ impl Store for FailingStore {
         Ok(self.routes.clone())
     }
 
+    async fn add(
+        &self,
+        _key: RouteKey,
+        _target: String,
+        _extra: Map<String, serde_json::Value>,
+    ) -> Result<RouteData, StoreError> {
+        Err(StoreError::message("injected add failure"))
+    }
+
     async fn put(&self, _key: RouteKey, _data: RouteData) -> Result<(), StoreError> {
         Err(StoreError::message("injected put failure"))
     }
@@ -173,6 +198,163 @@ async fn failed_persistence_never_publishes_route() {
         .await;
     assert!(result.is_err());
     assert!(registry.resolve("/user/a/tree").is_none());
+}
+
+struct GatedAtomicAddStore {
+    routes: RwLock<BTreeMap<RouteKey, RouteData>>,
+    entered: Semaphore,
+    release: Semaphore,
+    fail: bool,
+}
+
+impl GatedAtomicAddStore {
+    fn new(routes: BTreeMap<RouteKey, RouteData>, fail: bool) -> Self {
+        Self {
+            routes: RwLock::new(routes),
+            entered: Semaphore::new(0),
+            release: Semaphore::new(0),
+            fail,
+        }
+    }
+}
+
+#[async_trait]
+impl Store for GatedAtomicAddStore {
+    async fn snapshot(&self) -> Result<BTreeMap<RouteKey, RouteData>, StoreError> {
+        Ok(self.routes.read().await.clone())
+    }
+
+    async fn add(
+        &self,
+        key: RouteKey,
+        target: String,
+        extra: Map<String, serde_json::Value>,
+    ) -> Result<RouteData, StoreError> {
+        self.entered.add_permits(1);
+        self.release.acquire().await.unwrap().forget();
+        if self.fail {
+            return Err(StoreError::message("injected atomic add failure"));
+        }
+
+        let mut routes = self.routes.write().await;
+        let data = RouteData {
+            target,
+            last_activity: Utc::now(),
+            extra,
+        };
+        routes.insert(key, data.clone());
+        Ok(data)
+    }
+
+    async fn put(&self, key: RouteKey, data: RouteData) -> Result<(), StoreError> {
+        self.routes.write().await.insert(key, data);
+        Ok(())
+    }
+
+    async fn update_activity(&self, key: &RouteKey, at: DateTime<Utc>) -> Result<(), StoreError> {
+        if let Some(route) = self.routes.write().await.get_mut(key) {
+            route.last_activity = at;
+        }
+        Ok(())
+    }
+
+    async fn delete(&self, key: &RouteKey) -> Result<Option<RouteData>, StoreError> {
+        Ok(self.routes.write().await.remove(key))
+    }
+}
+
+#[tokio::test]
+async fn atomic_add_failure_leaves_backend_and_registry_unchanged() {
+    let route_key = key("/service");
+    let original = route("http://original.example");
+    let store = Arc::new(GatedAtomicAddStore::new(
+        BTreeMap::from([(route_key.clone(), original.clone())]),
+        true,
+    ));
+    let registry = Arc::new(RouteRegistry::load(store.clone()).await.unwrap());
+    let adding = {
+        let registry = Arc::clone(&registry);
+        let route_key = route_key.clone();
+        tokio::spawn(async move {
+            registry
+                .add(
+                    route_key,
+                    "http://replacement.example".to_owned(),
+                    Map::new(),
+                )
+                .await
+        })
+    };
+
+    store.entered.acquire().await.unwrap().forget();
+    store.release.add_permits(1);
+    assert!(adding.await.unwrap().is_err());
+
+    assert_eq!(
+        store.snapshot().await.unwrap().get(&route_key),
+        Some(&original)
+    );
+    assert_eq!(registry.get(&route_key), Some(original));
+}
+
+#[tokio::test]
+async fn cancelling_a_pending_atomic_add_leaves_backend_and_registry_unchanged() {
+    let route_key = key("/service");
+    let original = route("http://original.example");
+    let store = Arc::new(GatedAtomicAddStore::new(
+        BTreeMap::from([(route_key.clone(), original.clone())]),
+        false,
+    ));
+    let registry = Arc::new(RouteRegistry::load(store.clone()).await.unwrap());
+    let adding = {
+        let registry = Arc::clone(&registry);
+        let route_key = route_key.clone();
+        tokio::spawn(async move {
+            registry
+                .add(
+                    route_key,
+                    "http://replacement.example".to_owned(),
+                    Map::new(),
+                )
+                .await
+        })
+    };
+
+    store.entered.acquire().await.unwrap().forget();
+    adding.abort();
+    assert!(adding.await.unwrap_err().is_cancelled());
+    store.release.add_permits(1);
+
+    assert_eq!(
+        store.snapshot().await.unwrap().get(&route_key),
+        Some(&original)
+    );
+    assert_eq!(registry.get(&route_key), Some(original));
+}
+
+#[tokio::test]
+async fn slow_atomic_add_stamps_after_delay_and_publishes_exact_committed_data() {
+    let route_key = key("/service");
+    let store = Arc::new(GatedAtomicAddStore::new(BTreeMap::new(), false));
+    let registry = Arc::new(RouteRegistry::load(store.clone()).await.unwrap());
+    let adding = {
+        let registry = Arc::clone(&registry);
+        let route_key = route_key.clone();
+        tokio::spawn(async move {
+            registry
+                .add(route_key, "http://committed.example".to_owned(), Map::new())
+                .await
+        })
+    };
+
+    store.entered.acquire().await.unwrap().forget();
+    let delay_finished_at = Utc::now();
+    store.release.add_permits(1);
+    adding.await.unwrap().unwrap();
+
+    let committed = store.snapshot().await.unwrap().remove(&route_key).unwrap();
+    assert!(committed.last_activity >= delay_finished_at);
+    assert_eq!(registry.get(&route_key), Some(committed));
 }
 
 fn registry_views(
@@ -281,6 +463,116 @@ async fn registry_overwrite_and_activity_update_publish_complete_records() {
 }
 
 #[tokio::test]
+async fn aliasing_route_keys_follow_successful_mutation_order_in_both_permutations() {
+    for (first, second) in [("/service", "//service"), ("//service", "/service")] {
+        let registry = RouteRegistry::load(memory_store()).await.unwrap();
+        registry
+            .put(key(first), route(&format!("http://first.example{first}")))
+            .await
+            .unwrap();
+        registry
+            .put(
+                key(second),
+                route(&format!("http://second.example{second}")),
+            )
+            .await
+            .unwrap();
+
+        let matched = registry.resolve("/service/request").unwrap();
+        assert_eq!(
+            matched.key,
+            key(second),
+            "mutation order {first:?}, {second:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn overwriting_an_alias_moves_it_to_the_end_of_matcher_order() {
+    let registry = RouteRegistry::load(memory_store()).await.unwrap();
+    registry
+        .put(key("/service"), route("http://single.example/old"))
+        .await
+        .unwrap();
+    registry
+        .put(key("//service"), route("http://double.example"))
+        .await
+        .unwrap();
+    registry
+        .put(key("/service"), route("http://single.example/new"))
+        .await
+        .unwrap();
+
+    let matched = registry.resolve("/service/request").unwrap();
+    assert_eq!(matched.key, key("/service"));
+    assert_eq!(matched.data.target, "http://single.example/new");
+}
+
+#[tokio::test]
+async fn deleting_the_winning_alias_restores_the_surviving_alias() {
+    let registry = RouteRegistry::load(memory_store()).await.unwrap();
+    registry
+        .put(key("/service"), route("http://single.example"))
+        .await
+        .unwrap();
+    registry
+        .put(key("//service"), route("http://double.example"))
+        .await
+        .unwrap();
+
+    registry.delete(&key("//service")).await.unwrap();
+
+    assert_eq!(
+        registry.resolve("/service/request").unwrap().key,
+        key("/service")
+    );
+}
+
+#[tokio::test]
+async fn activity_updates_do_not_change_alias_matcher_order() {
+    let registry = RouteRegistry::load(memory_store()).await.unwrap();
+    registry
+        .put(key("/service"), route("http://single.example"))
+        .await
+        .unwrap();
+    registry
+        .put(key("//service"), route("http://double.example"))
+        .await
+        .unwrap();
+
+    registry
+        .update_activity(&key("/service"), Utc.timestamp_opt(500, 0).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        registry.resolve("/service/request").unwrap().key,
+        key("//service")
+    );
+}
+
+#[tokio::test]
+async fn initial_store_load_uses_deterministic_key_order_for_aliases() {
+    let store = memory_store();
+    store
+        .put(key("/service"), route("http://single.example"))
+        .await
+        .unwrap();
+    store
+        .put(key("//service"), route("http://double.example"))
+        .await
+        .unwrap();
+
+    let registry = RouteRegistry::load(store).await.unwrap();
+
+    assert_eq!(
+        registry.resolve("/service/request").unwrap().key,
+        key("/service"),
+        "initial load uses the snapshot's ascending RouteKey order"
+    );
+}
+
+#[tokio::test]
 async fn registry_delete_missing_is_a_noop_and_delete_returns_prior_route() {
     let registry = RouteRegistry::load(memory_store()).await.unwrap();
     let route_key = key("/service");
@@ -329,6 +621,15 @@ impl Store for GatedPutStore {
         Ok(self.routes.read().await.clone())
     }
 
+    async fn add(
+        &self,
+        _key: RouteKey,
+        _target: String,
+        _extra: Map<String, serde_json::Value>,
+    ) -> Result<RouteData, StoreError> {
+        unreachable!("the writer-serialization test only exercises put")
+    }
+
     async fn put(&self, key: RouteKey, data: RouteData) -> Result<(), StoreError> {
         self.entries.lock().unwrap().push(key.clone());
         self.gates[&key].acquire().await.unwrap().forget();
@@ -351,9 +652,9 @@ fn poll_once<F: Future>(future: std::pin::Pin<&mut F>) -> Poll<F::Output> {
 }
 
 #[tokio::test]
-async fn concurrent_writers_are_serialized_without_losing_mutations() {
-    let first_key = key("/first");
-    let second_key = key("/second");
+async fn concurrent_alias_writers_are_serialized_in_successful_mutation_order() {
+    let first_key = key("/service");
+    let second_key = key("//service");
     let store = Arc::new(GatedPutStore::new([first_key.clone(), second_key.clone()]));
     let registry = RouteRegistry::load(store.clone()).await.unwrap();
     let first_data = route("http://127.0.0.1:9001/first");
@@ -385,8 +686,10 @@ async fn concurrent_writers_are_serialized_without_losing_mutations() {
     assert_eq!(registry.all(), expected);
     assert_eq!(registry.get(&first_key), Some(first_data));
     assert_eq!(registry.get(&second_key), Some(second_data));
-    assert_eq!(registry.resolve("/first/request").unwrap().key, first_key);
-    assert_eq!(registry.resolve("/second/request").unwrap().key, second_key);
+    assert_eq!(
+        registry.resolve("/service/request").unwrap().key,
+        second_key
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

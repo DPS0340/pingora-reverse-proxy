@@ -13,6 +13,7 @@ use axum::{Json, Router};
 use chrono::{DateTime, NaiveDate, Utc};
 use constant_time_eq::constant_time_eq;
 use serde_json::{Map, Value};
+use url::Url;
 
 use crate::metrics::Metrics;
 use crate::route::RouteKey;
@@ -321,12 +322,18 @@ fn inactive_since(query: Option<&str>) -> Result<Option<DateTime<Utc>>, String> 
         return Ok(None);
     };
 
-    parse_javascript_date(raw)
+    parse_pinned_date_parse_subset(raw)
         .map(Some)
         .map_err(|_| format!("Invalid datestamp '{raw}' must be ISO8601."))
 }
 
-fn parse_javascript_date(raw: &str) -> Result<DateTime<Utc>, ()> {
+/// Parse the pinned, timezone-stable subset of CHP's `Date.parse` inputs.
+///
+/// Supported forms are RFC 3339 with an explicit zone, ISO date-only (UTC),
+/// RFC 2822 with an explicit zone, and ISO date/time separated by a space with
+/// an explicit zone. Locale-specific dates and zone-less local times are
+/// intentionally rejected because their meaning depends on locale or timezone.
+fn parse_pinned_date_parse_subset(raw: &str) -> Result<DateTime<Utc>, ()> {
     if let Ok(timestamp) = DateTime::parse_from_rfc3339(raw) {
         return Ok(timestamp.with_timezone(&Utc));
     }
@@ -345,7 +352,8 @@ fn parse_javascript_date(raw: &str) -> Result<DateTime<Utc>, ()> {
 }
 
 fn route_key_from_uri(uri: &Uri, clean_count: usize) -> Result<RouteKey, RoutePathError> {
-    let Some(raw) = uri.path().strip_prefix("/api/routes") else {
+    let pathname = whatwg_normalized_pathname(uri.path()).ok_or(RoutePathError::BadRequest)?;
+    let Some(raw) = pathname.strip_prefix("/api/routes") else {
         return Err(RoutePathError::NotFound);
     };
     let decoded = percent_decode(raw).ok_or(RoutePathError::BadRequest)?;
@@ -356,6 +364,16 @@ fn route_key_from_uri(uri: &Uri, clean_count: usize) -> Result<RouteKey, RoutePa
         key = route_key(key.as_str());
     }
     Ok(key)
+}
+
+fn whatwg_normalized_pathname(path: &str) -> Option<String> {
+    // `Uri::path` always begins with `/`, so appending it to a fixed authority
+    // cannot let request data replace the scheme or host. Parsing the absolute
+    // URL applies WHATWG pathname dot-segment handling while leaving percent
+    // decoding to CHP's subsequent route-key layer.
+    Url::parse(&format!("http://route.invalid{path}"))
+        .ok()
+        .map(|url| url.path().to_owned())
 }
 
 fn percent_decode(input: &str) -> Option<String> {

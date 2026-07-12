@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use serde_json::{Map, Value};
 use tokio::sync::RwLock;
 
 use crate::route::{RouteData, RouteKey};
@@ -26,6 +27,22 @@ impl MemoryStore {
 impl Store for MemoryStore {
     async fn snapshot(&self) -> Result<BTreeMap<RouteKey, RouteData>, StoreError> {
         Ok(self.routes.read().await.clone())
+    }
+
+    async fn add(
+        &self,
+        key: RouteKey,
+        target: String,
+        extra: Map<String, Value>,
+    ) -> Result<RouteData, StoreError> {
+        let mut routes = self.routes.write().await;
+        let data = RouteData {
+            target,
+            last_activity: Utc::now(),
+            extra,
+        };
+        routes.insert(key, data.clone());
+        Ok(data)
     }
 
     async fn put(&self, key: RouteKey, data: RouteData) -> Result<(), StoreError> {
