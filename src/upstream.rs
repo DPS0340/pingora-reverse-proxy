@@ -142,7 +142,12 @@ impl Target {
         let path = target_path(url);
         match url.scheme() {
             "http" | "https" => {
-                let host = url.host_str().ok_or(TargetError::MissingHost)?.to_owned();
+                let raw_host = url.host_str().ok_or(TargetError::MissingHost)?;
+                let host = raw_host
+                    .strip_prefix('[')
+                    .and_then(|host| host.strip_suffix(']'))
+                    .unwrap_or(raw_host)
+                    .to_owned();
                 if host.is_empty() {
                     return Err(TargetError::MissingHost);
                 }
@@ -200,7 +205,9 @@ impl Target {
 
     /// Construct a Pingora peer without using Pingora's panic-prone DNS constructor path.
     pub fn http_peer(&self, tls: &TlsClientConfig) -> Result<HttpPeer, TargetError> {
-        validate_identity_pair(tls)?;
+        if self.is_tls() {
+            validate_identity_pair(tls)?;
+        }
         let mut peer = match self {
             Self::Tcp {
                 host,
@@ -224,11 +231,13 @@ impl Target {
         peer.options.read_timeout = tls.read_timeout;
         peer.options.write_timeout = tls.write_timeout;
         peer.options.idle_timeout = tls.idle_timeout;
-        if let Some(path) = &tls.ca_file {
-            peer.options.ca = Some(Arc::new(load_ca(path)?));
-        }
-        if let (Some(cert_path), Some(key_path)) = (&tls.client_certificate, &tls.client_key) {
-            peer.client_cert_key = Some(Arc::new(load_identity(cert_path, key_path)?));
+        if self.is_tls() {
+            if let Some(path) = &tls.ca_file {
+                peer.options.ca = Some(Arc::new(load_ca(path)?));
+            }
+            if let (Some(cert_path), Some(key_path)) = (&tls.client_certificate, &tls.client_key) {
+                peer.client_cert_key = Some(Arc::new(load_identity(cert_path, key_path)?));
+            }
         }
         Ok(peer)
     }
@@ -243,21 +252,39 @@ pub fn build_upstream_uri(
     let raw_request = request_uri
         .path_and_query()
         .map_or(request_uri.path(), |path_and_query| path_and_query.as_str());
-    let request_path_and_query = if options.include_prefix {
+    let raw_request_path_and_query = if options.include_prefix {
         raw_request
     } else {
         let prefix_units = route.key.as_str().encode_utf16().count();
         raw_request.get(prefix_units..).unwrap_or("")
     };
+    let request_path_and_query = get_path(raw_request_path_and_query)?;
 
     let path_and_query = if options.prepend_path {
-        url_join(route.target.path(), request_path_and_query)
+        url_join(route.target.path(), &request_path_and_query)
     } else {
-        url_join("/", request_path_and_query)
+        url_join("/", &request_path_and_query)
     };
     path_and_query
         .parse()
         .map_err(|error: http::uri::InvalidUri| ProxyRequestError::InvalidUri(error.to_string()))
+}
+
+fn get_path(raw: &str) -> Result<String, ProxyRequestError> {
+    if raw.is_empty() || raw.starts_with('?') {
+        return Ok(raw.to_owned());
+    }
+    let absolute = if raw.starts_with("//") {
+        format!("http://base.invalid{raw}")
+    } else {
+        format!("http://base.invalid/{}", raw.trim_start_matches('/'))
+    };
+    let parsed =
+        Url::parse(&absolute).map_err(|error| ProxyRequestError::InvalidUri(error.to_string()))?;
+    Ok(match parsed.query() {
+        Some(query) => format!("{}?{query}", parsed.path()),
+        None => parsed.path().to_owned(),
+    })
 }
 
 /// Apply CHP/http-proxy request header policy in-place.
@@ -284,8 +311,8 @@ pub fn apply_request_headers(
         custom_headers.push((parsed_name, parsed_value));
     }
 
-    let websocket = is_websocket_upgrade(headers);
-    remove_hop_by_hop(headers, websocket);
+    let websocket_upgrade = is_websocket_upgrade(headers).then(|| headers[UPGRADE].clone());
+    remove_hop_by_hop(headers, websocket_upgrade.is_some());
 
     if options.x_forward && !headers.contains_key("x-forwarded-host") {
         if let Some(host) = original_host.as_ref() {
@@ -297,6 +324,11 @@ pub fn apply_request_headers(
     }
     for (parsed_name, parsed_value) in custom_headers {
         headers.insert(parsed_name, parsed_value);
+    }
+    remove_hop_by_hop(headers, false);
+    if let Some(upgrade) = websocket_upgrade {
+        headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
+        headers.insert(UPGRADE, upgrade);
     }
     Ok(())
 }
@@ -318,16 +350,18 @@ pub fn apply_forwarded_headers(
     ];
     let mut parsed = Vec::with_capacity(values.len());
     for (name, value) in values {
-        let combined = match headers.get(name) {
-            Some(existing) => format!(
-                "{},{}",
+        let mut parts = headers
+            .get_all(name)
+            .iter()
+            .map(|existing| {
                 existing
                     .to_str()
-                    .map_err(|_| ProxyRequestError::InvalidCustomHeaderValue(name.to_owned()))?,
-                value
-            ),
-            None => value,
-        };
+                    .map(str::to_owned)
+                    .map_err(|_| ProxyRequestError::InvalidCustomHeaderValue(name.to_owned()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        parts.push(value);
+        let combined = parts.join(",");
         let value = HeaderValue::from_str(&combined)
             .map_err(|_| ProxyRequestError::InvalidCustomHeaderValue(name.to_owned()))?;
         parsed.push((HeaderName::from_static(name), value));
@@ -335,7 +369,12 @@ pub fn apply_forwarded_headers(
     let forwarded_host = if headers.contains_key("x-forwarded-host") {
         None
     } else {
-        headers.get(HOST).cloned()
+        Some(
+            headers
+                .get(HOST)
+                .cloned()
+                .unwrap_or_else(|| HeaderValue::from_static("")),
+        )
     };
 
     for (name, value) in parsed {
@@ -368,32 +407,30 @@ pub fn rewrite_location<B, R>(
     let Ok(mut parsed) = Url::parse(location) else {
         return Ok(());
     };
-    if parsed.authority() != target.authority() {
+    if url_host(&parsed).as_deref() != Some(target.authority()) {
         return Ok(());
     }
 
     if options.auto_rewrite {
-        let Some(host) = request.headers().get(HOST) else {
-            return Ok(());
-        };
-        let host = host
-            .to_str()
-            .map_err(|_| ProxyRequestError::InvalidLocation)?;
-        parsed
-            .set_host(Some(host_name(host)))
-            .map_err(|_| ProxyRequestError::InvalidLocation)?;
-        parsed
-            .set_port(host_port(host))
-            .map_err(|_| ProxyRequestError::InvalidLocation)?;
-    }
-    if let Some(protocol) = &options.protocol_rewrite {
-        let protocol = protocol.trim_end_matches(':');
-        if !matches!(protocol, "http" | "https") || parsed.set_scheme(protocol).is_err() {
-            return Err(ProxyRequestError::InvalidProtocolRewrite(
-                options.protocol_rewrite.clone().unwrap_or_default(),
-            ));
+        if let Some(host) = request.headers().get(HOST) {
+            let host = host
+                .to_str()
+                .map_err(|_| ProxyRequestError::InvalidLocation)?;
+            parsed
+                .set_host(Some(host_name(host)))
+                .map_err(|_| ProxyRequestError::InvalidLocation)?;
+            parsed
+                .set_port(host_port(host))
+                .map_err(|_| ProxyRequestError::InvalidLocation)?;
         }
     }
+    if let Some(protocol) = &options.protocol_rewrite {
+        if let Some(protocol) = whatwg_scheme(protocol) {
+            let _ = parsed.set_scheme(protocol);
+        }
+    }
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
     let value =
         HeaderValue::from_str(parsed.as_str()).map_err(|_| ProxyRequestError::InvalidLocation)?;
     response.headers_mut().insert(LOCATION, value);
@@ -401,11 +438,16 @@ pub fn rewrite_location<B, R>(
 }
 
 fn target_path(url: &Url) -> String {
-    if url.path().is_empty() {
+    let mut path = if url.path().is_empty() {
         "/".to_owned()
     } else {
         url.path().to_owned()
+    };
+    if let Some(query) = url.query() {
+        path.push('?');
+        path.push_str(query);
     }
+    path
 }
 
 fn authority(url: &Url, host: &str) -> String {
@@ -418,6 +460,19 @@ fn authority(url: &Url, host: &str) -> String {
         Some(port) => format!("{display_host}:{port}"),
         None => display_host,
     }
+}
+
+fn url_host(url: &Url) -> Option<String> {
+    url.host_str().map(|host| authority(url, host))
+}
+
+fn whatwg_scheme(value: &str) -> Option<&str> {
+    let scheme = value.strip_suffix(':').unwrap_or(value);
+    let mut bytes = scheme.bytes();
+    bytes.next()?.is_ascii_alphabetic().then_some(())?;
+    bytes
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+        .then_some(scheme)
 }
 
 fn url_join(left: &str, right: &str) -> String {
@@ -484,6 +539,8 @@ fn remove_hop_by_hop(headers: &mut HeaderMap, websocket: bool) {
     for name in [
         HeaderName::from_static("keep-alive"),
         HeaderName::from_static("proxy-connection"),
+        HeaderName::from_static("proxy-authorization"),
+        HeaderName::from_static("proxy-authenticate"),
         TE,
         TRAILER,
         TRANSFER_ENCODING,
@@ -503,10 +560,10 @@ fn is_redirect_rewrite_status(status: StatusCode) -> bool {
 }
 
 fn host_name(authority: &str) -> &str {
-    if let Some(bracketed) = authority.strip_prefix('[') {
-        return bracketed
+    if authority.starts_with('[') {
+        return authority
             .split_once(']')
-            .map_or(authority, |(host, _)| host);
+            .map_or(authority, |(host, _)| &authority[..=host.len()]);
     }
     authority
         .split_once(':')

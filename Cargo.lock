@@ -1805,6 +1805,7 @@ dependencies = [
  "clap",
  "constant_time_eq",
  "http",
+ "openssl",
  "pingora",
  "prometheus 0.14.0",
  "proptest",

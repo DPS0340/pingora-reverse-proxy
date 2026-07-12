@@ -29,6 +29,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = { version = "2", features = ["serde"] }
 
 [dev-dependencies]
+openssl = "0.10"
 proptest = "1.7"
 serial_test = "3"
 tempfile = "3"

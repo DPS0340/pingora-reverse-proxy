@@ -1,10 +1,17 @@
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use http::header::{CONNECTION, HOST, LOCATION, UPGRADE};
 use http::{HeaderMap, HeaderValue, Request, Response, StatusCode, Uri};
+use openssl::asn1::Asn1Time;
 use pingora::protocols::l4::socket::SocketAddr;
+use pingora::tls::{
+    hash::MessageDigest,
+    pkey::PKey,
+    x509::{X509NameBuilder, X509},
+};
 use proptest::prelude::*;
 use url::Url;
 
@@ -158,6 +165,58 @@ fn uri_empty_query_delimiter_is_dropped_like_http_proxy_url_join() {
 }
 
 #[test]
+fn uri_target_query_precedes_request_query_like_http_proxy() {
+    let output = build_upstream_uri(
+        &route(
+            "/user/alice",
+            "http://upstream.example/base?target=%2F+raw&shared=target",
+        ),
+        &Uri::from_static("/user/alice/tree?request=%25FF&shared=request"),
+        &options(false, true),
+    )
+    .unwrap();
+
+    assert_eq!(
+        output,
+        "/base/tree?target=%2F+raw&shared=target&request=%25FF&shared=request"
+    );
+}
+
+#[test]
+fn uri_empty_target_and_request_queries_are_dropped_like_http_proxy() {
+    let output = build_upstream_uri(
+        &route("/user", "http://upstream.example/base?"),
+        &"/user/tree?".parse::<Uri>().unwrap(),
+        &options(false, true),
+    )
+    .unwrap();
+
+    assert_eq!(output, "/base/tree");
+    assert_eq!(output.query(), None);
+}
+
+#[test]
+fn uri_get_path_normalizes_literal_and_encoded_dot_segments_after_prefix_slicing() {
+    let cases = [
+        ("/user/a/./b?raw=%2F+%25", "/base/a/b?raw=%2F+%25"),
+        ("/user/a/../b?raw=%2F+%25", "/base/b?raw=%2F+%25"),
+        ("/user/a/%2e/b?raw=%2F+%25", "/base/a/b?raw=%2F+%25"),
+        ("/user/a/%2e%2e/b?raw=%2F+%25", "/base/b?raw=%2F+%25"),
+        ("/user/a/%2F/b?raw=%2F+%25", "/base/a/%2F/b?raw=%2F+%25"),
+    ];
+
+    for (request, expected) in cases {
+        let output = build_upstream_uri(
+            &route("/user", "http://upstream.example/base"),
+            &request.parse::<Uri>().unwrap(),
+            &options(false, true),
+        )
+        .unwrap();
+        assert_eq!(output, expected, "request={request}");
+    }
+}
+
+#[test]
 fn uri_request_headers_apply_custom_origin_and_forwarded_host_policy() {
     let target = Target::parse(&Url::parse("https://upstream.example:8443/base").unwrap()).unwrap();
     let mut opts = options(true, true);
@@ -221,6 +280,75 @@ fn uri_request_headers_keep_websocket_upgrade_pair_only() {
 }
 
 #[test]
+fn uri_request_headers_final_scrub_blocks_malicious_custom_hop_headers() {
+    let target = Target::parse(&Url::parse("http://upstream.example").unwrap()).unwrap();
+    let mut opts = options(true, true);
+    for (name, value) in [
+        ("connection", "keep-alive, x-smuggled"),
+        ("x-smuggled", "secret"),
+        ("keep-alive", "timeout=5"),
+        ("proxy-connection", "keep-alive"),
+        ("proxy-authorization", "Basic c2VjcmV0"),
+        ("proxy-authenticate", "Basic realm=upstream"),
+        ("te", "trailers"),
+        ("trailer", "x-checksum"),
+        ("transfer-encoding", "chunked"),
+        ("upgrade", "h2c"),
+    ] {
+        opts.custom_headers.insert(name.into(), value.into());
+    }
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "proxy-authorization",
+        HeaderValue::from_static("Basic inbound"),
+    );
+    headers.insert(
+        "proxy-authenticate",
+        HeaderValue::from_static("Basic inbound"),
+    );
+    apply_request_headers(&mut headers, &target, &opts).unwrap();
+
+    for removed in [
+        "connection",
+        "x-smuggled",
+        "keep-alive",
+        "proxy-connection",
+        "proxy-authorization",
+        "proxy-authenticate",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ] {
+        assert!(
+            !headers.contains_key(removed),
+            "{removed} survived final scrub"
+        );
+    }
+}
+
+#[test]
+fn uri_request_headers_preserve_only_the_validated_inbound_websocket_pair() {
+    let target = Target::parse(&Url::parse("http://upstream.example").unwrap()).unwrap();
+    let mut opts = options(true, true);
+    opts.custom_headers
+        .insert("connection".into(), "x-smuggled".into());
+    opts.custom_headers.insert("upgrade".into(), "h2c".into());
+    opts.custom_headers
+        .insert("x-smuggled".into(), "secret".into());
+
+    let mut headers = HeaderMap::new();
+    headers.insert(CONNECTION, HeaderValue::from_static("keep-alive, Upgrade"));
+    headers.insert(UPGRADE, HeaderValue::from_static("websocket"));
+    apply_request_headers(&mut headers, &target, &opts).unwrap();
+
+    assert_eq!(headers[CONNECTION], "upgrade");
+    assert_eq!(headers[UPGRADE], "websocket");
+    assert!(!headers.contains_key("x-smuggled"));
+}
+
+#[test]
 fn uri_invalid_custom_header_is_a_typed_error_not_a_panic() {
     let target = Target::parse(&Url::parse("http://upstream.example").unwrap()).unwrap();
     let mut opts = options(true, true);
@@ -266,6 +394,64 @@ fn uri_x_forwarded_values_append_exactly_like_http_proxy() {
     assert_eq!(headers["x-forwarded-port"], "443,9000");
     assert_eq!(headers["x-forwarded-proto"], "https,http");
     assert_eq!(headers["x-forwarded-host"], "edge.example");
+}
+
+#[test]
+fn uri_x_forwarded_preserves_all_duplicate_values_before_appending() {
+    let mut headers = HeaderMap::new();
+    for value in ["10.0.0.1", "10.0.0.2"] {
+        headers.append("x-forwarded-for", HeaderValue::from_str(value).unwrap());
+    }
+    for value in ["443", "8443"] {
+        headers.append("x-forwarded-port", HeaderValue::from_str(value).unwrap());
+    }
+    for value in ["https", "wss"] {
+        headers.append("x-forwarded-proto", HeaderValue::from_str(value).unwrap());
+    }
+    for value in ["edge-one.example", "edge-two.example"] {
+        headers.append("x-forwarded-host", HeaderValue::from_str(value).unwrap());
+    }
+
+    apply_forwarded_headers(
+        &mut headers,
+        &ForwardedContext {
+            client_address: "203.0.113.7",
+            port: 9000,
+            protocol: "http",
+        },
+        &options(true, true),
+    )
+    .unwrap();
+
+    assert_eq!(headers["x-forwarded-for"], "10.0.0.1,10.0.0.2,203.0.113.7");
+    assert_eq!(headers["x-forwarded-port"], "443,8443,9000");
+    assert_eq!(headers["x-forwarded-proto"], "https,wss,http");
+    assert_eq!(
+        headers
+            .get_all("x-forwarded-host")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["edge-one.example", "edge-two.example"]
+    );
+}
+
+#[test]
+fn uri_x_forwarded_host_is_set_to_an_empty_value_without_any_host() {
+    let mut headers = HeaderMap::new();
+
+    apply_forwarded_headers(
+        &mut headers,
+        &ForwardedContext {
+            client_address: "203.0.113.7",
+            port: 80,
+            protocol: "http",
+        },
+        &options(true, true),
+    )
+    .unwrap();
+
+    assert_eq!(headers["x-forwarded-host"], "");
 }
 
 #[test]
@@ -348,6 +534,98 @@ fn uri_redirect_rewrite_requires_matching_target_host_and_redirect_status() {
 }
 
 #[test]
+fn uri_redirect_matches_host_and_port_without_exposing_userinfo() {
+    let target =
+        Target::parse(&Url::parse("http://target-user:target-pass@upstream.example:8080").unwrap())
+            .unwrap();
+    let mut opts = options(true, true);
+    opts.protocol_rewrite = Some("https".to_owned());
+    let request = Request::builder().body(()).unwrap();
+    let mut response = Response::builder()
+        .status(StatusCode::FOUND)
+        .header(
+            LOCATION,
+            "http://redirect-user:redirect-pass@upstream.example:8080/next",
+        )
+        .body(())
+        .unwrap();
+
+    rewrite_location(&mut response, &request, &target, &opts).unwrap();
+
+    assert_eq!(
+        response.headers()[LOCATION],
+        "https://upstream.example:8080/next"
+    );
+}
+
+#[test]
+fn uri_protocol_rewrite_does_not_require_host_and_follows_whatwg_setter() {
+    let target = Target::parse(&Url::parse("http://upstream.example:8080").unwrap()).unwrap();
+    let request = Request::builder().body(()).unwrap();
+
+    let mut opts = options(true, true);
+    opts.auto_rewrite = true;
+    opts.protocol_rewrite = Some("ftp".to_owned());
+    let mut response = Response::builder()
+        .status(StatusCode::FOUND)
+        .header(LOCATION, "http://upstream.example:8080/next")
+        .body(())
+        .unwrap();
+    rewrite_location(&mut response, &request, &target, &opts).unwrap();
+    assert_eq!(
+        response.headers()[LOCATION],
+        "ftp://upstream.example:8080/next"
+    );
+
+    opts.protocol_rewrite = Some("1bad scheme".to_owned());
+    let mut response = Response::builder()
+        .status(StatusCode::FOUND)
+        .header(LOCATION, "http://upstream.example:8080/next")
+        .body(())
+        .unwrap();
+    rewrite_location(&mut response, &request, &target, &opts).unwrap();
+    assert_eq!(
+        response.headers()[LOCATION],
+        "http://upstream.example:8080/next"
+    );
+
+    opts.protocol_rewrite = Some("ftp::".to_owned());
+    let mut response = Response::builder()
+        .status(StatusCode::FOUND)
+        .header(LOCATION, "http://upstream.example:8080/next")
+        .body(())
+        .unwrap();
+    rewrite_location(&mut response, &request, &target, &opts).unwrap();
+    assert_eq!(
+        response.headers()[LOCATION],
+        "http://upstream.example:8080/next"
+    );
+}
+
+#[test]
+fn uri_redirect_matches_ipv6_with_a_default_port() {
+    let target = Target::parse(&Url::parse("http://[::1]:80").unwrap()).unwrap();
+    let mut opts = options(true, true);
+    opts.auto_rewrite = true;
+    let request = Request::builder()
+        .header(HOST, "[2001:db8::1]:8080")
+        .body(())
+        .unwrap();
+    let mut response = Response::builder()
+        .status(StatusCode::FOUND)
+        .header(LOCATION, "http://[::1]/next")
+        .body(())
+        .unwrap();
+
+    rewrite_location(&mut response, &request, &target, &opts).unwrap();
+
+    assert_eq!(
+        response.headers()[LOCATION],
+        "http://[2001:db8::1]:8080/next"
+    );
+}
+
+#[test]
 fn uri_target_parses_tcp_and_unix_variants() {
     let http = Target::parse(&Url::parse("http://example.test/base").unwrap()).unwrap();
     assert_eq!(http.authority(), "example.test");
@@ -418,6 +696,88 @@ fn uri_unix_http_peer_uses_the_decoded_socket_path() {
     let peer = target.http_peer(&TlsClientConfig::default()).unwrap();
     assert!(matches!(peer._address, SocketAddr::Unix(_)));
     assert!(!peer.is_tls());
+}
+
+#[test]
+fn uri_unix_http_alias_peer_uses_the_decoded_socket_path() {
+    let target = Target::parse(&Url::parse("unix+http://%2Ftmp%2Fchp.sock/base").unwrap()).unwrap();
+    let peer = target.http_peer(&TlsClientConfig::default()).unwrap();
+    assert!(matches!(peer._address, SocketAddr::Unix(_)));
+    assert!(!peer.is_tls());
+}
+
+#[test]
+fn uri_http_and_unix_peers_ignore_tls_identity_files() {
+    let tls = TlsClientConfig {
+        ca_file: Some(PathBuf::from("missing-ca.pem")),
+        client_certificate: Some(PathBuf::from("missing-client.pem")),
+        client_key: None,
+        ..TlsClientConfig::default()
+    };
+
+    for target in [
+        Target::parse(&Url::parse("http://127.0.0.1").unwrap()).unwrap(),
+        Target::parse(&Url::parse("http+unix://%2Ftmp%2Fchp.sock").unwrap()).unwrap(),
+        Target::parse(&Url::parse("unix+http://%2Ftmp%2Fchp.sock").unwrap()).unwrap(),
+    ] {
+        let peer = target.http_peer(&tls).unwrap();
+        assert!(!peer.is_tls());
+        assert!(peer.options.ca.is_none());
+        assert!(peer.client_cert_key.is_none());
+    }
+}
+
+#[test]
+fn uri_ipv6_peer_uses_the_default_http_port() {
+    let target = Target::parse(&Url::parse("http://[::1]:80").unwrap()).unwrap();
+    assert_eq!(target.authority(), "[::1]");
+    let peer = target.http_peer(&TlsClientConfig::default()).unwrap();
+    let address = peer._address.as_inet().unwrap();
+    assert!(address.ip().is_ipv6());
+    assert_eq!(address.port(), 80);
+}
+
+#[test]
+fn uri_https_peer_loads_generated_ca_and_client_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let ca_path = directory.path().join("ca.pem");
+    let certificate_path = directory.path().join("client.pem");
+    let key_path = directory.path().join("client-key.pem");
+
+    let key = PKey::generate_ed25519().unwrap();
+    let mut name = X509NameBuilder::new().unwrap();
+    name.append_entry_by_text("CN", "task-6-client").unwrap();
+    let name = name.build();
+    let mut certificate = X509::builder().unwrap();
+    certificate.set_version(2).unwrap();
+    certificate.set_subject_name(&name).unwrap();
+    certificate.set_issuer_name(&name).unwrap();
+    certificate.set_pubkey(&key).unwrap();
+    certificate
+        .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+        .unwrap();
+    certificate
+        .set_not_after(&Asn1Time::days_from_now(1).unwrap())
+        .unwrap();
+    certificate.sign(&key, MessageDigest::null()).unwrap();
+    let certificate = certificate.build();
+
+    fs::write(&ca_path, certificate.to_pem().unwrap()).unwrap();
+    fs::write(&certificate_path, certificate.to_pem().unwrap()).unwrap();
+    fs::write(&key_path, key.private_key_to_pem_pkcs8().unwrap()).unwrap();
+
+    let target = Target::parse(&Url::parse("https://127.0.0.1").unwrap()).unwrap();
+    let peer = target
+        .http_peer(&TlsClientConfig {
+            ca_file: Some(ca_path),
+            client_certificate: Some(certificate_path),
+            client_key: Some(key_path),
+            ..TlsClientConfig::default()
+        })
+        .unwrap();
+
+    assert_eq!(peer.options.ca.as_ref().unwrap().len(), 1);
+    assert!(peer.client_cert_key.is_some());
 }
 
 #[test]
