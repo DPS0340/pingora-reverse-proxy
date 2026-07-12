@@ -2,12 +2,16 @@
 
 use std::collections::HashSet;
 use std::fs;
+#[cfg(unix)]
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
+use std::task::Poll;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -19,6 +23,8 @@ use axum::response::Response;
 use axum::routing::get;
 use axum::serve::Listener;
 use axum::Router;
+#[cfg(unix)]
+use futures_util::FutureExt;
 use openssl::dh::Dh;
 use openssl::pkey::{PKey, Private};
 use openssl::ssl::{Ssl, SslAcceptor, SslAcceptorBuilder, SslMethod};
@@ -30,6 +36,7 @@ use pingora::server::ShutdownWatch;
 use pingora::services::background::BackgroundService;
 use pingora::services::listening::Service;
 use pingora::services::ServiceReadyNotifier;
+#[cfg(unix)]
 use pingora::services::ServiceWithDependents;
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
@@ -38,6 +45,8 @@ use tokio_openssl::SslStream;
 
 use crate::config::{ListenerConfig, TlsConfig};
 use crate::metrics::Metrics;
+#[cfg(unix)]
+use crate::path_ownership::OwnedPath;
 
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_CONCURRENT_TLS_HANDSHAKES: usize = 64;
@@ -55,6 +64,30 @@ pub enum ListenerError {
     UnixBind(#[source] io::Error),
     #[error("Unix listeners are unavailable on this platform")]
     UnixUnsupported,
+    #[error("public proxy listeners are unsupported on this platform")]
+    PublicUnsupported,
+}
+
+/// Reject targets where Pingora cannot safely adopt a synchronously owned public socket.
+pub fn ensure_public_startup_supported() -> Result<(), ListenerError> {
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "redox"
+    ))]
+    {
+        Ok(())
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "redox"
+    )))]
+    {
+        Err(ListenerError::PublicUnsupported)
+    }
 }
 
 /// Shared ordering signal between management accepts and terminal mutation drain.
@@ -105,6 +138,99 @@ pub struct TrafficLifecycle {
     active: std::sync::atomic::AtomicUsize,
     accepts_stopped: AtomicBool,
     changed: Notify,
+}
+
+#[cfg(unix)]
+struct PublicExitGuard {
+    traffic: Arc<TrafficLifecycle>,
+}
+
+#[cfg(unix)]
+impl Drop for PublicExitGuard {
+    fn drop(&mut self) {
+        self.traffic.acknowledge_accepts_stopped();
+    }
+}
+
+#[cfg(unix)]
+struct FailClosedReadyNotifier(Option<ServiceReadyNotifier>);
+
+#[cfg(unix)]
+impl FailClosedReadyNotifier {
+    fn notify_ready(&mut self) {
+        if let Some(notifier) = self.0.take() {
+            notifier.notify_ready();
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for FailClosedReadyNotifier {
+    fn drop(&mut self) {
+        if let Some(notifier) = self.0.take() {
+            // Pingora 0.8.1 signals ready when a notifier is dropped. A failed
+            // or cancelled build must instead leave the readiness bit false.
+            std::mem::forget(notifier);
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn run_public_service_future<F>(
+    future: F,
+    ready_notifier: ServiceReadyNotifier,
+    traffic: Arc<TrafficLifecycle>,
+) -> PublicServiceOutcome
+where
+    F: Future<Output = ()>,
+{
+    let _exit = PublicExitGuard { traffic };
+    let mut ready_notifier = FailClosedReadyNotifier(Some(ready_notifier));
+    let mut future = Box::pin(std::panic::AssertUnwindSafe(future).catch_unwind());
+    let first_poll = std::future::poll_fn(|context| {
+        Poll::Ready(match future.as_mut().poll(context) {
+            Poll::Pending => None,
+            Poll::Ready(result) => Some(result),
+        })
+    })
+    .await;
+
+    match first_poll {
+        None => ready_notifier.notify_ready(),
+        Some(Ok(())) => {
+            tracing::error!("public listener service exited before endpoint build completed");
+            return PublicServiceOutcome::FailedBeforeReady;
+        }
+        Some(Err(_)) => {
+            tracing::error!("public listener endpoint adoption/build panicked");
+            return PublicServiceOutcome::FailedBeforeReady;
+        }
+    }
+
+    if future.await.is_err() {
+        tracing::error!("public listener service panicked after startup");
+        PublicServiceOutcome::PanickedAfterReady
+    } else {
+        PublicServiceOutcome::Exited
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PublicServiceOutcome {
+    FailedBeforeReady,
+    PanickedAfterReady,
+    Exited,
+}
+
+#[cfg(unix)]
+fn signal_public_startup_failure(startup_failed: &AtomicBool) {
+    startup_failed.store(true, Ordering::Release);
+    // Drive Pingora's ordinary graceful path so PID/UDS guards unwind; main
+    // converts the recorded service failure into a nonzero exit.
+    unsafe {
+        libc::kill(libc::getpid(), libc::SIGTERM);
+    }
 }
 
 impl TrafficLifecycle {
@@ -507,35 +633,33 @@ impl Listener for OwnedUnixListener {
 
 #[cfg(unix)]
 struct SocketOwner {
-    path: PathBuf,
-    device: u64,
-    inode: u64,
+    owned: OwnedPath,
 }
 
 #[cfg(unix)]
 impl SocketOwner {
     fn from_path(path: PathBuf) -> io::Result<Self> {
-        use std::os::unix::fs::MetadataExt;
-
-        let metadata = fs::symlink_metadata(&path)?;
         Ok(Self {
-            path,
-            device: metadata.dev(),
-            inode: metadata.ino(),
+            owned: OwnedPath::from_path(path)?,
         })
     }
-}
 
-#[cfg(unix)]
-impl Drop for SocketOwner {
-    fn drop(&mut self) {
-        use std::os::unix::fs::MetadataExt;
+    fn path(&self) -> &Path {
+        self.owned.path()
+    }
 
-        if let Ok(metadata) = fs::symlink_metadata(&self.path) {
-            if metadata.dev() == self.device && metadata.ino() == self.inode {
-                let _ = fs::remove_file(&self.path);
-            }
-        }
+    fn set_path(&mut self, path: PathBuf) {
+        self.owned.set_path(path);
+    }
+
+    #[cfg(test)]
+    fn cleanup_for_test<B, R>(&mut self, before_quarantine: B, before_restore: R) -> Option<PathBuf>
+    where
+        B: FnOnce(),
+        R: FnOnce(),
+    {
+        self.owned
+            .cleanup_with_hooks(before_quarantine, before_restore)
     }
 }
 
@@ -545,6 +669,7 @@ pub struct PreboundPublicService<A> {
     service: Option<Service<A>>,
     reservation: Option<PublicListenerReservation>,
     traffic: Arc<TrafficLifecycle>,
+    startup_failed: Arc<AtomicBool>,
 }
 
 #[cfg(unix)]
@@ -613,7 +738,7 @@ impl PublicListenerReservation {
         match self {
             Self::Tcp { socket, key } => (key, socket.into_raw_fd(), None),
             Self::Unix { socket, owner } => (
-                owner.path.display().to_string(),
+                owner.path().display().to_string(),
                 socket.into_raw_fd(),
                 Some(owner),
             ),
@@ -648,7 +773,7 @@ fn bind_unix_socket(path: PathBuf) -> Result<(socket2::Socket, SocketOwner), Lis
             .map_err(ListenerError::UnixBind)?;
         rustix::fs::renameat_with(
             rustix::fs::CWD,
-            &owner.path,
+            owner.path(),
             rustix::fs::CWD,
             &path,
             rustix::fs::RenameFlags::NOREPLACE,
@@ -656,7 +781,7 @@ fn bind_unix_socket(path: PathBuf) -> Result<(socket2::Socket, SocketOwner), Lis
         .map_err(|error| {
             ListenerError::UnixBind(io::Error::from_raw_os_error(error.raw_os_error()))
         })?;
-        owner.path = path;
+        owner.set_path(path);
         return Ok((socket, owner));
     }
     Err(ListenerError::UnixBind(io::Error::new(
@@ -671,64 +796,14 @@ impl<A> PreboundPublicService<A> {
         service: Service<A>,
         listener: &ListenerConfig,
         traffic: Arc<TrafficLifecycle>,
+        startup_failed: Arc<AtomicBool>,
     ) -> Result<Self, ListenerError> {
         Ok(Self {
             service: Some(service),
             reservation: Some(PublicListenerReservation::bind(listener)?),
             traffic,
+            startup_failed,
         })
-    }
-}
-
-/// Public-service lifecycle wrapper for platforms without Pingora FD adoption.
-#[cfg(not(unix))]
-pub struct TrackedPublicService<A> {
-    service: Option<Service<A>>,
-    traffic: Arc<TrafficLifecycle>,
-}
-
-#[cfg(not(unix))]
-impl<A> TrackedPublicService<A> {
-    pub fn new(service: Service<A>, traffic: Arc<TrafficLifecycle>) -> Self {
-        Self {
-            service: Some(service),
-            traffic,
-        }
-    }
-}
-
-#[cfg(not(unix))]
-#[async_trait]
-impl<A> ServiceWithDependents for TrackedPublicService<A>
-where
-    A: pingora::apps::ServerApp + Send + Sync + 'static,
-{
-    async fn start_service(
-        &mut self,
-        shutdown: ShutdownWatch,
-        listeners_per_fd: usize,
-        ready_notifier: ServiceReadyNotifier,
-    ) {
-        let Some(mut service) = self.service.take() else {
-            tracing::error!("public listener service was started more than once");
-            return;
-        };
-        ready_notifier.notify_ready();
-        <Service<A> as pingora::services::Service>::start_service(
-            &mut service,
-            shutdown,
-            listeners_per_fd,
-        )
-        .await;
-        self.traffic.acknowledge_accepts_stopped();
-    }
-
-    fn name(&self) -> &str {
-        "CHP public proxy"
-    }
-
-    fn threads(&self) -> Option<usize> {
-        self.service.as_ref().and_then(|service| service.threads)
     }
 }
 
@@ -745,11 +820,25 @@ where
         listeners_per_fd: usize,
         ready_notifier: ServiceReadyNotifier,
     ) {
-        let (Some(mut service), Some(reservation), Some(fds)) =
-            (self.service.take(), self.reservation.take(), fds)
-        else {
+        let service = self.service.take();
+        let reservation = self.reservation.take();
+        let Some(fds) = fds else {
             tracing::error!("pre-bound public listener could not be adopted");
-            std::process::exit(1);
+            let _exit = PublicExitGuard {
+                traffic: Arc::clone(&self.traffic),
+            };
+            let _ready = FailClosedReadyNotifier(Some(ready_notifier));
+            signal_public_startup_failure(&self.startup_failed);
+            return;
+        };
+        let (Some(mut service), Some(reservation)) = (service, reservation) else {
+            tracing::error!("pre-bound public listener could not be adopted");
+            let _exit = PublicExitGuard {
+                traffic: Arc::clone(&self.traffic),
+            };
+            let _ready = FailClosedReadyNotifier(Some(ready_notifier));
+            signal_public_startup_failure(&self.startup_failed);
+            return;
         };
         let (key, fd, owner) = reservation.transfer();
         tracing::debug!(bind = key, fd, "registering pre-bound public listener");
@@ -757,16 +846,37 @@ where
             let mut table = fds.lock().await;
             table.add(key, fd);
         }
-        ready_notifier.notify_ready();
         tracing::debug!(listeners_per_fd, "starting Pingora public listener service");
-        <Service<A> as pingora::services::Service>::start_service(
-            &mut service,
-            Some(fds),
-            shutdown,
-            listeners_per_fd,
-        )
-        .await;
-        self.traffic.acknowledge_accepts_stopped();
+        let shutdown_observer = shutdown.clone();
+        #[cfg(debug_assertions)]
+        let inject_build_failure = std::env::var_os("CHP_TASK8_INJECT_PUBLIC_BUILD_FAILURE")
+            .is_some_and(|value| value == "1");
+        #[cfg(not(debug_assertions))]
+        let inject_build_failure = false;
+        let outcome = if inject_build_failure {
+            tracing::error!("injected public listener endpoint build failure");
+            run_public_service_future(
+                async { panic!("injected public listener endpoint build failure") },
+                ready_notifier,
+                Arc::clone(&self.traffic),
+            )
+            .await
+        } else {
+            run_public_service_future(
+                <Service<A> as pingora::services::Service>::start_service(
+                    &mut service,
+                    Some(fds),
+                    shutdown,
+                    listeners_per_fd,
+                ),
+                ready_notifier,
+                Arc::clone(&self.traffic),
+            )
+            .await
+        };
+        if outcome != PublicServiceOutcome::Exited || !*shutdown_observer.borrow() {
+            signal_public_startup_failure(&self.startup_failed);
+        }
         tracing::debug!("Pingora public listener service stopped");
         drop(owner);
     }
@@ -888,8 +998,10 @@ fn build_ssl_acceptor(tls: &TlsConfig) -> Result<SslAcceptorBuilder, ListenerErr
         let mut verify = SslVerifyMode::PEER;
         if tls.reject_unauthorized {
             verify |= SslVerifyMode::FAIL_IF_NO_PEER_CERT;
+            builder.set_verify(verify);
+        } else {
+            builder.set_verify_callback(verify, |_preverified, _certificate| true);
         }
-        builder.set_verify(verify);
     } else {
         builder.set_verify(SslVerifyMode::NONE);
     }
@@ -1023,9 +1135,170 @@ fn empty_response(status: StatusCode) -> Response {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::SocketOwner;
     use super::TrafficLifecycle;
+    #[cfg(unix)]
+    use crate::shutdown::PidFileGuard;
+    #[cfg(unix)]
+    use pingora::services::ServiceReadyNotifier;
+    #[cfg(unix)]
+    use std::fs;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn public_startup_support_is_decided_synchronously_by_target() {
+        let result = super::ensure_public_startup_supported();
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "redox"
+        ))]
+        assert!(result.is_ok());
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "redox"
+        )))]
+        assert!(matches!(
+            result,
+            Err(super::ListenerError::PublicUnsupported)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn injected_public_build_panic_never_signals_ready_and_unwinds_every_owner() {
+        let directory = tempfile::tempdir().expect("temporary public failure directory");
+        let socket_path = directory.path().join("public.sock");
+        fs::write(&socket_path, b"owned socket").expect("write owned socket entry");
+        let socket_owner = SocketOwner::from_path(socket_path.clone()).expect("own socket entry");
+        let pid_path = directory.path().join("proxy.pid");
+        let pid_guard = PidFileGuard::acquire(&pid_path).expect("own PID entry");
+        let api = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind test API");
+        let api_address = api.local_addr().expect("test API address");
+        let traffic = Arc::new(TrafficLifecycle::new());
+        let (ready_sender, ready_watch) = tokio::sync::watch::channel(false);
+
+        super::run_public_service_future(
+            async { panic!("injected public endpoint build failure") },
+            ServiceReadyNotifier::new(ready_sender),
+            Arc::clone(&traffic),
+        )
+        .await;
+        drop((socket_owner, pid_guard, api));
+
+        assert!(
+            !*ready_watch.borrow(),
+            "failed public service announced ready"
+        );
+        tokio::time::timeout(Duration::from_secs(1), traffic.wait_for_accepts_stopped())
+            .await
+            .expect("public exit acknowledgement did not fire");
+        assert!(std::net::TcpStream::connect(api_address).is_err());
+        assert!(!socket_path.exists());
+        assert!(!pid_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_public_service_future_acknowledges_exit() {
+        let traffic = Arc::new(TrafficLifecycle::new());
+        let (ready_sender, mut ready_watch) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(super::run_public_service_future(
+            std::future::pending::<()>(),
+            ServiceReadyNotifier::new(ready_sender),
+            Arc::clone(&traffic),
+        ));
+        ready_watch
+            .wait_for(|ready| *ready)
+            .await
+            .expect("service readiness channel closed");
+
+        task.abort();
+        let _ = task.await;
+
+        tokio::time::timeout(Duration::from_secs(1), traffic.wait_for_accepts_stopped())
+            .await
+            .expect("cancelled public service did not acknowledge exit");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_cleanup_never_deletes_a_boundary_replacement() {
+        let directory = tempfile::tempdir().expect("temporary socket ownership directory");
+        let path = directory.path().join("public.sock");
+        fs::write(&path, b"owned").expect("write owned entry");
+        let mut owner = SocketOwner::from_path(path.clone()).expect("capture socket identity");
+
+        owner.cleanup_for_test(
+            || {
+                fs::remove_file(&path).expect("replace owned entry");
+                fs::write(&path, b"replacement").expect("write replacement");
+            },
+            || {},
+        );
+
+        assert_eq!(
+            fs::read(&path).expect("replacement was preserved"),
+            b"replacement"
+        );
+        assert_eq!(
+            fs::read_dir(directory.path())
+                .expect("list ownership directory")
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_cleanup_preserves_quarantine_when_restore_collides() {
+        let directory = tempfile::tempdir().expect("temporary socket ownership directory");
+        let path = directory.path().join("public.sock");
+        fs::write(&path, b"owned").expect("write owned entry");
+        let mut owner = SocketOwner::from_path(path.clone()).expect("capture socket identity");
+
+        let quarantine = owner.cleanup_for_test(
+            || {
+                fs::remove_file(&path).expect("replace owned entry");
+                fs::write(&path, b"replacement").expect("write replacement");
+            },
+            || fs::write(&path, b"restore-collision").expect("install restore collision"),
+        );
+
+        assert_eq!(
+            fs::read(&path).expect("collision was preserved"),
+            b"restore-collision"
+        );
+        let quarantine = quarantine.expect("foreign replacement must remain quarantined");
+        assert_eq!(
+            fs::read(quarantine).expect("quarantined replacement was preserved"),
+            b"replacement"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_owned_socket_entry_is_removed_without_private_debris() {
+        let directory = tempfile::tempdir().expect("temporary socket ownership directory");
+        let path = directory.path().join("public.sock");
+        fs::write(&path, b"owned").expect("write owned entry");
+        let owner = SocketOwner::from_path(path.clone()).expect("capture socket identity");
+
+        drop(owner);
+
+        assert!(!path.exists());
+        assert_eq!(
+            fs::read_dir(directory.path())
+                .expect("list ownership directory")
+                .count(),
+            0
+        );
+    }
 
     #[tokio::test]
     async fn traffic_admission_closes_and_drains_64_concurrent_requests() {

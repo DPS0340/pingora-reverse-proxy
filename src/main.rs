@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use clap::Parser;
@@ -9,11 +10,9 @@ use pingora_reverse_proxy::activity::ActivityWriter;
 use pingora_reverse_proxy::api::{router as api_router, ApiState};
 #[cfg(unix)]
 use pingora_reverse_proxy::api_server::PreboundPublicService;
-#[cfg(not(unix))]
-use pingora_reverse_proxy::api_server::TrackedPublicService;
 use pingora_reverse_proxy::api_server::{
-    ensure_listener_paths_distinct, install_listener, metrics_router, redirect_router, ApiServer,
-    ListenerError, ManagementLifecycle,
+    ensure_listener_paths_distinct, ensure_public_startup_supported, install_listener,
+    metrics_router, redirect_router, ApiServer, ListenerError, ManagementLifecycle,
 };
 use pingora_reverse_proxy::config::{
     AppConfig, Cli, ConfigError, ListenerConfig, LogLevel, StoreConfig,
@@ -54,6 +53,8 @@ enum StartupError {
     UnsupportedStore(StoreConfig),
     #[error("redirect listener requires a TCP public listener")]
     InvalidRedirectListener,
+    #[error("public listener service failed during startup or execution")]
+    PublicService,
 }
 
 fn main() -> ExitCode {
@@ -81,6 +82,7 @@ fn run() -> Result<(), StartupError> {
     if config.store != StoreConfig::Memory {
         return Err(StartupError::UnsupportedStore(config.store));
     }
+    ensure_public_startup_supported()?;
     ensure_listener_paths_distinct(
         std::iter::once(&config.public_listener)
             .chain(std::iter::once(&config.api_listener))
@@ -149,8 +151,11 @@ fn run() -> Result<(), StartupError> {
                 .map_err(StartupError::Listener)
         })
         .transpose()?;
+    #[cfg(not(unix))]
+    let _ = (&api_server, &metrics_server, &redirect_server);
 
     let mut server = Server::new(None).map_err(|error| StartupError::Pingora(error.to_string()))?;
+    let public_service_failed = Arc::new(AtomicBool::new(false));
     if let Some(configuration) = Arc::get_mut(&mut server.configuration) {
         configuration.grace_period_seconds = Some(SHUTDOWN_GRACE_PERIOD_SECONDS);
         configuration.graceful_shutdown_timeout_seconds = Some(RUNTIME_SHUTDOWN_TIMEOUT_SECONDS);
@@ -165,20 +170,24 @@ fn run() -> Result<(), StartupError> {
     )?;
     #[cfg(unix)]
     {
-        server.add_service(PreboundPublicService::new(
+        let public_handle = server.add_service(PreboundPublicService::new(
             public,
             &config.public_listener,
             Arc::clone(&traffic),
+            Arc::clone(&public_service_failed),
         )?);
-    }
-    #[cfg(not(unix))]
-    server.add_service(TrackedPublicService::new(public, Arc::clone(&traffic)));
-    server.add_service(background_service("CHP management API", api_server));
-    if let Some(metrics_server) = metrics_server {
-        server.add_service(background_service("CHP metrics", metrics_server));
-    }
-    if let Some(redirect_server) = redirect_server {
-        server.add_service(background_service("CHP HTTPS redirect", redirect_server));
+        let api_handle = server.add_service(background_service("CHP management API", api_server));
+        api_handle.add_dependency(&public_handle);
+        if let Some(metrics_server) = metrics_server {
+            let metrics_handle =
+                server.add_service(background_service("CHP metrics", metrics_server));
+            metrics_handle.add_dependency(&public_handle);
+        }
+        if let Some(redirect_server) = redirect_server {
+            let redirect_handle =
+                server.add_service(background_service("CHP HTTPS redirect", redirect_server));
+            redirect_handle.add_dependency(&public_handle);
+        }
     }
     server.add_service(background_service(
         "CHP graceful shutdown",
@@ -191,6 +200,9 @@ fn run() -> Result<(), StartupError> {
         ),
     ));
     server.run(Default::default());
+    if public_service_failed.load(Ordering::Acquire) {
+        return Err(StartupError::PublicService);
+    }
     Ok(())
 }
 

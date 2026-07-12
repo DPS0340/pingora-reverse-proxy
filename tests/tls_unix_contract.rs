@@ -219,6 +219,55 @@ fn every_public_api_metrics_tcp_collision_fails_before_startup() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+#[serial]
+fn injected_public_build_failure_exits_nonzero_without_ready_api_or_owned_files() {
+    use std::os::unix::net::UnixStream;
+
+    let directory = tempfile::tempdir().expect("temporary injected startup directory");
+    let public = directory.path().join("public.sock");
+    let api = directory.path().join("api.sock");
+    let pid = directory.path().join("proxy.pid");
+    let mut binary = Binary::spawn_with_env(
+        &[
+            "--socket".into(),
+            public.display().to_string(),
+            "--api-socket".into(),
+            api.display().to_string(),
+            "--pid-file".into(),
+            pid.display().to_string(),
+        ],
+        &[("CHP_TASK8_INJECT_PUBLIC_BUILD_FAILURE", "1")],
+    );
+
+    assert!(
+        !binary.wait_for_graceful_exit().success(),
+        "injected public build failure exited successfully"
+    );
+    assert!(
+        binary
+            .stderr_text()
+            .contains("injected public listener endpoint build failure"),
+        "missing injected build diagnostic: {}",
+        binary.stderr_text()
+    );
+    assert!(
+        UnixStream::connect(&api).is_err(),
+        "API remained operational"
+    );
+    assert!(!public.exists(), "public UDS owner leaked");
+    assert!(!api.exists(), "API UDS owner leaked");
+    assert!(!pid.exists(), "PID owner leaked");
+    assert_eq!(
+        fs::read_dir(directory.path())
+            .expect("list injected startup directory")
+            .count(),
+        0,
+        "private publication or quarantine entry leaked"
+    );
+}
+
 fn tcp_http(port: u16, request: &[u8]) -> Vec<u8> {
     let deadline = Instant::now() + IO_TIMEOUT;
     let mut stream = loop {
@@ -464,16 +513,22 @@ impl TestPki {
     }
 }
 
-fn https_client(pki: &TestPki, identity: bool) -> reqwest::Client {
+fn https_client_with_identity(
+    trusted_server: &TestPki,
+    client_identity: Option<&TestPki>,
+) -> reqwest::Client {
     let builder = reqwest::Client::builder()
         .timeout(IO_TIMEOUT)
-        .add_root_certificate(pki.root_certificate());
-    let builder = if identity {
-        builder.identity(pki.client_identity())
-    } else {
-        builder
+        .add_root_certificate(trusted_server.root_certificate());
+    let builder = match client_identity {
+        Some(identity) => builder.identity(identity.client_identity()),
+        None => builder,
     };
     builder.build().expect("HTTPS client")
+}
+
+fn https_client(pki: &TestPki, identity: bool) -> reqwest::Client {
+    https_client_with_identity(pki, identity.then_some(pki))
 }
 
 #[test]
@@ -750,6 +805,120 @@ async fn api_https_requires_a_client_certificate_when_configured() {
     );
     let client = https_client(&pki, true);
     wait_https_response(&mut binary, &client, &url, "{}").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn optional_client_certificates_accept_absent_untrusted_and_trusted_for_public_and_api() {
+    let directory = tempfile::tempdir().expect("temporary optional mTLS directory");
+    let untrusted_directory =
+        tempfile::tempdir().expect("temporary untrusted optional mTLS directory");
+    let pki = TestPki::new(&directory, false);
+    let untrusted = TestPki::new(&untrusted_directory, false);
+    let public = reserve_port();
+    let api = reserve_port();
+    let mut binary = Binary::spawn(&[
+        "--ip".into(),
+        "127.0.0.1".into(),
+        "--port".into(),
+        public.to_string(),
+        "--api-ip".into(),
+        "127.0.0.1".into(),
+        "--api-port".into(),
+        api.to_string(),
+        "--ssl-cert".into(),
+        pki.server_path.display().to_string(),
+        "--ssl-key".into(),
+        pki.server_key_path.display().to_string(),
+        "--ssl-ca".into(),
+        pki.ca_path.display().to_string(),
+        "--ssl-request-cert".into(),
+        "--api-ssl-cert".into(),
+        pki.server_path.display().to_string(),
+        "--api-ssl-key".into(),
+        pki.server_key_path.display().to_string(),
+        "--api-ssl-ca".into(),
+        pki.ca_path.display().to_string(),
+        "--api-ssl-request-cert".into(),
+    ]);
+    let endpoints = [
+        (
+            format!("https://127.0.0.1:{public}/_chp_healthz"),
+            r#"{"status":"OK"}"#,
+        ),
+        (format!("https://127.0.0.1:{api}/api/routes"), "{}"),
+    ];
+
+    for identity in [None, Some(&untrusted), Some(&pki)] {
+        let client = https_client_with_identity(&pki, identity);
+        for (url, body) in &endpoints {
+            wait_https_response(&mut binary, &client, url, body).await;
+        }
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn strict_client_certificates_reject_absent_and_untrusted_but_accept_trusted_everywhere() {
+    let directory = tempfile::tempdir().expect("temporary strict mTLS directory");
+    let untrusted_directory =
+        tempfile::tempdir().expect("temporary untrusted strict mTLS directory");
+    let pki = TestPki::new(&directory, false);
+    let untrusted = TestPki::new(&untrusted_directory, false);
+    let public = reserve_port();
+    let api = reserve_port();
+    let mut binary = Binary::spawn(&[
+        "--ip".into(),
+        "127.0.0.1".into(),
+        "--port".into(),
+        public.to_string(),
+        "--api-ip".into(),
+        "127.0.0.1".into(),
+        "--api-port".into(),
+        api.to_string(),
+        "--ssl-cert".into(),
+        pki.server_path.display().to_string(),
+        "--ssl-key".into(),
+        pki.server_key_path.display().to_string(),
+        "--ssl-ca".into(),
+        pki.ca_path.display().to_string(),
+        "--ssl-request-cert".into(),
+        "--ssl-reject-unauthorized".into(),
+        "--api-ssl-cert".into(),
+        pki.server_path.display().to_string(),
+        "--api-ssl-key".into(),
+        pki.server_key_path.display().to_string(),
+        "--api-ssl-ca".into(),
+        pki.ca_path.display().to_string(),
+        "--api-ssl-request-cert".into(),
+        "--api-ssl-reject-unauthorized".into(),
+    ]);
+    let endpoints = [
+        (
+            format!("https://127.0.0.1:{public}/_chp_healthz"),
+            r#"{"status":"OK"}"#,
+        ),
+        (format!("https://127.0.0.1:{api}/api/routes"), "{}"),
+    ];
+
+    let trusted = https_client_with_identity(&pki, Some(&pki));
+    for (url, body) in &endpoints {
+        wait_https_response(&mut binary, &trusted, url, body).await;
+    }
+    for identity in [None, Some(&untrusted)] {
+        let client = https_client_with_identity(&pki, identity);
+        for (url, _) in &endpoints {
+            assert!(
+                client.get(url).send().await.is_err(),
+                "strict mTLS accepted {} client at {url}",
+                if identity.is_some() {
+                    "untrusted"
+                } else {
+                    "absent"
+                }
+            );
+        }
+    }
 }
 
 fn mtls_upstream(pki: &TestPki, expect_success: bool) -> (u16, JoinHandle<()>) {

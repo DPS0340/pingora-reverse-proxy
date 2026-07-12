@@ -4,6 +4,7 @@ pub mod api_server;
 pub mod config;
 pub mod errors;
 pub mod metrics;
+mod path_ownership;
 pub mod proxy;
 pub mod route;
 pub mod route_table;

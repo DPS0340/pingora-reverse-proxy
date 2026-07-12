@@ -1,8 +1,9 @@
 //! Process ownership and ordered graceful-shutdown coordination.
 
-use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,6 +14,7 @@ use thiserror::Error;
 
 use crate::activity::ActivityWriter;
 use crate::api_server::{wait_for_shutdown, ManagementLifecycle, TrafficLifecycle};
+use crate::path_ownership::OwnedPath;
 use crate::route_table::RouteRegistry;
 
 pub const TERMINAL_MUTATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -39,97 +41,29 @@ pub enum PidFileError {
 
 /// RAII ownership of a PID file created with `create_new`.
 pub struct PidFileGuard {
-    path: PathBuf,
-    identity: FileIdentity,
+    _owned: OwnedPath,
 }
 
 impl PidFileGuard {
     pub fn acquire(path: impl AsRef<Path>) -> Result<Self, PidFileError> {
         let path = path.as_ref().to_owned();
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(PidFileError::Create)?;
-        let identity = FileIdentity::from_file(&file).map_err(PidFileError::Create)?;
-        let guard = Self { path, identity };
+        let (mut file, owned) = OwnedPath::create_new_file(path).map_err(PidFileError::Create)?;
+        let guard = Self { _owned: owned };
         writeln!(file, "{}", std::process::id()).map_err(PidFileError::Write)?;
         file.sync_data().map_err(PidFileError::Write)?;
         Ok(guard)
     }
 }
 
-impl Drop for PidFileGuard {
-    fn drop(&mut self) {
-        let Ok(metadata) = fs::symlink_metadata(&self.path) else {
-            return;
-        };
-        if self.identity.matches(&metadata) {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct FileIdentity {
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(windows)]
-    volume_serial_number: Option<u32>,
-    #[cfg(windows)]
-    file_index: Option<u64>,
-    #[cfg(not(any(unix, windows)))]
-    length: u64,
-}
-
-impl FileIdentity {
-    fn from_file(file: &File) -> io::Result<Self> {
-        let metadata = file.metadata()?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            Ok(Self {
-                device: metadata.dev(),
-                inode: metadata.ino(),
-            })
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::MetadataExt;
-            Ok(Self {
-                volume_serial_number: metadata.volume_serial_number(),
-                file_index: metadata.file_index(),
-            })
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            Ok(Self {
-                length: metadata.len(),
-            })
-        }
-    }
-
-    fn matches(self, metadata: &fs::Metadata) -> bool {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            metadata.dev() == self.device && metadata.ino() == self.inode
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::MetadataExt;
-            self.volume_serial_number.is_some()
-                && self.file_index.is_some()
-                && metadata.volume_serial_number() == self.volume_serial_number
-                && metadata.file_index() == self.file_index
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = (self.length, metadata);
-            false
-        }
+impl PidFileGuard {
+    #[cfg(test)]
+    fn cleanup_for_test<B, R>(&mut self, before_quarantine: B, before_restore: R) -> Option<PathBuf>
+    where
+        B: FnOnce(),
+        R: FnOnce(),
+    {
+        self._owned
+            .cleanup_with_hooks(before_quarantine, before_restore)
     }
 }
 
@@ -229,5 +163,79 @@ impl BackgroundService for ShutdownCoordinator {
             );
         }
         tracing::info!("ordered shutdown lifecycle completed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PidFileGuard;
+    use std::fs;
+
+    #[test]
+    fn pid_cleanup_never_deletes_a_boundary_replacement() {
+        let directory = tempfile::tempdir().expect("temporary PID ownership directory");
+        let path = directory.path().join("proxy.pid");
+        let mut guard = PidFileGuard::acquire(&path).expect("acquire PID file");
+
+        guard.cleanup_for_test(
+            || {
+                fs::remove_file(&path).expect("replace owned PID");
+                fs::write(&path, b"replacement\n").expect("write replacement PID");
+            },
+            || {},
+        );
+
+        assert_eq!(
+            fs::read(&path).expect("replacement PID was preserved"),
+            b"replacement\n"
+        );
+        assert_eq!(
+            fs::read_dir(directory.path())
+                .expect("list PID directory")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn pid_cleanup_preserves_quarantine_when_restore_collides() {
+        let directory = tempfile::tempdir().expect("temporary PID ownership directory");
+        let path = directory.path().join("proxy.pid");
+        let mut guard = PidFileGuard::acquire(&path).expect("acquire PID file");
+
+        let quarantine = guard.cleanup_for_test(
+            || {
+                fs::remove_file(&path).expect("replace owned PID");
+                fs::write(&path, b"replacement\n").expect("write replacement PID");
+            },
+            || fs::write(&path, b"restore-collision\n").expect("install restore collision"),
+        );
+
+        assert_eq!(
+            fs::read(&path).expect("collision PID was preserved"),
+            b"restore-collision\n"
+        );
+        let quarantine = quarantine.expect("foreign replacement must remain quarantined");
+        assert_eq!(
+            fs::read(quarantine).expect("quarantined PID was preserved"),
+            b"replacement\n"
+        );
+    }
+
+    #[test]
+    fn ordinary_owned_pid_is_removed_without_private_debris() {
+        let directory = tempfile::tempdir().expect("temporary PID ownership directory");
+        let path = directory.path().join("proxy.pid");
+        let guard = PidFileGuard::acquire(&path).expect("acquire PID file");
+
+        drop(guard);
+
+        assert!(!path.exists());
+        assert_eq!(
+            fs::read_dir(directory.path())
+                .expect("list PID directory")
+                .count(),
+            0
+        );
     }
 }

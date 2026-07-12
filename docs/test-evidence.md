@@ -446,3 +446,58 @@ WebSocket 4. The second passed all 11 route contracts. `cargo fmt --check`,
 Clippy with `-D warnings`, all-target/all-feature `cargo check`, and
 `git diff --check` all exited `0`. Cargo resolved Pingora 0.8.1 exactly. No Task
 9 files or implementation were added.
+
+### Task 8 cross-platform lifecycle ownership re-review (2026-07-13)
+
+The four final re-review findings were reproduced before production changes.
+Filesystem-owner tests forced a foreign replacement immediately before cleanup
+and a second collision immediately before restoration. Optional mTLS rejected a
+foreign-CA client, the public build-failure injection was ignored and remained
+running, and the non-Unix readiness policy still had an unsafe wrapper.
+
+UDS and PID cleanup now atomically rename the public entry to an unpredictable
+same-directory quarantine with no-replace semantics, verify the private entry's
+identity, and unlink only that verified private identity. A foreign entry is
+restored with no-replace; if restoration collides, both entries are preserved
+and the quarantine is logged. Unix cleanup is descriptor-relative to the
+original canonical parent, while the configured public spelling remains the
+Pingora FD-adoption key. PID creation is descriptor-relative and exclusive on
+Unix. Deterministic tests cover the replacement boundary, restoration
+collision, parent-directory replacement, ordinary cleanup, and absence of
+private debris.
+
+Non-Unix public startup now fails synchronously before PID, API, metrics, or
+redirect binding. On Unix, management listeners depend on actual public
+readiness. The public wrapper polls Pingora's service through its synchronous FD
+adoption/listener-build prefix before forwarding `ServiceReadyNotifier`, catches
+panics, and uses an RAII exit guard for panic and cancellation. A debug-only
+injected build failure proves no readiness, nonzero orderly exit, public/API/PID
+cleanup, no operational API, and no publication/quarantine debris. The
+`process::exit` bypass was removed. Traffic admission remains single-release:
+the request context takes its token in logging and its `Drop` fallback owns
+cancellation/panic cleanup.
+
+For `requestCert=true` with `rejectUnauthorized=false`, OpenSSL retains `PEER`
+but uses a permissive verification callback, matching the pinned CHP 5.3.0
+Node TLS options: absent, foreign-CA, and trusted client certificates all pass.
+Strict public and API modes reject absent and foreign-CA certificates and accept
+the trusted identity. Upstream client request/reject flags remain rejected.
+
+Verification after the final implementation:
+
+- focused Task 8: TLS/Unix/lifecycle `23 passed`; WebSocket `4 passed`;
+- stress: cleanup boundary, injected service failure, TLS silent-client
+  saturation/termination, active HTTP lifecycle, and active WebSocket lifecycle
+  each passed `20/20`;
+- default-parallel `PROPTEST_CASES=256` all targets/features: `231 passed`, zero
+  failures or ignores (library 19, binary 0, API 33, config 27, proxy 69,
+  routes 11, store 45, TLS/Unix 23, WebSocket 4);
+- `PROPTEST_CASES=512` routes: `11 passed`;
+- format, Clippy with warnings denied, all-target/all-feature check, and diff
+  check: all exit `0`.
+
+Only `aarch64-apple-darwin` is installed, so a Windows cross-check could not be
+run. The non-Unix startup rejection has mutually exclusive cfg implementations
+and a target-cfg unit contract; Windows PID identity/quarantine code remains
+source-covered. Pingora stayed pinned at 0.8.1 and CHP at 5.3.0. No Task 9 work
+was added.
