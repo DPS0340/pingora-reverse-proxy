@@ -24,12 +24,15 @@ struct ActivityState {
 struct PendingActivities {
     by_key: BTreeMap<RouteKey, PendingActivity>,
     ready: VecDeque<RouteKey>,
+    accepted_through: u64,
 }
 
 #[derive(Clone, Copy)]
 struct PendingActivity {
     latest: DateTime<Utc>,
-    in_flight: Option<DateTime<Utc>>,
+    latest_sequence: u64,
+    pending_oldest_sequence: Option<u64>,
+    in_flight_sequence: Option<u64>,
 }
 
 /// Non-blocking activity recorder backed by one bounded wake-up channel.
@@ -81,11 +84,12 @@ impl ActivityWriter {
                                 .by_key
                                 .get_mut(&key)
                                 .expect("ready activity key must remain resident");
-                            pending.in_flight = Some(pending.latest);
-                            (key, pending.latest)
+                            pending.in_flight_sequence = Some(pending.latest_sequence);
+                            pending.pending_oldest_sequence = None;
+                            (key, pending.latest, pending.latest_sequence)
                         })
                     };
-                    let Some((key, pending_at)) = pending else {
+                    let Some((key, pending_at, pending_sequence)) = pending else {
                         worker_state.idle.notify_waiters();
                         break;
                     };
@@ -106,14 +110,14 @@ impl ActivityWriter {
                         .pending
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if guard
-                        .by_key
-                        .get(&key)
-                        .is_some_and(|pending| pending.latest <= pending_at)
-                    {
+                    let has_later_activity = guard.by_key.get_mut(&key).is_some_and(|pending| {
+                        debug_assert_eq!(pending.in_flight_sequence, Some(pending_sequence));
+                        pending.in_flight_sequence = None;
+                        pending.pending_oldest_sequence.is_some()
+                    });
+                    if !has_later_activity {
                         guard.by_key.remove(&key);
-                    } else if let Some(pending) = guard.by_key.get_mut(&key) {
-                        pending.in_flight = None;
+                    } else {
                         guard.ready.push_back(key);
                     }
                     drop(guard);
@@ -143,18 +147,9 @@ impl ActivityWriter {
             .pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(existing) = pending.by_key.get_mut(key) {
-            existing.latest = existing.latest.max(at);
-        } else if pending.by_key.len() < self.state.pending_capacity {
-            pending.by_key.insert(
-                key.clone(),
-                PendingActivity {
-                    latest: at,
-                    in_flight: None,
-                },
-            );
-            pending.ready.push_back(key.clone());
-        } else {
+        let accepted =
+            pending.by_key.contains_key(key) || pending.by_key.len() < self.state.pending_capacity;
+        if !accepted {
             let previous = self
                 .state
                 .dropped_observations
@@ -167,6 +162,27 @@ impl ActivityWriter {
                 );
             }
             return;
+        }
+        pending.accepted_through = pending
+            .accepted_through
+            .checked_add(1)
+            .expect("activity acceptance sequence exhausted");
+        let sequence = pending.accepted_through;
+        if let Some(existing) = pending.by_key.get_mut(key) {
+            existing.latest = existing.latest.max(at);
+            existing.latest_sequence = sequence;
+            existing.pending_oldest_sequence.get_or_insert(sequence);
+        } else {
+            pending.by_key.insert(
+                key.clone(),
+                PendingActivity {
+                    latest: at,
+                    latest_sequence: sequence,
+                    pending_oldest_sequence: Some(sequence),
+                    in_flight_sequence: None,
+                },
+            );
+            pending.ready.push_back(key.clone());
         }
         drop(pending);
         if matches!(
@@ -209,16 +225,30 @@ impl ActivityWriter {
 
     /// Wait until all activity accepted before this observation has drained.
     pub async fn flush(&self) {
+        let watermark = self
+            .state
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .accepted_through;
         loop {
             let notified = self.state.idle.notified();
-            let pending_is_empty = self
+            let watermark_is_complete = self
                 .state
                 .pending
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .by_key
-                .is_empty();
-            if pending_is_empty {
+                .values()
+                .all(|pending| {
+                    pending
+                        .in_flight_sequence
+                        .is_none_or(|sequence| sequence > watermark)
+                        && pending
+                            .pending_oldest_sequence
+                            .is_none_or(|sequence| sequence > watermark)
+                });
+            if watermark_is_complete {
                 return;
             }
             notified.await;

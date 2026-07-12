@@ -2590,6 +2590,69 @@ async fn activity_pending_keys_are_bounded_and_recover_with_newest_accepted_time
 }
 
 #[tokio::test]
+async fn activity_flush_uses_an_acceptance_watermark_for_a_continuously_advancing_key() {
+    let initial = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let key = RouteKey::parse("/hot-flush").unwrap();
+    let store = Arc::new(StalledActivityStore {
+        routes: tokio::sync::RwLock::new(BTreeMap::from([(
+            key.clone(),
+            RouteData {
+                target: "http://upstream.example".to_owned(),
+                last_activity: initial,
+                extra: Default::default(),
+            },
+        )])),
+        entries: std::sync::Mutex::new(Vec::new()),
+        writes: std::sync::Mutex::new(Vec::new()),
+        entered: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let registry = RouteRegistry::load(store.clone()).await.unwrap();
+    let writer = ActivityWriter::start(Arc::clone(&registry), 1);
+    let before_watermark = initial + chrono::Duration::seconds(1);
+    let after_watermark = initial + chrono::Duration::seconds(2);
+    let newest = initial + chrono::Duration::seconds(3);
+
+    writer.record_at(&key, before_watermark);
+    store.entered.acquire().await.unwrap().forget();
+    let mut flush = Box::pin(writer.flush());
+    tokio::select! {
+        biased;
+        () = &mut flush => panic!("blocked pre-watermark activity flushed early"),
+        () = tokio::task::yield_now() => {}
+    }
+
+    writer.record_at(&key, after_watermark);
+    store.release.add_permits(1);
+    store.entered.acquire().await.unwrap().forget();
+    writer.record_at(&key, newest);
+
+    tokio::time::timeout(Duration::from_millis(100), &mut flush)
+        .await
+        .expect("post-watermark activity starved the earlier flush");
+    assert_eq!(writer.pending_routes(), 1);
+    assert_eq!(
+        store.writes.lock().unwrap().as_slice(),
+        &[(key.clone(), before_watermark)]
+    );
+
+    store.release.add_permits(1);
+    store.entered.acquire().await.unwrap().forget();
+    store.release.add_permits(1);
+    timed_activity_flush(&writer).await;
+    assert_eq!(
+        store.writes.lock().unwrap().as_slice(),
+        &[
+            (key.clone(), before_watermark),
+            (key.clone(), after_watermark),
+            (key, newest),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn continuously_advancing_activity_key_yields_to_ready_peers() {
     let initial = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
         .unwrap()

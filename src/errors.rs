@@ -73,6 +73,29 @@ struct ResolveRequest {
     response: oneshot::Sender<io::Result<CachedAddresses>>,
 }
 
+fn resolver_batch_count(receiver: &mpsc::Receiver<ResolveRequest>) -> usize {
+    receiver
+        .len()
+        .min(RESOLVER_QUEUE_CAPACITY.saturating_sub(1))
+}
+
+fn take_resolver_batch(
+    first: ResolveRequest,
+    receiver: &mut mpsc::Receiver<ResolveRequest>,
+    waiting: usize,
+) -> Vec<ResolveRequest> {
+    let mut batch = Vec::with_capacity(waiting + 1);
+    batch.push(first);
+    for _ in 0..waiting {
+        batch.push(
+            receiver
+                .try_recv()
+                .expect("captured resolver batch entries must remain queued"),
+        );
+    }
+    batch
+}
+
 #[derive(Clone)]
 struct CachedAddresses {
     addresses: Vec<SocketAddr>,
@@ -84,18 +107,45 @@ struct CachedAddresses {
 struct ResolverCache {
     current: Option<CachedAddresses>,
     generation: u64,
+    leased_generation: Option<u64>,
 }
 
 impl ResolverCache {
     fn fresh(&mut self) -> Option<CachedAddresses> {
-        if self
-            .current
-            .as_ref()
-            .is_some_and(|cached| cached.expires_at <= Instant::now())
-        {
+        if self.current.as_ref().is_some_and(|cached| {
+            cached.expires_at <= Instant::now() && self.leased_generation != Some(cached.generation)
+        }) {
             self.current = None;
         }
         self.current.clone()
+    }
+
+    fn lease(&mut self, generation: u64) -> bool {
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|cached| cached.generation == generation)
+            && self.leased_generation.is_none()
+        {
+            self.leased_generation = Some(generation);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn finish_lease(&mut self, generation: u64, succeeded: bool) {
+        if self.leased_generation == Some(generation) {
+            self.leased_generation = None;
+        }
+        if !succeeded
+            && self
+                .current
+                .as_ref()
+                .is_some_and(|cached| cached.generation == generation)
+        {
+            self.current = None;
+        }
     }
 }
 
@@ -152,11 +202,8 @@ impl BoundedResolver {
                         }
                     })
                 };
-                let mut waiting = vec![first];
-                while let Ok(request) = receiver.try_recv() {
-                    waiting.push(request);
-                }
-                for request in waiting {
+                let waiting = resolver_batch_count(&receiver);
+                for request in take_resolver_batch(first, &mut receiver, waiting) {
                     let response = match &result {
                         Ok(cached) => Ok(cached.clone()),
                         Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
@@ -173,13 +220,20 @@ impl BoundedResolver {
     }
 
     async fn ensure_cached(&self) -> io::Result<u64> {
-        if let Some(cached) = self
-            .cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .fresh()
         {
-            return Ok(cached.generation);
+            let mut cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(cached) = cache.fresh() {
+                if cache.lease(cached.generation) {
+                    return Ok(cached.generation);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "custom-error resolver generation unavailable",
+                ));
+            }
         }
         let (response, received) = oneshot::channel();
         self.requests
@@ -200,21 +254,25 @@ impl BoundedResolver {
                 "custom-error resolver worker unavailable",
             )
         })??;
-        Ok(cached.generation)
-    }
-
-    fn invalidate(&self, generation: u64) {
         let mut cache = self
             .cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if cache
-            .current
-            .as_ref()
-            .is_some_and(|cached| cached.generation == generation)
-        {
-            cache.current = None;
+        if cache.lease(cached.generation) {
+            Ok(cached.generation)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "custom-error resolver generation changed",
+            ))
         }
+    }
+
+    fn finish_lease(&self, generation: u64, succeeded: bool) {
+        self.cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .finish_lease(generation, succeeded);
     }
 }
 
@@ -289,9 +347,7 @@ impl ResolverAttempt {
 
 impl Drop for ResolverAttempt {
     fn drop(&mut self) {
-        if !self.succeeded {
-            self.resolver.invalidate(self.generation);
-        }
+        self.resolver.finish_lease(self.generation, self.succeeded);
     }
 }
 
@@ -300,6 +356,7 @@ impl Drop for ResolverAttempt {
 pub struct ProxyErrorRenderer {
     connector: BoundedErrorConnector,
     resolver: BoundedResolver,
+    request_serialization: Arc<tokio::sync::Mutex<()>>,
     error_target: Option<Url>,
     error_path: Option<PathBuf>,
 }
@@ -476,6 +533,7 @@ impl ProxyErrorRenderer {
         Ok(Self {
             connector,
             resolver,
+            request_serialization: Arc::new(tokio::sync::Mutex::new(())),
             error_target,
             error_path,
         })
@@ -549,7 +607,14 @@ impl ProxyErrorRenderer {
         url: Url,
         deadline: tokio::time::Instant,
     ) -> Option<RenderedError> {
-        let generation = self.resolver.ensure_cached().await.ok()?;
+        let _generation_lease =
+            tokio::time::timeout_at(deadline, self.request_serialization.lock())
+                .await
+                .ok()?;
+        let generation = tokio::time::timeout_at(deadline, self.resolver.ensure_cached())
+            .await
+            .ok()?
+            .ok()?;
         let mut attempt = ResolverAttempt::new(self.resolver.clone(), generation);
         let rendered = self.bounded_request_inner(url, deadline).await;
         if rendered.is_some() {
@@ -935,13 +1000,75 @@ mod tests {
 
     use super::{
         encode_uri_component, parse_http_response, read_bounded_file_sync_with_hook,
-        write_all_and_flush, BoundedResolver, ErrorRendererBuildError, ProxyErrorRenderer,
-        MAX_RESOLVED_ADDRESSES,
+        resolver_batch_count, take_resolver_batch, write_all_and_flush, BoundedResolver,
+        ErrorRendererBuildError, ProxyErrorRenderer, MAX_RESOLVED_ADDRESSES,
+        RESOLVER_QUEUE_CAPACITY,
     };
     use crate::config::TlsConfig;
 
     struct FlushRequiredWriter {
         flushed: bool,
+    }
+
+    fn resolve_request() -> super::ResolveRequest {
+        let (response, _received) = tokio::sync::oneshot::channel();
+        super::ResolveRequest { response }
+    }
+
+    #[test]
+    fn resolver_batch_snapshot_leaves_adversarial_refill_for_the_next_turn() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(RESOLVER_QUEUE_CAPACITY);
+        sender.try_send(resolve_request()).unwrap();
+        for _ in 0..2 {
+            sender.try_send(resolve_request()).unwrap();
+        }
+
+        let first = receiver.try_recv().unwrap();
+        let captured = resolver_batch_count(&receiver);
+        for _ in 0..(RESOLVER_QUEUE_CAPACITY - 2) {
+            sender.try_send(resolve_request()).unwrap();
+        }
+        assert_eq!(receiver.len(), RESOLVER_QUEUE_CAPACITY);
+
+        let batch = take_resolver_batch(first, &mut receiver, captured);
+        assert_eq!(batch.len(), 3);
+        assert!(batch.len() <= RESOLVER_QUEUE_CAPACITY);
+        assert_eq!(receiver.len(), RESOLVER_QUEUE_CAPACITY - 2);
+
+        let next = receiver.try_recv().unwrap();
+        let next_captured = resolver_batch_count(&receiver);
+        let next_batch = take_resolver_batch(next, &mut receiver, next_captured);
+        assert_eq!(next_batch.len(), RESOLVER_QUEUE_CAPACITY - 2);
+        assert!(receiver.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolver_generation_lease_pins_addresses_across_cache_expiry() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let lookup: super::Lookup = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_host: String| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)]) })
+            })
+        };
+        let resolver = BoundedResolver::start_with_lookup("errors.invalid", lookup);
+        let generation = resolver.ensure_cached().await.unwrap();
+        let mut attempt = super::ResolverAttempt::new(resolver.clone(), generation);
+        resolver
+            .cache
+            .lock()
+            .unwrap()
+            .current
+            .as_mut()
+            .unwrap()
+            .expires_at = std::time::Instant::now() - Duration::from_secs(1);
+
+        let mut connector_resolver = resolver;
+        let name: Name = "errors.invalid".parse().unwrap();
+        assert_eq!(connector_resolver.call(name).await.unwrap().count(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        attempt.succeed();
     }
 
     impl AsyncWrite for FlushRequiredWriter {
@@ -1197,6 +1324,141 @@ mod tests {
                 .as_bytes()
         )));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_request_invalidates_the_generation_consumed_by_its_connector() {
+        let healthy_listener = Arc::new(
+            tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap(),
+        );
+        let port = healthy_listener.local_addr().unwrap().port();
+        let stale_listener = Arc::new(
+            tokio::net::TcpListener::bind((Ipv6Addr::LOCALHOST, port))
+                .await
+                .unwrap(),
+        );
+        let stale_entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release_stale = Arc::new(tokio::sync::Semaphore::new(0));
+        let stale_server = {
+            let stale_listener = Arc::clone(&stale_listener);
+            let stale_entered = Arc::clone(&stale_entered);
+            let release_stale = Arc::clone(&release_stale);
+            tokio::spawn(async move {
+                let (mut stream, _) = stale_listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let mut chunk = [0; 512];
+                    let count = stream.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&chunk[..count]);
+                }
+                stale_entered.add_permits(1);
+                release_stale.acquire().await.unwrap().forget();
+            })
+        };
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let lookup: super::Lookup = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_host: String| {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    let ip = match call {
+                        0 => IpAddr::V6(Ipv6Addr::LOCALHOST),
+                        1 => IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
+                        _ => IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    };
+                    Ok(vec![SocketAddr::new(ip, 0)])
+                })
+            })
+        };
+        let target = Url::parse(&format!("http://errors.invalid:{port}/errors/")).unwrap();
+        let renderer =
+            ProxyErrorRenderer::with_tls_policy_and_lookup(Some(target), None, true, None, lookup)
+                .unwrap();
+
+        let first = {
+            let renderer = renderer.clone();
+            tokio::spawn(async move { renderer.render(http::StatusCode::NOT_FOUND, "/n").await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), stale_entered.acquire())
+            .await
+            .expect("generation N connector did not enter")
+            .unwrap()
+            .forget();
+
+        let canceled = {
+            let renderer = renderer.clone();
+            tokio::spawn(async move {
+                tokio::time::timeout(
+                    Duration::from_millis(20),
+                    renderer.render(http::StatusCode::NOT_FOUND, "/canceled"),
+                )
+                .await
+            })
+        };
+        assert!(canceled.await.unwrap().is_err());
+        let second = {
+            let renderer = renderer.clone();
+            tokio::spawn(async move {
+                renderer
+                    .render(http::StatusCode::NOT_FOUND, "/n-plus-one")
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), stale_listener.accept())
+                .await
+                .is_err(),
+            "a later request consumed generation N before its owner completed"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        release_stale.add_permits(1);
+        assert_eq!(
+            first.await.unwrap().body,
+            bytes::Bytes::from_static(b"Not Found")
+        );
+        stale_server.await.unwrap();
+        assert_eq!(
+            second.await.unwrap().body,
+            bytes::Bytes::from_static(b"Not Found")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        let healthy_server = {
+            let healthy_listener = Arc::clone(&healthy_listener);
+            tokio::spawn(async move {
+                let (mut stream, _) = healthy_listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let mut chunk = [0; 512];
+                    let count = stream.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&chunk[..count]);
+                }
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nhealthy",
+                    )
+                    .await
+                    .unwrap();
+                request
+            })
+        };
+        let recovered = renderer
+            .render(http::StatusCode::NOT_FOUND, "/recovered")
+            .await;
+        assert_eq!(recovered.body, bytes::Bytes::from_static(b"healthy"));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let request = healthy_server.await.unwrap();
+        assert!(request.starts_with(
+            format!("GET /errors/404?url=%2Frecovered HTTP/1.1\r\nHost: errors.invalid:{port}\r\n")
+                .as_bytes()
+        ));
     }
 
     #[test]

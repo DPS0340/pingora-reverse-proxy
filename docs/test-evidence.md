@@ -261,3 +261,61 @@ cargo check --all-targets --all-features
 
 All three exited `0`. `git diff --check` also exited `0`. No dependency was
 added.
+
+## Task 7 final concurrency findings RED
+
+Each final finding was reproduced before its production change.
+
+- The resolver refill regression failed to compile with missing
+  `resolver_batch_count` and `take_resolver_batch`, establishing the absent
+  fixed-batch snapshot API (`cargo test --lib
+  errors::tests::resolver_batch_snapshot_leaves_adversarial_refill_for_the_next_turn
+  -- --exact --nocapture`, exit `101`).
+- The generation interleaving connected a later request to generation N before
+  the request owning N completed (`cargo test --lib
+  errors::tests::failed_request_invalidates_the_generation_consumed_by_its_connector
+  -- --exact --nocapture`, exit `101`). The companion expiry regression then
+  observed a second lookup while generation N should have remained leased
+  (`errors::tests::resolver_generation_lease_pins_addresses_across_cache_expiry`,
+  exit `101`).
+- The activity flush regression timed out while post-watermark activity kept
+  the hot key resident (`cargo test --test proxy_contract
+  activity_flush_uses_an_acceptance_watermark_for_a_continuously_advancing_key
+  -- --exact --nocapture`, exit `101`).
+
+## Task 7 final concurrency findings GREEN
+
+The three exact focused tests passed after fixed resolver batching,
+deadline-bounded request generation serialization, and per-entry activity
+sequence watermarks were implemented. Existing resolver single-flight/bounded
+I/O tests and all eight activity-related proxy contracts also passed.
+
+The full all-target/all-feature suite passed with 256 property cases:
+
+```bash
+PROPTEST_CASES=256 cargo test --all-targets --all-features -- --nocapture
+```
+
+Exit code: `0`. Results: library `8 passed`, API `33 passed`, config `26 passed`,
+proxy `68 passed`, route `11 passed`, store `45 passed`, and binary `0 passed`;
+`191 passed` total with no failures, ignores, measured, or filtered tests.
+
+The dedicated route property suite passed with 512 cases:
+
+```bash
+PROPTEST_CASES=512 cargo test --test route_properties -- --nocapture
+```
+
+Exit code: `0`; `11 passed`, with no failures, ignores, measured, or filtered
+tests.
+
+Final quality gates:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo check --all-targets --all-features
+git diff --check
+```
+
+All four exited `0`. No dependency was added.
