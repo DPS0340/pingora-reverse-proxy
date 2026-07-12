@@ -542,6 +542,20 @@ impl Store for CommitThenReturnAddStore {
         Ok(())
     }
 
+    async fn put_preserving_activity(
+        &self,
+        key: RouteKey,
+        mut data: RouteData,
+        activity_floor: ActivityFloor,
+    ) -> Result<RouteData, StoreError> {
+        let mut routes = self.routes.write().await;
+        if let Some(floor) = activity_floor.current() {
+            data.last_activity = data.last_activity.max(floor);
+        }
+        routes.insert(key, data.clone());
+        Ok(data)
+    }
+
     async fn update_activity(
         &self,
         key: &RouteKey,
@@ -603,6 +617,20 @@ impl Store for GatedAtomicAddStore {
     async fn put(&self, key: RouteKey, data: RouteData) -> Result<(), StoreError> {
         self.routes.write().await.insert(key, data);
         Ok(())
+    }
+
+    async fn put_preserving_activity(
+        &self,
+        key: RouteKey,
+        mut data: RouteData,
+        activity_floor: ActivityFloor,
+    ) -> Result<RouteData, StoreError> {
+        let mut routes = self.routes.write().await;
+        if let Some(floor) = activity_floor.current() {
+            data.last_activity = data.last_activity.max(floor);
+        }
+        routes.insert(key, data.clone());
+        Ok(data)
     }
 
     async fn update_activity(
@@ -740,6 +768,20 @@ impl Store for AtomicAddFailureStore {
         Ok(())
     }
 
+    async fn put_preserving_activity(
+        &self,
+        key: RouteKey,
+        mut data: RouteData,
+        activity_floor: ActivityFloor,
+    ) -> Result<RouteData, StoreError> {
+        let mut routes = self.routes.write().await;
+        if let Some(floor) = activity_floor.current() {
+            data.last_activity = data.last_activity.max(floor);
+        }
+        routes.insert(key, data.clone());
+        Ok(data)
+    }
+
     async fn update_activity(
         &self,
         _key: &RouteKey,
@@ -770,6 +812,15 @@ impl Store for FailingMutationStore {
     }
 
     async fn put(&self, _key: RouteKey, _data: RouteData) -> Result<(), StoreError> {
+        Err(StoreError::message("injected put failure"))
+    }
+
+    async fn put_preserving_activity(
+        &self,
+        _key: RouteKey,
+        _data: RouteData,
+        _activity_floor: ActivityFloor,
+    ) -> Result<RouteData, StoreError> {
         Err(StoreError::message("injected put failure"))
     }
 

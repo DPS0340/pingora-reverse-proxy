@@ -2369,6 +2369,20 @@ impl Store for FailingActivityStore {
         Ok(())
     }
 
+    async fn put_preserving_activity(
+        &self,
+        key: RouteKey,
+        mut data: RouteData,
+        activity_floor: ActivityFloor,
+    ) -> Result<RouteData, StoreError> {
+        let mut routes = self.routes.write().await;
+        if let Some(floor) = activity_floor.current() {
+            data.last_activity = data.last_activity.max(floor);
+        }
+        routes.insert(key, data.clone());
+        Ok(data)
+    }
+
     async fn update_activity(
         &self,
         _key: &RouteKey,
@@ -2459,6 +2473,7 @@ async fn activity_memory_update_is_immediate_coalesced_and_survives_persistence_
 
 struct StalledActivityStore {
     routes: tokio::sync::RwLock<BTreeMap<RouteKey, RouteData>>,
+    entries: std::sync::Mutex<Vec<RouteKey>>,
     writes: std::sync::Mutex<Vec<(RouteKey, chrono::DateTime<chrono::Utc>)>>,
     entered: tokio::sync::Semaphore,
     release: tokio::sync::Semaphore,
@@ -2484,11 +2499,21 @@ impl Store for StalledActivityStore {
         unreachable!("activity test only persists timestamps")
     }
 
+    async fn put_preserving_activity(
+        &self,
+        _key: RouteKey,
+        _data: RouteData,
+        _activity_floor: ActivityFloor,
+    ) -> Result<RouteData, StoreError> {
+        unreachable!("activity test only persists timestamps")
+    }
+
     async fn update_activity(
         &self,
         key: &RouteKey,
         at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), StoreError> {
+        self.entries.lock().unwrap().push(key.clone());
         self.entered.add_permits(1);
         self.release.acquire().await.unwrap().forget();
         self.writes.lock().unwrap().push((key.clone(), at));
@@ -2525,6 +2550,7 @@ async fn activity_pending_keys_are_bounded_and_recover_with_newest_accepted_time
         .collect();
     let store = Arc::new(StalledActivityStore {
         routes: tokio::sync::RwLock::new(routes),
+        entries: std::sync::Mutex::new(Vec::new()),
         writes: std::sync::Mutex::new(Vec::new()),
         entered: tokio::sync::Semaphore::new(0),
         release: tokio::sync::Semaphore::new(0),
@@ -2561,6 +2587,68 @@ async fn activity_pending_keys_are_bounded_and_recover_with_newest_accepted_time
         in_flight_newest
     );
     assert_eq!(writer.pending_routes(), 0);
+}
+
+#[tokio::test]
+async fn continuously_advancing_activity_key_yields_to_ready_peers() {
+    let initial = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let keys: Vec<_> = ["/a-hot", "/b-ready", "/c-ready"]
+        .into_iter()
+        .map(|path| RouteKey::parse(path).unwrap())
+        .collect();
+    let routes = keys
+        .iter()
+        .cloned()
+        .map(|key| {
+            (
+                key,
+                RouteData {
+                    target: "http://upstream.example".to_owned(),
+                    last_activity: initial,
+                    extra: Default::default(),
+                },
+            )
+        })
+        .collect();
+    let store = Arc::new(StalledActivityStore {
+        routes: tokio::sync::RwLock::new(routes),
+        entries: std::sync::Mutex::new(Vec::new()),
+        writes: std::sync::Mutex::new(Vec::new()),
+        entered: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let registry = RouteRegistry::load(store.clone()).await.unwrap();
+    let writer = ActivityWriter::start(Arc::clone(&registry), 3);
+
+    writer.record_at(&keys[0], initial + chrono::Duration::seconds(1));
+    store.entered.acquire().await.unwrap().forget();
+    writer.record_at(&keys[1], initial + chrono::Duration::seconds(1));
+    writer.record_at(&keys[2], initial + chrono::Duration::seconds(1));
+    writer.record_at(&keys[0], initial + chrono::Duration::seconds(2));
+
+    for (expected, hot_second) in [(&keys[1], 3), (&keys[2], 4)] {
+        store.release.add_permits(1);
+        store.entered.acquire().await.unwrap().forget();
+        assert_eq!(store.entries.lock().unwrap().last(), Some(expected));
+        writer.record_at(&keys[0], initial + chrono::Duration::seconds(hot_second));
+    }
+
+    store.release.add_permits(1);
+    store.entered.acquire().await.unwrap().forget();
+    assert_eq!(store.entries.lock().unwrap().last(), Some(&keys[0]));
+    store.release.add_permits(1);
+
+    tokio::time::timeout(Duration::from_secs(1), writer.flush())
+        .await
+        .expect("fair activity queue did not flush within its bound");
+    let drained = registry.drain_mutations(Duration::from_secs(1)).await;
+    assert!(!drained.timed_out);
+    assert_eq!(drained.active_mutations, 0);
+    assert_eq!(writer.pending_routes(), 0);
+    let entries = store.entries.lock().unwrap().clone();
+    assert_eq!(entries[..3], keys);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2624,6 +2712,21 @@ impl Store for OrderedPersistenceStore {
         self.gate(PersistenceOperation::Put).await;
         self.routes.write().await.insert(key, data);
         Ok(())
+    }
+
+    async fn put_preserving_activity(
+        &self,
+        key: RouteKey,
+        mut data: RouteData,
+        activity_floor: ActivityFloor,
+    ) -> Result<RouteData, StoreError> {
+        self.gate(PersistenceOperation::Put).await;
+        let mut routes = self.routes.write().await;
+        if let Some(floor) = activity_floor.current() {
+            data.last_activity = data.last_activity.max(floor);
+        }
+        routes.insert(key, data.clone());
+        Ok(data)
     }
 
     async fn update_activity(

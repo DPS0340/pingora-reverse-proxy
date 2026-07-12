@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http::header::{CONTENT_ENCODING, CONTENT_TYPE};
@@ -39,6 +39,7 @@ const MAX_ERROR_BODY_BYTES: usize = 1024 * 1024;
 const MAX_UNIX_WIRE_BYTES: usize = MAX_ERROR_HEADER_BYTES + MAX_ERROR_BODY_BYTES + 64 * 1024;
 const MAX_RESOLVED_ADDRESSES: usize = 16;
 const RESOLVER_QUEUE_CAPACITY: usize = 8;
+const RESOLVER_CACHE_TTL: Duration = Duration::from_secs(30);
 
 /// Classification used to select the public HTTP status without exposing an
 /// internal error or target URL to clients and logs.
@@ -69,13 +70,39 @@ type LookupFuture = Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + S
 type Lookup = Arc<dyn Fn(String) -> LookupFuture + Send + Sync>;
 
 struct ResolveRequest {
-    response: oneshot::Sender<io::Result<Vec<SocketAddr>>>,
+    response: oneshot::Sender<io::Result<CachedAddresses>>,
+}
+
+#[derive(Clone)]
+struct CachedAddresses {
+    addresses: Vec<SocketAddr>,
+    generation: u64,
+    expires_at: Instant,
+}
+
+#[derive(Default)]
+struct ResolverCache {
+    current: Option<CachedAddresses>,
+    generation: u64,
+}
+
+impl ResolverCache {
+    fn fresh(&mut self) -> Option<CachedAddresses> {
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|cached| cached.expires_at <= Instant::now())
+        {
+            self.current = None;
+        }
+        self.current.clone()
+    }
 }
 
 #[derive(Clone)]
 struct BoundedResolver {
     host: Arc<str>,
-    cache: Arc<std::sync::Mutex<Option<Vec<SocketAddr>>>>,
+    cache: Arc<std::sync::Mutex<ResolverCache>>,
     requests: mpsc::Sender<ResolveRequest>,
 }
 
@@ -86,22 +113,9 @@ impl std::fmt::Debug for BoundedResolver {
 }
 
 impl BoundedResolver {
-    fn start(host: &str) -> Self {
-        Self::start_with_lookup(
-            host,
-            Arc::new(|host| {
-                Box::pin(async move {
-                    tokio::net::lookup_host((host.as_str(), 0))
-                        .await
-                        .map(|addresses| addresses.collect())
-                })
-            }),
-        )
-    }
-
     fn start_with_lookup(host: &str, lookup: Lookup) -> Self {
         let host: Arc<str> = Arc::from(host);
-        let cache = Arc::new(std::sync::Mutex::new(None));
+        let cache = Arc::new(std::sync::Mutex::new(ResolverCache::default()));
         let (requests, mut receiver) = mpsc::channel::<ResolveRequest>(RESOLVER_QUEUE_CAPACITY);
         let worker_host = Arc::clone(&host);
         let worker_cache = Arc::clone(&cache);
@@ -110,9 +124,9 @@ impl BoundedResolver {
                 let cached = worker_cache
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone();
-                let result = if let Some(addresses) = cached {
-                    Ok(addresses)
+                    .fresh();
+                let result = if let Some(cached) = cached {
+                    Ok(cached)
                 } else {
                     lookup(worker_host.to_string()).await.and_then(|addresses| {
                         let mut addresses: Vec<_> =
@@ -124,11 +138,17 @@ impl BoundedResolver {
                                 "custom-error hostname resolved to no addresses",
                             ))
                         } else {
-                            *worker_cache
+                            let mut cache = worker_cache
                                 .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                                Some(addresses.clone());
-                            Ok(addresses)
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            cache.generation = cache.generation.wrapping_add(1);
+                            let cached = CachedAddresses {
+                                addresses,
+                                generation: cache.generation,
+                                expires_at: Instant::now() + RESOLVER_CACHE_TTL,
+                            };
+                            cache.current = Some(cached.clone());
+                            Ok(cached)
                         }
                     })
                 };
@@ -138,7 +158,7 @@ impl BoundedResolver {
                 }
                 for request in waiting {
                     let response = match &result {
-                        Ok(addresses) => Ok(addresses.clone()),
+                        Ok(cached) => Ok(cached.clone()),
                         Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
                     };
                     let _ = request.response.send(response);
@@ -149,6 +169,51 @@ impl BoundedResolver {
             host,
             cache,
             requests,
+        }
+    }
+
+    async fn ensure_cached(&self) -> io::Result<u64> {
+        if let Some(cached) = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .fresh()
+        {
+            return Ok(cached.generation);
+        }
+        let (response, received) = oneshot::channel();
+        self.requests
+            .try_send(ResolveRequest { response })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "custom-error resolver queue unavailable",
+                ),
+                mpsc::error::TrySendError::Closed(_) => io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "custom-error resolver queue unavailable",
+                ),
+            })?;
+        let cached = received.await.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "custom-error resolver worker unavailable",
+            )
+        })??;
+        Ok(cached.generation)
+    }
+
+    fn invalidate(&self, generation: u64) {
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cache
+            .current
+            .as_ref()
+            .is_some_and(|cached| cached.generation == generation)
+        {
+            cache.current = None;
         }
     }
 }
@@ -173,9 +238,9 @@ impl tower::Service<Name> for BoundedResolver {
             .cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+            .fresh()
         {
-            return Box::pin(std::future::ready(Ok(addresses.into_iter())));
+            return Box::pin(std::future::ready(Ok(addresses.addresses.into_iter())));
         }
         let (response, received) = oneshot::channel();
         if let Err(error) = self.requests.try_send(ResolveRequest { response }) {
@@ -189,23 +254,52 @@ impl tower::Service<Name> for BoundedResolver {
             ))));
         }
         Box::pin(async move {
-            let addresses = received.await.map_err(|_| {
+            let cached = received.await.map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "custom-error resolver worker unavailable",
                 )
             })??;
-            Ok(addresses.into_iter())
+            Ok(cached.addresses.into_iter())
         })
     }
 }
 
 type BoundedErrorConnector = HttpsConnector<HttpConnector<BoundedResolver>>;
 
+struct ResolverAttempt {
+    resolver: BoundedResolver,
+    generation: u64,
+    succeeded: bool,
+}
+
+impl ResolverAttempt {
+    fn new(resolver: BoundedResolver, generation: u64) -> Self {
+        Self {
+            resolver,
+            generation,
+            succeeded: false,
+        }
+    }
+
+    fn succeed(&mut self) {
+        self.succeeded = true;
+    }
+}
+
+impl Drop for ResolverAttempt {
+    fn drop(&mut self) {
+        if !self.succeeded {
+            self.resolver.invalidate(self.generation);
+        }
+    }
+}
+
 /// Renders custom-target, file, and reason-phrase proxy errors in CHP order.
 #[derive(Clone)]
 pub struct ProxyErrorRenderer {
     connector: BoundedErrorConnector,
+    resolver: BoundedResolver,
     error_target: Option<Url>,
     error_path: Option<PathBuf>,
 }
@@ -274,6 +368,28 @@ impl ProxyErrorRenderer {
         error_path: Option<PathBuf>,
         verify_tls: bool,
         tls: Option<&TlsConfig>,
+    ) -> Result<Self, ErrorRendererBuildError> {
+        Self::with_tls_policy_and_lookup(
+            error_target,
+            error_path,
+            verify_tls,
+            tls,
+            Arc::new(|host| {
+                Box::pin(async move {
+                    tokio::net::lookup_host((host.as_str(), 0))
+                        .await
+                        .map(|addresses| addresses.collect())
+                })
+            }),
+        )
+    }
+
+    fn with_tls_policy_and_lookup(
+        error_target: Option<Url>,
+        error_path: Option<PathBuf>,
+        verify_tls: bool,
+        tls: Option<&TlsConfig>,
+        lookup: Lookup,
     ) -> Result<Self, ErrorRendererBuildError> {
         let mut roots = rustls::RootCertStore::empty();
         if let Some(path) = tls.and_then(|tls| tls.ca.as_ref()) {
@@ -348,7 +464,8 @@ impl ProxyErrorRenderer {
             .as_ref()
             .and_then(Url::host_str)
             .unwrap_or("localhost");
-        let mut connector = HttpConnector::new_with_resolver(BoundedResolver::start(resolver_host));
+        let resolver = BoundedResolver::start_with_lookup(resolver_host, lookup);
+        let mut connector = HttpConnector::new_with_resolver(resolver.clone());
         connector.set_connect_timeout(Some(ERROR_CONNECT_TIMEOUT));
         connector.enforce_http(false);
         let connector = HttpsConnectorBuilder::new()
@@ -358,6 +475,7 @@ impl ProxyErrorRenderer {
             .wrap_connector(connector);
         Ok(Self {
             connector,
+            resolver,
             error_target,
             error_path,
         })
@@ -427,6 +545,20 @@ impl ProxyErrorRenderer {
     }
 
     async fn bounded_request(
+        &self,
+        url: Url,
+        deadline: tokio::time::Instant,
+    ) -> Option<RenderedError> {
+        let generation = self.resolver.ensure_cached().await.ok()?;
+        let mut attempt = ResolverAttempt::new(self.resolver.clone(), generation);
+        let rendered = self.bounded_request_inner(url, deadline).await;
+        if rendered.is_some() {
+            attempt.succeed();
+        }
+        rendered
+    }
+
+    async fn bounded_request_inner(
         &self,
         url: Url,
         deadline: tokio::time::Instant,
@@ -789,7 +921,7 @@ fn reason_phrase(status: StatusCode) -> RenderedError {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -797,8 +929,9 @@ mod tests {
     use std::time::Duration;
 
     use hyper_util::client::legacy::connect::dns::Name;
-    use tokio::io::AsyncWrite;
+    use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use tower::Service as _;
+    use url::Url;
 
     use super::{
         encode_uri_component, parse_http_response, read_bounded_file_sync_with_hook,
@@ -963,6 +1096,107 @@ mod tests {
             writer.flushed,
             "TLS request bytes must be flushed explicitly"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_cached_address_is_invalidated_and_concurrent_retry_is_single_flight() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stale_guard = tokio::net::TcpListener::bind((Ipv6Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        drop(stale_guard);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release_healthy_lookup = Arc::new(tokio::sync::Semaphore::new(0));
+        let lookup: super::Lookup = {
+            let calls = Arc::clone(&calls);
+            let release_healthy_lookup = Arc::clone(&release_healthy_lookup);
+            Arc::new(move |_host: String| {
+                let calls = Arc::clone(&calls);
+                let release_healthy_lookup = Arc::clone(&release_healthy_lookup);
+                Box::pin(async move {
+                    let call = calls.fetch_add(1, Ordering::SeqCst);
+                    if call > 0 {
+                        release_healthy_lookup.acquire().await.unwrap().forget();
+                    }
+                    let ip = if call == 0 {
+                        IpAddr::V6(Ipv6Addr::LOCALHOST)
+                    } else {
+                        IpAddr::V4(Ipv4Addr::LOCALHOST)
+                    };
+                    Ok(vec![SocketAddr::new(ip, 0)])
+                })
+            })
+        };
+        let target = Url::parse(&format!("http://errors.invalid:{port}/errors/")).unwrap();
+        let renderer =
+            ProxyErrorRenderer::with_tls_policy_and_lookup(Some(target), None, true, None, lookup)
+                .unwrap();
+
+        let stale = renderer.render(http::StatusCode::NOT_FOUND, "/stale").await;
+        assert_eq!(stale.body, bytes::Bytes::from_static(b"Not Found"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..super::RESOLVER_QUEUE_CAPACITY {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let mut chunk = [0; 512];
+                    let count = stream.read(&mut chunk).await.unwrap();
+                    assert!(count > 0, "custom-error request ended before its headers");
+                    request.extend_from_slice(&chunk[..count]);
+                    assert!(
+                        request.len() <= 4096,
+                        "custom-error test request is unbounded"
+                    );
+                }
+                requests.push(request);
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nhealthy",
+                    )
+                    .await
+                    .unwrap();
+            }
+            requests
+        });
+        let retries: Vec<_> = (0..super::RESOLVER_QUEUE_CAPACITY)
+            .map(|_| {
+                let renderer = renderer.clone();
+                tokio::spawn(
+                    async move { renderer.render(http::StatusCode::NOT_FOUND, "/retry").await },
+                )
+            })
+            .collect();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while calls.load(Ordering::SeqCst) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("healthy retry lookup did not start");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        release_healthy_lookup.add_permits(1);
+
+        for retry in retries {
+            assert_eq!(
+                retry.await.unwrap().body,
+                bytes::Bytes::from_static(b"healthy")
+            );
+        }
+        let requests = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("healthy custom-error server did not finish")
+            .unwrap();
+        assert!(requests.iter().all(|request| request.starts_with(
+            format!("GET /errors/404?url=%2Fretry HTTP/1.1\r\nHost: errors.invalid:{port}\r\n")
+                .as_bytes()
+        )));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]

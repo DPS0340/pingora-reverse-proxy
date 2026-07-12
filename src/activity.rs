@@ -1,6 +1,6 @@
 //! Bounded, coalesced persistence for proxy activity observations.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -12,12 +12,18 @@ use crate::route::RouteKey;
 use crate::route_table::RouteRegistry;
 
 struct ActivityState {
-    pending: Mutex<BTreeMap<RouteKey, PendingActivity>>,
+    pending: Mutex<PendingActivities>,
     persistence_errors: AtomicU64,
     dropped_observations: AtomicU64,
     pending_capacity: usize,
     metrics: Arc<Metrics>,
     idle: Notify,
+}
+
+#[derive(Default)]
+struct PendingActivities {
+    by_key: BTreeMap<RouteKey, PendingActivity>,
+    ready: VecDeque<RouteKey>,
 }
 
 #[derive(Clone, Copy)]
@@ -52,7 +58,7 @@ impl ActivityWriter {
     ) -> Self {
         let pending_capacity = pending_capacity.max(1);
         let state = Arc::new(ActivityState {
-            pending: Mutex::new(BTreeMap::new()),
+            pending: Mutex::new(PendingActivities::default()),
             persistence_errors: AtomicU64::new(0),
             dropped_observations: AtomicU64::new(0),
             pending_capacity,
@@ -70,11 +76,13 @@ impl ActivityWriter {
                             .pending
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        guard.iter_mut().find_map(|(key, pending)| {
-                            pending.in_flight.is_none().then(|| {
-                                pending.in_flight = Some(pending.latest);
-                                (key.clone(), pending.latest)
-                            })
+                        guard.ready.pop_front().map(|key| {
+                            let pending = guard
+                                .by_key
+                                .get_mut(&key)
+                                .expect("ready activity key must remain resident");
+                            pending.in_flight = Some(pending.latest);
+                            (key, pending.latest)
                         })
                     };
                     let Some((key, pending_at)) = pending else {
@@ -99,12 +107,14 @@ impl ActivityWriter {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     if guard
+                        .by_key
                         .get(&key)
                         .is_some_and(|pending| pending.latest <= pending_at)
                     {
-                        guard.remove(&key);
-                    } else if let Some(pending) = guard.get_mut(&key) {
+                        guard.by_key.remove(&key);
+                    } else if let Some(pending) = guard.by_key.get_mut(&key) {
                         pending.in_flight = None;
+                        guard.ready.push_back(key);
                     }
                     drop(guard);
                     worker_state.idle.notify_waiters();
@@ -133,16 +143,17 @@ impl ActivityWriter {
             .pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(existing) = pending.get_mut(key) {
+        if let Some(existing) = pending.by_key.get_mut(key) {
             existing.latest = existing.latest.max(at);
-        } else if pending.len() < self.state.pending_capacity {
-            pending.insert(
+        } else if pending.by_key.len() < self.state.pending_capacity {
+            pending.by_key.insert(
                 key.clone(),
                 PendingActivity {
                     latest: at,
                     in_flight: None,
                 },
             );
+            pending.ready.push_back(key.clone());
         } else {
             let previous = self
                 .state
@@ -192,6 +203,7 @@ impl ActivityWriter {
             .pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .by_key
             .len()
     }
 
@@ -204,6 +216,7 @@ impl ActivityWriter {
                 .pending
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .by_key
                 .is_empty();
             if pending_is_empty {
                 return;

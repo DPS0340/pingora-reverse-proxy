@@ -77,21 +77,15 @@ pub trait Store: Send + Sync {
     async fn put(&self, key: RouteKey, data: RouteData) -> Result<(), StoreError>;
     /// Atomically replace a complete route without a corrective second write.
     ///
-    /// Backends that perform preparation before their atomic commit should
-    /// override this method and sample `activity_floor` immediately before the
-    /// transactional write, as `MemoryStore` does.
+    /// Every backend must sample `activity_floor` inside the same lock or
+    /// transaction as the replacement, immediately before its atomic commit.
+    /// An error must leave backend state unchanged.
     async fn put_preserving_activity(
         &self,
         key: RouteKey,
-        mut data: RouteData,
+        data: RouteData,
         activity_floor: ActivityFloor,
-    ) -> Result<RouteData, StoreError> {
-        if let Some(floor) = activity_floor.current() {
-            data.last_activity = data.last_activity.max(floor);
-        }
-        self.put(key, data.clone()).await?;
-        Ok(data)
-    }
+    ) -> Result<RouteData, StoreError>;
     async fn update_activity(&self, key: &RouteKey, at: DateTime<Utc>) -> Result<(), StoreError>;
     async fn delete(&self, key: &RouteKey) -> Result<Option<RouteData>, StoreError>;
 }

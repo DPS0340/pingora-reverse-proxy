@@ -137,11 +137,14 @@ proptest! {
                     Operation::Put(id, route_id) => {
                         let route_key = key(&format!("/route/{id}"));
                         let route_data = route(&format!("http://127.0.0.1:{}/", 10_000 + u16::from(route_id)));
+                        let activity_floor = reference
+                            .get(&route_key)
+                            .map(|route: &RouteData| route.last_activity);
                         let route_data = store
                             .put_preserving_activity(
                                 route_key.clone(),
                                 route_data,
-                                ActivityFloor::fixed(None),
+                                ActivityFloor::fixed(activity_floor),
                             )
                             .await
                             .unwrap();
@@ -204,6 +207,15 @@ impl Store for FailingStore {
         Err(StoreError::message("injected put failure"))
     }
 
+    async fn put_preserving_activity(
+        &self,
+        _key: RouteKey,
+        _data: RouteData,
+        _activity_floor: ActivityFloor,
+    ) -> Result<RouteData, StoreError> {
+        Err(StoreError::message("injected put failure"))
+    }
+
     async fn update_activity(&self, _key: &RouteKey, _at: DateTime<Utc>) -> Result<(), StoreError> {
         Err(StoreError::message("injected activity failure"))
     }
@@ -222,6 +234,27 @@ async fn failed_persistence_never_publishes_route() {
         .await;
     assert!(result.is_err());
     assert!(registry.resolve("/user/a/tree").is_none());
+}
+
+#[tokio::test]
+async fn failed_atomic_put_changes_no_backend_state_and_fresh_reload_matches() {
+    let route_key = key("/user/a");
+    let original = route("http://original.example");
+    let store = Arc::new(FailingStore::with_routes(BTreeMap::from([(
+        route_key.clone(),
+        original.clone(),
+    )])));
+    let registry = RouteRegistry::load(store.clone()).await.unwrap();
+    let observed = Utc.timestamp_opt(999, 0).unwrap();
+    assert!(registry.observe_activity(&route_key, observed));
+
+    assert!(registry
+        .put(route_key.clone(), route("http://replacement.example"))
+        .await
+        .is_err());
+    assert_eq!(store.snapshot().await.unwrap()[&route_key], original);
+    let reloaded = RouteRegistry::load(store).await.unwrap();
+    assert_eq!(reloaded.get(&route_key), Some(original));
 }
 
 struct GatedAtomicAddStore {
@@ -277,6 +310,20 @@ impl Store for GatedAtomicAddStore {
     async fn put(&self, key: RouteKey, data: RouteData) -> Result<(), StoreError> {
         self.routes.write().await.insert(key, data);
         Ok(())
+    }
+
+    async fn put_preserving_activity(
+        &self,
+        key: RouteKey,
+        mut data: RouteData,
+        activity_floor: ActivityFloor,
+    ) -> Result<RouteData, StoreError> {
+        let mut routes = self.routes.write().await;
+        if let Some(floor) = activity_floor.current() {
+            data.last_activity = data.last_activity.max(floor);
+        }
+        routes.insert(key, data.clone());
+        Ok(data)
     }
 
     async fn update_activity(&self, key: &RouteKey, at: DateTime<Utc>) -> Result<(), StoreError> {
@@ -429,6 +476,21 @@ impl Store for GatedMutationStore {
         Ok(())
     }
 
+    async fn put_preserving_activity(
+        &self,
+        key: RouteKey,
+        mut data: RouteData,
+        activity_floor: ActivityFloor,
+    ) -> Result<RouteData, StoreError> {
+        self.gate(GatedMutation::Put).await;
+        let mut routes = self.routes.write().await;
+        if let Some(floor) = activity_floor.current() {
+            data.last_activity = data.last_activity.max(floor);
+        }
+        routes.insert(key, data.clone());
+        Ok(data)
+    }
+
     async fn update_activity(&self, key: &RouteKey, at: DateTime<Utc>) -> Result<(), StoreError> {
         self.gate(GatedMutation::UpdateActivity).await;
         if let Some(route) = self.routes.write().await.get_mut(key) {
@@ -468,6 +530,39 @@ async fn cancelling_put_does_not_cancel_the_registry_owned_mutation() {
         Some(&replacement)
     );
     assert_eq!(registry.get(&route_key), Some(replacement));
+}
+
+#[tokio::test]
+async fn put_samples_activity_after_method_entry_at_atomic_commit_and_survives_reload() {
+    let route_key = key("/service");
+    let original = route("http://original.example");
+    let observed = Utc.timestamp_opt(999, 0).unwrap();
+    let store = Arc::new(GatedMutationStore::new(
+        GatedMutation::Put,
+        BTreeMap::from([(route_key.clone(), original)]),
+    ));
+    let registry = RouteRegistry::load(store.clone()).await.unwrap();
+    let putting = {
+        let registry = Arc::clone(&registry);
+        let route_key = route_key.clone();
+        tokio::spawn(async move {
+            registry
+                .put(route_key, route("http://replacement.example"))
+                .await
+        })
+    };
+
+    store.entered.acquire().await.unwrap().forget();
+    assert!(registry.observe_activity(&route_key, observed));
+    store.release.add_permits(1);
+    putting.await.unwrap().unwrap();
+
+    let committed = store.snapshot().await.unwrap()[&route_key].clone();
+    assert_eq!(committed.target, "http://replacement.example");
+    assert_eq!(committed.last_activity, observed);
+    assert_eq!(registry.get(&route_key), Some(committed.clone()));
+    let reloaded = RouteRegistry::load(store).await.unwrap();
+    assert_eq!(reloaded.get(&route_key), Some(committed));
 }
 
 #[tokio::test]
@@ -552,6 +647,18 @@ impl Store for TimingOutPutStore {
         tokio::time::timeout(Duration::from_millis(10), std::future::pending::<()>())
             .await
             .map_err(|_| StoreError::message("backend timeout"))
+    }
+
+    async fn put_preserving_activity(
+        &self,
+        _key: RouteKey,
+        _data: RouteData,
+        _activity_floor: ActivityFloor,
+    ) -> Result<RouteData, StoreError> {
+        tokio::time::timeout(Duration::from_millis(10), std::future::pending::<()>())
+            .await
+            .map_err(|_| StoreError::message("backend timeout"))?;
+        unreachable!()
     }
 
     async fn update_activity(&self, _key: &RouteKey, _at: DateTime<Utc>) -> Result<(), StoreError> {
@@ -911,10 +1018,11 @@ impl Store for GatedManagementStore {
     ) -> Result<RouteData, StoreError> {
         assert!(matches!(self.operation, GatedManagementOperation::Put));
         self.gate().await;
+        let mut routes = self.routes.write().await;
         if let Some(floor) = activity_floor.current() {
             data.last_activity = data.last_activity.max(floor);
         }
-        self.routes.write().await.insert(key, data.clone());
+        routes.insert(key, data.clone());
         Ok(data)
     }
 
@@ -1062,6 +1170,23 @@ impl Store for GatedPutStore {
         self.gates[&key].acquire().await.unwrap().forget();
         self.routes.write().await.insert(key, data);
         Ok(())
+    }
+
+    async fn put_preserving_activity(
+        &self,
+        key: RouteKey,
+        mut data: RouteData,
+        activity_floor: ActivityFloor,
+    ) -> Result<RouteData, StoreError> {
+        self.entries.lock().unwrap().push(key.clone());
+        self.entered.add_permits(1);
+        self.gates[&key].acquire().await.unwrap().forget();
+        let mut routes = self.routes.write().await;
+        if let Some(floor) = activity_floor.current() {
+            data.last_activity = data.last_activity.max(floor);
+        }
+        routes.insert(key, data.clone());
+        Ok(data)
     }
 
     async fn update_activity(&self, _key: &RouteKey, _at: DateTime<Utc>) -> Result<(), StoreError> {
@@ -1244,6 +1369,33 @@ impl Store for SupervisedPutStore {
         }
     }
 
+    async fn put_preserving_activity(
+        &self,
+        key: RouteKey,
+        mut data: RouteData,
+        activity_floor: ActivityFloor,
+    ) -> Result<RouteData, StoreError> {
+        self.entered.add_permits(1);
+        self.release.acquire().await.unwrap().forget();
+        match self.outcome {
+            SupervisedPutOutcome::Success => {
+                let mut routes = self.routes.write().await;
+                if let Some(floor) = activity_floor.current() {
+                    data.last_activity = data.last_activity.max(floor);
+                }
+                routes.insert(key, data.clone());
+                Ok(data)
+            }
+            SupervisedPutOutcome::Error => Err(StoreError::message("detached backend failure")),
+            SupervisedPutOutcome::Panic => {
+                panic!("SUPERVISOR_PANIC_SECRET_SENTINEL_7d69f58e")
+            }
+            SupervisedPutOutcome::PanicWithPanickingPayload => {
+                std::panic::panic_any(PanickingPayloadDrop)
+            }
+        }
+    }
+
     async fn update_activity(&self, _key: &RouteKey, _at: DateTime<Utc>) -> Result<(), StoreError> {
         Err(StoreError::message("unused activity update"))
     }
@@ -1387,6 +1539,15 @@ impl Store for SnapshotFailureStore {
         unreachable!()
     }
 
+    async fn put_preserving_activity(
+        &self,
+        _key: RouteKey,
+        _data: RouteData,
+        _activity_floor: ActivityFloor,
+    ) -> Result<RouteData, StoreError> {
+        unreachable!()
+    }
+
     async fn update_activity(&self, _key: &RouteKey, _at: DateTime<Utc>) -> Result<(), StoreError> {
         unreachable!()
     }
@@ -1513,6 +1674,19 @@ impl Store for AdmissionCountingStore {
         Ok(())
     }
 
+    async fn put_preserving_activity(
+        &self,
+        _key: RouteKey,
+        mut data: RouteData,
+        activity_floor: ActivityFloor,
+    ) -> Result<RouteData, StoreError> {
+        if let Some(floor) = activity_floor.current() {
+            data.last_activity = data.last_activity.max(floor);
+        }
+        self.mutation_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(data)
+    }
+
     async fn update_activity(&self, _key: &RouteKey, _at: DateTime<Utc>) -> Result<(), StoreError> {
         self.mutation_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
@@ -1576,6 +1750,23 @@ impl Store for FirstMutationPanicStore {
             std::panic::panic_any(PanickingPayloadDrop);
         }
         Ok(())
+    }
+
+    async fn put_preserving_activity(
+        &self,
+        _key: RouteKey,
+        mut data: RouteData,
+        activity_floor: ActivityFloor,
+    ) -> Result<RouteData, StoreError> {
+        if self.enter() {
+            self.first_entered.add_permits(1);
+            self.release_first.acquire().await.unwrap().forget();
+            std::panic::panic_any(PanickingPayloadDrop);
+        }
+        if let Some(floor) = activity_floor.current() {
+            data.last_activity = data.last_activity.max(floor);
+        }
+        Ok(data)
     }
 
     async fn update_activity(&self, _key: &RouteKey, _at: DateTime<Utc>) -> Result<(), StoreError> {
