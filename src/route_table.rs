@@ -106,9 +106,16 @@ impl OrderedRoutes {
         self.by_key.insert(key, data);
     }
 
+    fn replace_preserving_activity(&mut self, key: RouteKey, mut data: RouteData) {
+        if let Some(existing) = self.by_key.get(&key) {
+            data.last_activity = data.last_activity.max(existing.last_activity);
+        }
+        self.replace(key, data);
+    }
+
     fn update_activity(&mut self, key: &RouteKey, at: DateTime<Utc>) {
         if let Some(route) = self.by_key.get_mut(key) {
-            route.last_activity = at;
+            route.last_activity = route.last_activity.max(at);
         }
     }
 
@@ -600,17 +607,22 @@ impl RouteRegistry {
 
     /// Persist a previously observed proxy activity timestamp.
     pub async fn persist_observed_activity(
-        &self,
+        self: &Arc<Self>,
         key: &RouteKey,
         at: DateTime<Utc>,
     ) -> Result<(), StoreError> {
-        let _mutation_guard = self.mutation.lock().await;
-        let Some(current) = self.get(key) else {
-            return Ok(());
-        };
-        self.store
-            .update_activity(key, current.last_activity.max(at))
-            .await
+        let registry = Arc::clone(self);
+        let key = key.clone();
+        self.run_mutation(MutationOperation::UpdateActivity, async move {
+            let Some(current) = registry.get(&key) else {
+                return Ok(());
+            };
+            registry
+                .store
+                .update_activity(&key, current.last_activity.max(at))
+                .await
+        })
+        .await
     }
 
     /// Persist a route replacement and publish it atomically on success.
@@ -622,9 +634,12 @@ impl RouteRegistry {
         .await
     }
 
-    async fn put_owned(&self, key: RouteKey, data: RouteData) -> Result<(), StoreError> {
+    async fn put_owned(&self, key: RouteKey, mut data: RouteData) -> Result<(), StoreError> {
         self.store.put(key.clone(), data.clone()).await?;
-        self.merge_and_publish(|routes| routes.replace(key.clone(), data.clone()));
+        self.persist_newer_observation(&key, &mut data).await?;
+        self.merge_and_publish(|routes| {
+            routes.replace_preserving_activity(key.clone(), data.clone())
+        });
         Ok(())
     }
 
@@ -648,8 +663,28 @@ impl RouteRegistry {
         target: String,
         extra: Map<String, Value>,
     ) -> Result<(), StoreError> {
-        let data = self.store.add(key.clone(), target, extra).await?;
-        self.merge_and_publish(|routes| routes.replace(key.clone(), data.clone()));
+        let mut data = self.store.add(key.clone(), target, extra).await?;
+        self.persist_newer_observation(&key, &mut data).await?;
+        self.merge_and_publish(|routes| {
+            routes.replace_preserving_activity(key.clone(), data.clone())
+        });
+        Ok(())
+    }
+
+    async fn persist_newer_observation(
+        &self,
+        key: &RouteKey,
+        replacement: &mut RouteData,
+    ) -> Result<(), StoreError> {
+        let Some(observed) = self.get(key) else {
+            return Ok(());
+        };
+        if observed.last_activity > replacement.last_activity {
+            self.store
+                .update_activity(key, observed.last_activity)
+                .await?;
+            replacement.last_activity = observed.last_activity;
+        }
         Ok(())
     }
 

@@ -455,10 +455,15 @@ async fn cancelling_activity_update_does_not_cancel_the_registry_owned_mutation(
         BTreeMap::from([(route_key.clone(), original)]),
     ));
     let registry = RouteRegistry::load(store.clone()).await.unwrap();
+    assert!(registry.observe_activity(&route_key, activity));
     let caller = {
         let registry = Arc::clone(&registry);
         let route_key = route_key.clone();
-        tokio::spawn(async move { registry.update_activity(&route_key, activity).await })
+        tokio::spawn(async move {
+            registry
+                .persist_observed_activity(&route_key, activity)
+                .await
+        })
     };
 
     store.entered.acquire().await.unwrap().forget();

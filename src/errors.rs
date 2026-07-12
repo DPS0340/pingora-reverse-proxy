@@ -3,15 +3,22 @@
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use http::header::{CONTENT_ENCODING, CONTENT_TYPE};
 use http::{HeaderValue, StatusCode};
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::rt::TokioIo;
 use pingora::http::ResponseHeader;
 use pingora::proxy::Session;
-#[cfg(unix)]
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, SignatureScheme};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tower::Service as _;
 use url::Url;
 
 use crate::config::TlsConfig;
@@ -49,10 +56,12 @@ struct RenderedError {
     content_encoding: Option<HeaderValue>,
 }
 
+type BoundedErrorConnector = HttpsConnector<HttpConnector>;
+
 /// Renders custom-target, file, and reason-phrase proxy errors in CHP order.
 #[derive(Clone)]
 pub struct ProxyErrorRenderer {
-    client: reqwest::Client,
+    connector: BoundedErrorConnector,
     error_target: Option<Url>,
     error_path: Option<PathBuf>,
 }
@@ -66,12 +75,52 @@ pub enum ErrorRendererBuildError {
         #[source]
         source: std::io::Error,
     },
-    #[error("invalid custom-error TLS CA certificate")]
-    InvalidCa(#[source] reqwest::Error),
+    #[error("invalid custom-error TLS CA certificate bundle")]
+    InvalidCa,
     #[error("invalid custom-error TLS client identity")]
-    InvalidIdentity(#[source] reqwest::Error),
+    InvalidIdentity,
     #[error("failed to build custom-error HTTP client")]
-    Client(#[source] reqwest::Error),
+    Client,
+}
+
+#[derive(Debug)]
+struct NoCertificateVerification {
+    schemes: Vec<SignatureScheme>,
+}
+
+impl ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.schemes.clone()
+    }
 }
 
 impl ProxyErrorRenderer {
@@ -82,44 +131,85 @@ impl ProxyErrorRenderer {
         verify_tls: bool,
         tls: Option<&TlsConfig>,
     ) -> Result<Self, ErrorRendererBuildError> {
-        let mut builder = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(ERROR_CONNECT_TIMEOUT)
-            .read_timeout(ERROR_READ_TIMEOUT)
-            .timeout(ERROR_TOTAL_TIMEOUT)
-            .http1_only()
-            .danger_accept_invalid_certs(!verify_tls);
+        let mut roots = rustls::RootCertStore::empty();
         if let Some(path) = tls.and_then(|tls| tls.ca.as_ref()) {
             let pem = std::fs::read(path).map_err(|source| ErrorRendererBuildError::ReadTls {
                 kind: "CA certificate",
                 source,
             })?;
-            let certificate =
-                reqwest::Certificate::from_pem(&pem).map_err(ErrorRendererBuildError::InvalidCa)?;
-            builder = builder.add_root_certificate(certificate);
+            let certificates = rustls_pemfile::certs(&mut pem.as_slice())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| ErrorRendererBuildError::InvalidCa)?;
+            if certificates.is_empty() {
+                return Err(ErrorRendererBuildError::InvalidCa);
+            }
+            for certificate in certificates {
+                roots
+                    .add(certificate)
+                    .map_err(|_| ErrorRendererBuildError::InvalidCa)?;
+            }
+        } else {
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         }
+
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config_builder = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .map_err(|_| ErrorRendererBuildError::Client)?;
+        let config_builder = if verify_tls {
+            config_builder.with_root_certificates(roots)
+        } else {
+            config_builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoCertificateVerification {
+                    schemes: provider
+                        .signature_verification_algorithms
+                        .supported_schemes(),
+                }))
+        };
+        let mut client_identity = None;
         if let Some(tls) = tls {
             if let (Some(certificate), Some(key)) = (&tls.cert, &tls.key) {
-                let mut pem = std::fs::read(certificate).map_err(|source| {
+                let pem = std::fs::read(certificate).map_err(|source| {
                     ErrorRendererBuildError::ReadTls {
                         kind: "client certificate",
                         source,
                     }
                 })?;
-                pem.push(b'\n');
-                pem.extend(std::fs::read(key).map_err(|source| {
-                    ErrorRendererBuildError::ReadTls {
+                let certificates = rustls_pemfile::certs(&mut pem.as_slice())
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| ErrorRendererBuildError::InvalidIdentity)?;
+                let key_pem =
+                    std::fs::read(key).map_err(|source| ErrorRendererBuildError::ReadTls {
                         kind: "client key",
                         source,
-                    }
-                })?);
-                let identity = reqwest::Identity::from_pem(&pem)
-                    .map_err(ErrorRendererBuildError::InvalidIdentity)?;
-                builder = builder.identity(identity);
+                    })?;
+                let private_key = rustls_pemfile::private_key(&mut key_pem.as_slice())
+                    .map_err(|_| ErrorRendererBuildError::InvalidIdentity)?
+                    .ok_or(ErrorRendererBuildError::InvalidIdentity)?;
+                if certificates.is_empty() {
+                    return Err(ErrorRendererBuildError::InvalidIdentity);
+                }
+                client_identity = Some((certificates, private_key));
             }
         }
+        let tls_config = if let Some((certificates, private_key)) = client_identity {
+            config_builder
+                .with_client_auth_cert(certificates, private_key)
+                .map_err(|_| ErrorRendererBuildError::InvalidIdentity)?
+        } else {
+            config_builder.with_no_client_auth()
+        };
+        let mut connector = HttpConnector::new();
+        connector.set_connect_timeout(Some(ERROR_CONNECT_TIMEOUT));
+        connector.enforce_http(false);
+        let connector = HttpsConnectorBuilder::new()
+            .with_tls_config(tls_config)
+            .https_or_http()
+            .enable_http1()
+            .wrap_connector(connector);
         Ok(Self {
-            client: builder.build().map_err(ErrorRendererBuildError::Client)?,
+            connector,
             error_target,
             error_path,
         })
@@ -182,29 +272,52 @@ impl ProxyErrorRenderer {
         if !matches!(url.scheme(), "http" | "https") {
             return None;
         }
-        let mut response = self.client.get(url).send().await.ok()?;
-        let header_bytes = response_wire_header_bytes(&response)?;
-        if header_bytes > MAX_ERROR_HEADER_BYTES
-            || response
-                .content_length()
-                .is_some_and(|length| length > MAX_ERROR_BODY_BYTES as u64)
-        {
-            return None;
-        }
-        let content_type = response.headers().get(CONTENT_TYPE).cloned();
-        let content_encoding = response.headers().get(CONTENT_ENCODING).cloned();
-        let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await.ok()? {
-            if body.len().saturating_add(chunk.len()) > MAX_ERROR_BODY_BYTES {
+        tokio::time::timeout(ERROR_TOTAL_TIMEOUT, self.bounded_request(url))
+            .await
+            .ok()?
+    }
+
+    async fn bounded_request(&self, url: Url) -> Option<RenderedError> {
+        let uri = url.as_str().parse().ok()?;
+        let mut connector = self.connector.clone();
+        let stream = connector.call(uri).await.ok()?;
+        let mut stream = TokioIo::new(stream);
+        let request_target = match url.query() {
+            Some(query) => format!("{}?{query}", url.path()),
+            None => url.path().to_owned(),
+        };
+        let authority = &url[url::Position::BeforeHost..url::Position::AfterPort];
+        let request = format!(
+            "GET {request_target} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
+        );
+        tokio::time::timeout(ERROR_READ_TIMEOUT, stream.write_all(request.as_bytes()))
+            .await
+            .ok()?
+            .ok()?;
+
+        let mut response = Vec::new();
+        let mut chunk = [0_u8; 8192];
+        loop {
+            let count = tokio::time::timeout(ERROR_READ_TIMEOUT, stream.read(&mut chunk))
+                .await
+                .ok()?
+                .ok()?;
+            if count == 0 {
+                return parse_http_response(&response, true);
+            }
+            if response.len().saturating_add(count) > MAX_UNIX_WIRE_BYTES {
                 return None;
             }
-            body.extend_from_slice(&chunk);
+            response.extend_from_slice(&chunk[..count]);
+            if !response.windows(4).any(|bytes| bytes == b"\r\n\r\n")
+                && response.len() > MAX_ERROR_HEADER_BYTES
+            {
+                return None;
+            }
+            if let Some(rendered) = parse_http_response(&response, false) {
+                return Some(rendered);
+            }
         }
-        Some(RenderedError {
-            body: Bytes::from(body),
-            content_type,
-            content_encoding,
-        })
     }
 }
 
@@ -269,29 +382,43 @@ fn parse_http_response(response: &[u8], eof: bool) -> Option<RenderedError> {
     if header_end.saturating_add(4) > MAX_ERROR_HEADER_BYTES {
         return None;
     }
-    let headers = std::str::from_utf8(&response[..header_end]).ok()?;
+    let mut raw_headers = [httparse::EMPTY_HEADER; 128];
+    let mut parsed = httparse::Response::new(&mut raw_headers);
+    match parsed.parse(&response[..header_end + 4]).ok()? {
+        httparse::Status::Complete(consumed) if consumed == header_end + 4 => {}
+        _ => return None,
+    }
+    parsed.code?;
     let mut content_type = None;
     let mut content_encoding = None;
     let mut chunked = false;
     let mut content_length = None;
-    for line in headers.lines().skip(1) {
-        let (name, value) = line.split_once(':')?;
-        let value = value.trim();
-        if name.eq_ignore_ascii_case("content-type") {
-            content_type = HeaderValue::from_bytes(value.as_bytes()).ok();
-        } else if name.eq_ignore_ascii_case("content-encoding") {
-            content_encoding = HeaderValue::from_bytes(value.as_bytes()).ok();
-        } else if name.eq_ignore_ascii_case("transfer-encoding")
-            && value.eq_ignore_ascii_case("chunked")
-        {
+    for header in parsed.headers {
+        if header.name.eq_ignore_ascii_case("content-type") {
+            content_type = HeaderValue::from_bytes(header.value).ok();
+        } else if header.name.eq_ignore_ascii_case("content-encoding") {
+            content_encoding = HeaderValue::from_bytes(header.value).ok();
+        } else if header.name.eq_ignore_ascii_case("transfer-encoding") {
+            if chunked || !header.value.eq_ignore_ascii_case(b"chunked") {
+                return None;
+            }
             chunked = true;
-        } else if name.eq_ignore_ascii_case("content-length") {
-            let length = value.parse::<usize>().ok()?;
+        } else if header.name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some() {
+                return None;
+            }
+            let length = std::str::from_utf8(header.value)
+                .ok()?
+                .parse::<usize>()
+                .ok()?;
             if length > MAX_ERROR_BODY_BYTES {
                 return None;
             }
             content_length = Some(length);
         }
+    }
+    if chunked && content_length.is_some() {
+        return None;
     }
     let raw_body = &response[header_end + 4..];
     let body = if chunked {
@@ -397,24 +524,75 @@ fn open_bounded_regular_file(
     filename: &str,
     after_root_open: impl FnOnce(),
 ) -> Option<File> {
-    use rustix::fs::{open, openat, Mode, OFlags};
+    use std::path::Component;
 
-    let root = open(
-        root,
+    use rustix::fs::{fstat, open, openat, FileType, Mode, OFlags};
+
+    let mut directory = open(
+        if root.is_absolute() {
+            Path::new("/")
+        } else {
+            Path::new(".")
+        },
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
     )
     .ok()?;
     after_root_open();
-    let child = openat(
-        &root,
+    for component in root.components() {
+        match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(name) => {
+                directory = openat(
+                    &directory,
+                    name,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                    Mode::empty(),
+                )
+                .ok()?;
+            }
+            Component::ParentDir | Component::Prefix(_) => return None,
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let stat_flags = OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK;
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let stat_flags = OFlags::from_bits_retain(libc::O_EVTONLY as u32)
+        | OFlags::CLOEXEC
+        | OFlags::NOFOLLOW
+        | OFlags::NONBLOCK;
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    )))]
+    return None;
+
+    let stat_only = openat(&directory, filename, stat_flags, Mode::empty()).ok()?;
+    let before = fstat(&stat_only).ok()?;
+    if !FileType::from_raw_mode(before.st_mode).is_file()
+        || before.st_size < 0
+        || before.st_size as u64 > MAX_ERROR_BODY_BYTES as u64
+    {
+        return None;
+    }
+    let readable = openat(
+        &directory,
         filename,
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
         Mode::empty(),
     )
     .ok()?;
-    let file = File::from(child);
-    file.metadata().ok()?.is_file().then_some(file)
+    let after = fstat(&readable).ok()?;
+    if before.st_dev != after.st_dev
+        || before.st_ino != after.st_ino
+        || !FileType::from_raw_mode(after.st_mode).is_file()
+    {
+        return None;
+    }
+    Some(File::from(readable))
 }
 
 #[cfg(not(unix))]
@@ -428,37 +606,6 @@ fn open_bounded_regular_file(
     // supported macOS/Linux/Unix deployment targets. Other platforms fail
     // closed instead of falling back to a pathname check/open sequence.
     None
-}
-
-fn response_wire_header_bytes(response: &reqwest::Response) -> Option<usize> {
-    let version = match response.version() {
-        reqwest::Version::HTTP_09 => "HTTP/0.9",
-        reqwest::Version::HTTP_10 => "HTTP/1.0",
-        reqwest::Version::HTTP_11 => "HTTP/1.1",
-        _ => return None,
-    };
-    let reason = response
-        .extensions()
-        .get::<hyper::ext::ReasonPhrase>()
-        .map_or_else(
-            || {
-                response
-                    .status()
-                    .canonical_reason()
-                    .unwrap_or("")
-                    .as_bytes()
-            },
-            hyper::ext::ReasonPhrase::as_bytes,
-        );
-    let reason_separator = usize::from(!reason.is_empty());
-    let status_line = version.len() + 1 + 3 + reason_separator + reason.len() + 2;
-    let fields = response
-        .headers()
-        .iter()
-        .try_fold(0usize, |total, (name, value)| {
-            total.checked_add(name.as_str().len() + 2 + value.as_bytes().len() + 2)
-        })?;
-    status_line.checked_add(fields)?.checked_add(2)
 }
 
 fn reason_phrase(status: StatusCode) -> RenderedError {
@@ -477,8 +624,13 @@ fn reason_phrase(status: StatusCode) -> RenderedError {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
 
-    use super::{encode_uri_component, parse_http_response, read_bounded_file_sync_with_hook};
+    use super::{
+        encode_uri_component, parse_http_response, read_bounded_file_sync_with_hook,
+        ErrorRendererBuildError, ProxyErrorRenderer,
+    };
+    use crate::config::TlsConfig;
 
     #[test]
     fn uri_component_encoding_matches_javascript_encode_uri_component() {
@@ -486,6 +638,32 @@ mod tests {
             encode_uri_component("/!~*()'% already%20한글"),
             "%2F!~*()'%25%20already%2520%ED%95%9C%EA%B8%80"
         );
+
+        for invalid in [b"".as_slice(), b"not a PEM certificate".as_slice()] {
+            let directory = tempfile::tempdir().unwrap();
+            let ca = directory.path().join("ca.pem");
+            fs::write(&ca, invalid).unwrap();
+            let tls = TlsConfig {
+                key: None,
+                cert: None,
+                ca: Some(ca),
+                key_passphrase: None,
+                request_cert: false,
+                reject_unauthorized: true,
+                protocol: None,
+                ciphers: None,
+                dhparam: None,
+            };
+            let error = match ProxyErrorRenderer::with_tls_policy(None, None, true, Some(&tls)) {
+                Ok(_) => panic!("empty and malformed CA bundles must fail eagerly"),
+                Err(error) => error,
+            };
+            assert!(matches!(error, ErrorRendererBuildError::InvalidCa));
+            assert_eq!(
+                error.to_string(),
+                "invalid custom-error TLS CA certificate bundle"
+            );
+        }
     }
 
     #[test]
@@ -525,6 +703,32 @@ mod tests {
             result.is_none(),
             "a swapped symlink must never disclose its target"
         );
+
+        let traversed = directory.path().join("traversed");
+        let safe_parent = traversed.join("safe-parent");
+        let replacement_parent = traversed.join("replacement-parent");
+        fs::create_dir_all(safe_parent.join("errors")).unwrap();
+        fs::create_dir_all(&replacement_parent).unwrap();
+        fs::write(safe_parent.join("errors/404.html"), "safe ancestor").unwrap();
+        fs::write(replacement_parent.join("404.html"), "outside ancestor").unwrap();
+        let selected = traversed.join("selected");
+        std::os::unix::fs::symlink(&safe_parent, &selected).unwrap();
+        assert!(
+            read_bounded_file_sync_with_hook(&selected.join("errors"), "404.html", || {}).is_none(),
+            "every ancestor must reject symlinks, not only the final directory"
+        );
+
+        fs::remove_file(&selected).unwrap();
+        fs::rename(&safe_parent, &selected).unwrap();
+        let swapped =
+            read_bounded_file_sync_with_hook(&selected.join("errors"), "404.html", || {
+                fs::rename(&selected, traversed.join("detached-safe")).unwrap();
+                std::os::unix::fs::symlink(&replacement_parent, &selected).unwrap();
+            });
+        assert!(
+            swapped.is_none(),
+            "an intermediate parent swapped before traversal must be rejected"
+        );
     }
 
     #[cfg(unix)]
@@ -554,5 +758,10 @@ mod tests {
 
         let _socket = std::os::unix::net::UnixListener::bind(&fifo).unwrap();
         assert!(read_bounded_file_sync_with_hook(directory.path(), "404.html", || {}).is_none());
+
+        assert!(
+            read_bounded_file_sync_with_hook(Path::new("/dev"), "null", || {}).is_none(),
+            "character devices must be rejected before a readable open"
+        );
     }
 }

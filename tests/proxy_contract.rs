@@ -45,7 +45,7 @@ use pingora_reverse_proxy::metrics::Metrics;
 use pingora_reverse_proxy::proxy::ChpProxy;
 use pingora_reverse_proxy::route::RouteData;
 use pingora_reverse_proxy::route::RouteKey;
-use pingora_reverse_proxy::route_table::RouteRegistry;
+use pingora_reverse_proxy::route_table::{MutationSeal, RouteRegistry};
 use pingora_reverse_proxy::store::memory::MemoryStore;
 use pingora_reverse_proxy::store::{Store, StoreError};
 use pingora_reverse_proxy::upstream::{
@@ -85,6 +85,25 @@ async fn timed_read<R: AsyncReadExt + Unpin>(
         .await
         .expect(diagnostic)
         .expect(diagnostic)
+}
+
+async fn timed_read_until<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    buffer: &mut Vec<u8>,
+    ceiling: usize,
+    deadline: tokio::time::Instant,
+    diagnostic: &'static str,
+) -> usize {
+    assert!(buffer.len() < ceiling, "{diagnostic}: byte ceiling reached");
+    let old_len = buffer.len();
+    let read_len = (ceiling - old_len).min(8192);
+    buffer.resize(old_len + read_len, 0);
+    let count = tokio::time::timeout_at(deadline, reader.read(&mut buffer[old_len..]))
+        .await
+        .expect(diagnostic)
+        .expect(diagnostic);
+    buffer.truncate(old_len + count);
+    count
 }
 
 async fn timed_read_to_end<R: AsyncReadExt + Unpin>(
@@ -144,6 +163,12 @@ async fn timed_join<T>(task: tokio::task::JoinHandle<T>, diagnostic: &'static st
         .expect(diagnostic)
 }
 
+async fn timed_activity_flush(writer: &ActivityWriter) {
+    tokio::time::timeout(RAW_NETWORK_TIMEOUT, writer.flush())
+        .await
+        .expect("activity writer flush timed out");
+}
+
 struct ReservedPort {
     listener: Option<StdTcpListener>,
     address: StdSocketAddr,
@@ -182,7 +207,7 @@ impl EchoServer {
                 listener,
                 Router::new().fallback(any_route(move |request: AxumRequest| async move {
                     let (parts, body) = request.into_parts();
-                    let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+                    let body = axum::body::to_bytes(body, 2 * 1024 * 1024).await.unwrap();
                     if parts.uri.path().ends_with("/redirect-body") {
                         return (
                             StatusCode::FOUND,
@@ -341,6 +366,7 @@ impl pingora::server::ShutdownSignalWatch for TestShutdown {
 }
 
 struct ProxyHarness {
+    store: Arc<MemoryStore>,
     registry: Arc<RouteRegistry>,
     activity: ActivityWriter,
     base_url: String,
@@ -365,8 +391,8 @@ impl ProxyHarness {
             ];
             argv.extend_from_slice(arguments);
             let config = AppConfig::try_from(Cli::try_parse_from(argv).unwrap()).unwrap();
-            let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
-            let registry = RouteRegistry::load(store).await.unwrap();
+            let store = Arc::new(MemoryStore::new());
+            let registry = RouteRegistry::load(store.clone()).await.unwrap();
             for (key, target) in routes {
                 registry
                     .add(
@@ -399,6 +425,7 @@ impl ProxyHarness {
             while tokio::time::Instant::now() < deadline {
                 if exact_health_ready(&client, &base_url).await {
                     return Self {
+                        store,
                         registry,
                         activity,
                         base_url,
@@ -439,7 +466,7 @@ impl ProxyHarness {
     async fn wait_for_activity_after(&self, key: &str, before: chrono::DateTime<chrono::Utc>) {
         for _ in 0..100 {
             if self.route(key).last_activity > before {
-                self.activity.flush().await;
+                timed_activity_flush(&self.activity).await;
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -955,9 +982,14 @@ async fn network_default_target_is_a_persisted_root_route_with_activity_policy()
         .get(&root)
         .expect("default target must be visible as the registry root route");
     assert_eq!(installed.target, upstream.target("/default/"));
+    let persisted = harness.store.snapshot().await.unwrap();
+    assert_eq!(persisted.get(&root), Some(&installed));
+    let reloaded = RouteRegistry::load(harness.store.clone()).await.unwrap();
+    assert_eq!(reloaded.all(), harness.registry.all());
+    assert_eq!(reloaded.resolve("/restart").unwrap().key, root);
     let response = harness.get("/eligible").await;
     assert_eq!(response.status(), StatusCode::OK);
-    harness.activity.flush().await;
+    timed_activity_flush(&harness.activity).await;
     assert!(harness.registry.get(&root).unwrap().last_activity > installed.last_activity);
 
     let mut unavailable = ReservedPort::new();
@@ -974,7 +1006,7 @@ async fn network_default_target_is_a_persisted_root_route_with_activity_policy()
         harness.get("/ineligible").await.status(),
         StatusCode::SERVICE_UNAVAILABLE
     );
-    harness.activity.flush().await;
+    timed_activity_flush(&harness.activity).await;
     assert_eq!(
         harness.registry.get(&root).unwrap().last_activity,
         installed.last_activity
@@ -1084,15 +1116,17 @@ async fn network_request_body_is_forwarded_incrementally_before_downstream_compl
         let (mut stream, _) =
             timed_accept(&listener, "incremental upstream accept timed out").await;
         let mut received = Vec::new();
-        let mut chunk = [0; 1024];
+        let first_deadline = tokio::time::Instant::now() + RAW_NETWORK_TIMEOUT;
         loop {
-            let count = timed_read(
+            let count = timed_read_until(
                 &mut stream,
-                &mut chunk,
-                "incremental upstream read timed out",
+                &mut received,
+                64 * 1024,
+                first_deadline,
+                "incremental upstream first-body phase timed out",
             )
             .await;
-            received.extend_from_slice(&chunk[..count]);
+            assert!(count > 0);
             if received
                 .windows(b"first".len())
                 .any(|part| part == b"first")
@@ -1101,15 +1135,17 @@ async fn network_request_body_is_forwarded_incrementally_before_downstream_compl
             }
         }
         let _ = first_tx.send(());
+        let completion_deadline = tokio::time::Instant::now() + RAW_NETWORK_TIMEOUT;
         while !received.windows(5).any(|part| part == b"0\r\n\r\n") {
-            let count = timed_read(
+            let count = timed_read_until(
                 &mut stream,
-                &mut chunk,
-                "incremental upstream completion read timed out",
+                &mut received,
+                64 * 1024,
+                completion_deadline,
+                "incremental upstream completion phase timed out",
             )
             .await;
             assert!(count > 0);
-            received.extend_from_slice(&chunk[..count]);
         }
         timed_write_all(
             &mut stream,
@@ -1162,12 +1198,21 @@ async fn network_request_body_is_forwarded_incrementally_before_downstream_compl
 
 async fn read_raw_response(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
     let mut response = Vec::new();
-    let mut chunk = [0; 1024];
+    let deadline = tokio::time::Instant::now() + RAW_NETWORK_TIMEOUT;
+    const MAX_RAW_RESPONSE_HEADER: usize = 64 * 1024;
+    const MAX_RAW_RESPONSE_BODY: usize = 2 * 1024 * 1024;
     loop {
-        let count = timed_read(stream, &mut chunk, "raw response read timed out").await;
-        assert!(count > 0);
-        response.extend_from_slice(&chunk[..count]);
+        let count = timed_read_until(
+            stream,
+            &mut response,
+            MAX_RAW_RESPONSE_HEADER + MAX_RAW_RESPONSE_BODY,
+            deadline,
+            "raw response total deadline elapsed",
+        )
+        .await;
+        assert!(count > 0, "raw response ended before its declared body");
         let Some(header_end) = response.windows(4).position(|part| part == b"\r\n\r\n") else {
+            assert!(response.len() <= MAX_RAW_RESPONSE_HEADER);
             continue;
         };
         let headers = std::str::from_utf8(&response[..header_end]).unwrap();
@@ -1180,7 +1225,9 @@ async fn read_raw_response(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
                 })
             })
             .unwrap();
+        assert!(length <= MAX_RAW_RESPONSE_BODY);
         if response.len() >= header_end + 4 + length {
+            response.truncate(header_end + 4 + length);
             return response;
         }
     }
@@ -1199,17 +1246,18 @@ async fn network_reuses_the_same_downstream_socket_and_upstream_connection() {
         let (mut stream, _) = timed_accept(&listener, "reuse upstream accept timed out").await;
         task_accepts.fetch_add(1, Ordering::Relaxed);
         let mut buffered = Vec::new();
-        let mut chunk = [0; 1024];
+        let requests_deadline = tokio::time::Instant::now() + RAW_NETWORK_TIMEOUT;
         for _ in 0..2 {
             while !buffered.windows(4).any(|part| part == b"\r\n\r\n") {
-                let count = timed_read(
+                let count = timed_read_until(
                     &mut stream,
-                    &mut chunk,
-                    "reuse upstream request read timed out",
+                    &mut buffered,
+                    128 * 1024,
+                    requests_deadline,
+                    "reuse upstream requests phase timed out",
                 )
                 .await;
                 assert!(count > 0);
-                buffered.extend_from_slice(&chunk[..count]);
             }
             let end = buffered
                 .windows(4)
@@ -1588,7 +1636,12 @@ async fn network_custom_and_file_errors_follow_chp_fallback_policy() {
     let files = ProxyHarness::start(
         &[
             "--error-path".to_owned(),
-            directory.path().to_string_lossy().into_owned(),
+            directory
+                .path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
         ],
         &[],
     )
@@ -1616,7 +1669,12 @@ async fn network_custom_and_file_errors_follow_chp_fallback_policy() {
     let unavailable_files = ProxyHarness::start(
         &[
             "--error-path".to_owned(),
-            directory.path().to_string_lossy().into_owned(),
+            directory
+                .path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
         ],
         &[("/unavailable", unavailable_target)],
     )
@@ -1780,6 +1838,30 @@ async fn network_custom_error_slow_and_oversized_responses_fall_back_within_boun
         harness.get("/missing").await.text().await.unwrap(),
         "Not Found"
     );
+
+    for oversized_raw_header in [
+        format!(
+            "HTTP/1.1 200 OK\r\nX-OWS:{}x\r\nContent-Length: 4\r\n\r\nleak",
+            " \t".repeat(9 * 1024)
+        ),
+        format!(
+            "HTTP/1.1 200 OK\r\nX-Noncanonical {}: x\r\nContent-Length: 4\r\n\r\nleak",
+            " ".repeat(17 * 1024)
+        ),
+    ] {
+        let oversized =
+            RawErrorServer::start(oversized_raw_header.into_bytes(), Duration::ZERO).await;
+        let harness = ProxyHarness::start(
+            &["--error-target".to_owned(), oversized.target("/errors/")],
+            &[],
+        )
+        .await;
+        assert_eq!(
+            harness.get("/missing").await.text().await.unwrap(),
+            "Not Found"
+        );
+        timed_join(oversized.task, "raw oversized-header server did not join").await;
+    }
 }
 
 fn exact_wire_header_response(wire_header_bytes: usize) -> Vec<u8> {
@@ -1812,7 +1894,8 @@ async fn network_custom_error_wire_header_bound_is_exact_for_http_https_and_unix
         .await;
         assert_eq!(
             harness.get("/missing").await.text().await.unwrap(),
-            expected
+            expected,
+            "HTTP wire-header boundary {wire_header_bytes}"
         );
         tokio::time::timeout(Duration::from_secs(2), server.task)
             .await
@@ -1970,7 +2053,12 @@ async fn network_error_files_are_bounded_and_cannot_escape_the_configured_direct
     let harness = ProxyHarness::start(
         &[
             "--error-path".to_owned(),
-            directory.path().to_string_lossy().into_owned(),
+            directory
+                .path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
         ],
         &[],
     )
@@ -2217,6 +2305,7 @@ async fn network_unix_custom_error_target_uses_get_and_copies_only_content_heade
 struct FailingActivityStore {
     routes: tokio::sync::RwLock<BTreeMap<RouteKey, RouteData>>,
     attempts: AtomicUsize,
+    panic_on_update: AtomicBool,
 }
 
 #[async_trait]
@@ -2251,6 +2340,9 @@ impl Store for FailingActivityStore {
         _at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), StoreError> {
         self.attempts.fetch_add(1, Ordering::Relaxed);
+        if self.panic_on_update.swap(false, Ordering::AcqRel) {
+            panic!("backend activity mutation panicked");
+        }
         Err(StoreError::message("activity persistence unavailable"))
     }
 
@@ -2276,6 +2368,7 @@ async fn activity_memory_update_is_immediate_coalesced_and_survives_persistence_
             },
         )])),
         attempts: AtomicUsize::new(0),
+        panic_on_update: AtomicBool::new(false),
     });
     let registry = RouteRegistry::load(store.clone()).await.unwrap();
     let metrics = Arc::new(Metrics::new());
@@ -2293,11 +2386,40 @@ async fn activity_memory_update_is_immediate_coalesced_and_survives_persistence_
         observed.extra["unknown"],
         serde_json::json!({"preserved": true})
     );
-    writer.flush().await;
+    timed_activity_flush(&writer).await;
     assert_eq!(store.attempts.load(Ordering::Relaxed), 1);
     assert_eq!(writer.persistence_errors(), 1);
     assert_eq!(metrics.snapshot().activity_persistence_failures, 1);
     assert_eq!(registry.get(&key).unwrap().last_activity, newest);
+
+    let panic_store = Arc::new(FailingActivityStore {
+        routes: tokio::sync::RwLock::new(BTreeMap::from([(
+            key.clone(),
+            RouteData {
+                target: "http://panic.example".to_owned(),
+                last_activity: initial,
+                extra: Default::default(),
+            },
+        )])),
+        attempts: AtomicUsize::new(0),
+        panic_on_update: AtomicBool::new(true),
+    });
+    let panic_registry = RouteRegistry::load(panic_store.clone()).await.unwrap();
+    let panic_writer = ActivityWriter::start(Arc::clone(&panic_registry), 1);
+    panic_writer.record_at(&key, first);
+    timed_activity_flush(&panic_writer).await;
+    assert_eq!(panic_writer.persistence_errors(), 1);
+    assert_eq!(
+        panic_registry.mutation_status().seal,
+        MutationSeal::BackendPanic
+    );
+    assert_eq!(panic_registry.mutation_status().active_mutations, 0);
+
+    panic_writer.record_at(&key, newest);
+    timed_activity_flush(&panic_writer).await;
+    assert_eq!(panic_writer.persistence_errors(), 2);
+    assert_eq!(panic_store.attempts.load(Ordering::Relaxed), 1);
+    assert_eq!(panic_registry.mutation_status().active_mutations, 0);
 }
 
 struct StalledActivityStore {
@@ -2388,7 +2510,7 @@ async fn activity_pending_keys_are_bounded_and_recover_with_newest_accepted_time
     assert_eq!(metrics.snapshot().activity_dropped, 1);
 
     store.release.add_permits(3);
-    writer.flush().await;
+    timed_activity_flush(&writer).await;
     let writes = store.writes.lock().unwrap().clone();
     assert_eq!(writes.len(), 3);
     assert!(writes.contains(&(keys[1].clone(), newest)));
@@ -2486,7 +2608,7 @@ async fn assert_activity_and_management_are_persisted_in_order(
         .unwrap()
         .with_timezone(&chrono::Utc);
     let activity_at = initial + chrono::Duration::seconds(4);
-    let replacement_at = initial + chrono::Duration::seconds(9);
+    let replacement_at = initial + chrono::Duration::seconds(2);
     let store = Arc::new(OrderedPersistenceStore {
         routes: tokio::sync::RwLock::new(BTreeMap::from([(
             key.clone(),
@@ -2545,7 +2667,13 @@ async fn assert_activity_and_management_are_persisted_in_order(
             .unwrap()
             .forget();
         management_task = start_management();
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while registry.mutation_status().active_mutations < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("management mutation was not admitted behind activity");
         assert_eq!(store.operations(), vec![PersistenceOperation::Activity]);
     } else {
         management_task = start_management();
@@ -2555,11 +2683,17 @@ async fn assert_activity_and_management_are_persisted_in_order(
             .unwrap()
             .forget();
         writer.record_at(&key, activity_at);
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while registry.mutation_status().active_mutations < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("activity mutation was not admitted behind management");
         assert_eq!(store.operations(), vec![management]);
     }
 
-    store.release.add_permits(1);
+    store.release.add_permits(4);
     if activity_first || management != PersistenceOperation::Delete {
         tokio::time::timeout(Duration::from_secs(1), async {
             while store.operations().len() < 2 {
@@ -2569,7 +2703,9 @@ async fn assert_activity_and_management_are_persisted_in_order(
         .await
         .expect("serialized second backend operation did not enter");
     }
-    writer.flush().await;
+    tokio::time::timeout(Duration::from_secs(1), writer.flush())
+        .await
+        .expect("activity writer did not flush within its bound");
     tokio::time::timeout(Duration::from_secs(1), management_task)
         .await
         .expect("management task did not join")
@@ -2587,14 +2723,8 @@ async fn assert_activity_and_management_are_persisted_in_order(
         PersistenceOperation::Add | PersistenceOperation::Put => {
             let route = persisted.get(&key).unwrap();
             assert_eq!(route.target, "http://new.example");
-            assert_eq!(
-                route.last_activity,
-                if activity_first {
-                    replacement_at
-                } else {
-                    replacement_at.max(activity_at)
-                }
-            );
+            assert_eq!(route.last_activity, replacement_at.max(activity_at));
+            assert_eq!(registry.get(&key).unwrap(), route.clone());
         }
         PersistenceOperation::Delete => assert!(!persisted.contains_key(&key)),
         PersistenceOperation::Activity => unreachable!(),
