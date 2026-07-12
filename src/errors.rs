@@ -1,5 +1,6 @@
 //! CHP-compatible proxy error rendering.
 
+use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -13,6 +14,7 @@ use pingora::proxy::Session;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use url::Url;
 
+use crate::config::TlsConfig;
 use crate::upstream::Target;
 
 const ERROR_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
@@ -55,29 +57,72 @@ pub struct ProxyErrorRenderer {
     error_path: Option<PathBuf>,
 }
 
-impl ProxyErrorRenderer {
-    pub fn new(error_target: Option<Url>, error_path: Option<PathBuf>) -> Self {
-        Self::with_tls_verification(error_target, error_path, true)
-    }
+/// A typed, redacted failure while configuring the custom-error HTTP client.
+#[derive(Debug, thiserror::Error)]
+pub enum ErrorRendererBuildError {
+    #[error("failed to read custom-error TLS {kind}")]
+    ReadTls {
+        kind: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("invalid custom-error TLS CA certificate")]
+    InvalidCa(#[source] reqwest::Error),
+    #[error("invalid custom-error TLS client identity")]
+    InvalidIdentity(#[source] reqwest::Error),
+    #[error("failed to build custom-error HTTP client")]
+    Client(#[source] reqwest::Error),
+}
 
-    /// Build a renderer using the proxy's configured upstream certificate policy.
-    pub fn with_tls_verification(
+impl ProxyErrorRenderer {
+    /// Build a renderer using the proxy's complete upstream TLS policy.
+    pub fn with_tls_policy(
         error_target: Option<Url>,
         error_path: Option<PathBuf>,
         verify_tls: bool,
-    ) -> Self {
-        Self {
-            client: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .connect_timeout(ERROR_CONNECT_TIMEOUT)
-                .read_timeout(ERROR_READ_TIMEOUT)
-                .timeout(ERROR_TOTAL_TIMEOUT)
-                .danger_accept_invalid_certs(!verify_tls)
-                .build()
-                .expect("fixed custom error HTTP client configuration is valid"),
+        tls: Option<&TlsConfig>,
+    ) -> Result<Self, ErrorRendererBuildError> {
+        let mut builder = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(ERROR_CONNECT_TIMEOUT)
+            .read_timeout(ERROR_READ_TIMEOUT)
+            .timeout(ERROR_TOTAL_TIMEOUT)
+            .http1_only()
+            .danger_accept_invalid_certs(!verify_tls);
+        if let Some(path) = tls.and_then(|tls| tls.ca.as_ref()) {
+            let pem = std::fs::read(path).map_err(|source| ErrorRendererBuildError::ReadTls {
+                kind: "CA certificate",
+                source,
+            })?;
+            let certificate =
+                reqwest::Certificate::from_pem(&pem).map_err(ErrorRendererBuildError::InvalidCa)?;
+            builder = builder.add_root_certificate(certificate);
+        }
+        if let Some(tls) = tls {
+            if let (Some(certificate), Some(key)) = (&tls.cert, &tls.key) {
+                let mut pem = std::fs::read(certificate).map_err(|source| {
+                    ErrorRendererBuildError::ReadTls {
+                        kind: "client certificate",
+                        source,
+                    }
+                })?;
+                pem.push(b'\n');
+                pem.extend(std::fs::read(key).map_err(|source| {
+                    ErrorRendererBuildError::ReadTls {
+                        kind: "client key",
+                        source,
+                    }
+                })?);
+                let identity = reqwest::Identity::from_pem(&pem)
+                    .map_err(ErrorRendererBuildError::InvalidIdentity)?;
+                builder = builder.identity(identity);
+            }
+        }
+        Ok(Self {
+            client: builder.build().map_err(ErrorRendererBuildError::Client)?,
             error_target,
             error_path,
-        }
+        })
     }
 
     pub async fn respond(
@@ -138,11 +183,7 @@ impl ProxyErrorRenderer {
             return None;
         }
         let mut response = self.client.get(url).send().await.ok()?;
-        let header_bytes = response
-            .headers()
-            .iter()
-            .map(|(name, value)| name.as_str().len() + value.as_bytes().len() + 4)
-            .sum::<usize>();
+        let header_bytes = response_wire_header_bytes(&response)?;
         if header_bytes > MAX_ERROR_HEADER_BYTES
             || response
                 .content_length()
@@ -225,7 +266,7 @@ async fn unix_custom_error(_url: &Url) -> Option<RenderedError> {
 
 fn parse_http_response(response: &[u8], eof: bool) -> Option<RenderedError> {
     let header_end = response.windows(4).position(|bytes| bytes == b"\r\n\r\n")?;
-    if header_end > MAX_ERROR_HEADER_BYTES {
+    if header_end.saturating_add(4) > MAX_ERROR_HEADER_BYTES {
         return None;
     }
     let headers = std::str::from_utf8(&response[..header_end]).ok()?;
@@ -327,15 +368,18 @@ async fn read_bounded_file(root: PathBuf, filename: String) -> Option<Bytes> {
 }
 
 fn read_bounded_file_sync(root: &Path, filename: &str) -> Option<Bytes> {
+    read_bounded_file_sync_with_hook(root, filename, || {})
+}
+
+fn read_bounded_file_sync_with_hook(
+    root: &Path,
+    filename: &str,
+    after_root_open: impl FnOnce(),
+) -> Option<Bytes> {
     if Path::new(filename).components().count() != 1 {
         return None;
     }
-    let root = root.canonicalize().ok()?;
-    let path = root.join(filename).canonicalize().ok()?;
-    if !path.starts_with(&root) {
-        return None;
-    }
-    let mut file = std::fs::File::open(path).ok()?;
+    let mut file = open_bounded_regular_file(root, filename, after_root_open)?;
     if file.metadata().ok()?.len() > MAX_ERROR_BODY_BYTES as u64 {
         return None;
     }
@@ -345,6 +389,76 @@ fn read_bounded_file_sync(root: &Path, filename: &str) -> Option<Bytes> {
         .read_to_end(&mut body)
         .ok()?;
     (body.len() <= MAX_ERROR_BODY_BYTES).then(|| Bytes::from(body))
+}
+
+#[cfg(unix)]
+fn open_bounded_regular_file(
+    root: &Path,
+    filename: &str,
+    after_root_open: impl FnOnce(),
+) -> Option<File> {
+    use rustix::fs::{open, openat, Mode, OFlags};
+
+    let root = open(
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .ok()?;
+    after_root_open();
+    let child = openat(
+        &root,
+        filename,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .ok()?;
+    let file = File::from(child);
+    file.metadata().ok()?.is_file().then_some(file)
+}
+
+#[cfg(not(unix))]
+fn open_bounded_regular_file(
+    _root: &Path,
+    _filename: &str,
+    after_root_open: impl FnOnce(),
+) -> Option<File> {
+    after_root_open();
+    // Secure descriptor-relative, no-follow traversal is implemented for the
+    // supported macOS/Linux/Unix deployment targets. Other platforms fail
+    // closed instead of falling back to a pathname check/open sequence.
+    None
+}
+
+fn response_wire_header_bytes(response: &reqwest::Response) -> Option<usize> {
+    let version = match response.version() {
+        reqwest::Version::HTTP_09 => "HTTP/0.9",
+        reqwest::Version::HTTP_10 => "HTTP/1.0",
+        reqwest::Version::HTTP_11 => "HTTP/1.1",
+        _ => return None,
+    };
+    let reason = response
+        .extensions()
+        .get::<hyper::ext::ReasonPhrase>()
+        .map_or_else(
+            || {
+                response
+                    .status()
+                    .canonical_reason()
+                    .unwrap_or("")
+                    .as_bytes()
+            },
+            hyper::ext::ReasonPhrase::as_bytes,
+        );
+    let reason_separator = usize::from(!reason.is_empty());
+    let status_line = version.len() + 1 + 3 + reason_separator + reason.len() + 2;
+    let fields = response
+        .headers()
+        .iter()
+        .try_fold(0usize, |total, (name, value)| {
+            total.checked_add(name.as_str().len() + 2 + value.as_bytes().len() + 2)
+        })?;
+    status_line.checked_add(fields)?.checked_add(2)
 }
 
 fn reason_phrase(status: StatusCode) -> RenderedError {
@@ -362,7 +476,9 @@ fn reason_phrase(status: StatusCode) -> RenderedError {
 
 #[cfg(test)]
 mod tests {
-    use super::encode_uri_component;
+    use std::fs;
+
+    use super::{encode_uri_component, parse_http_response, read_bounded_file_sync_with_hook};
 
     #[test]
     fn uri_component_encoding_matches_javascript_encode_uri_component() {
@@ -370,5 +486,73 @@ mod tests {
             encode_uri_component("/!~*()'% already%20한글"),
             "%2F!~*()'%25%20already%2520%ED%95%9C%EA%B8%80"
         );
+    }
+
+    #[test]
+    fn wire_header_limit_includes_status_line_and_final_delimiter() {
+        let prefix = b"HTTP/1.1 200 OK\r\nX-Fill: ";
+        let suffix = b"\r\n\r\nbody";
+        for (wire_header_bytes, accepted) in [
+            (16 * 1024 - 1, true),
+            (16 * 1024, true),
+            (16 * 1024 + 1, false),
+        ] {
+            let mut response = prefix.to_vec();
+            response.extend(vec![b'x'; wire_header_bytes - prefix.len() - 4]);
+            response.extend_from_slice(suffix);
+            assert_eq!(
+                parse_http_response(&response, true).is_some(),
+                accepted,
+                "unexpected result for {wire_header_bytes} wire header bytes"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_relative_open_defeats_a_deterministic_symlink_swap() {
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        fs::write(outside.path(), "outside secret").unwrap();
+        fs::write(directory.path().join("404.html"), "safe").unwrap();
+
+        let result = read_bounded_file_sync_with_hook(directory.path(), "404.html", || {
+            fs::remove_file(directory.path().join("404.html")).unwrap();
+            std::os::unix::fs::symlink(outside.path(), directory.path().join("404.html")).unwrap();
+        });
+
+        assert!(
+            result.is_none(),
+            "a swapped symlink must never disclose its target"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn special_error_files_are_rejected_without_blocking() {
+        use std::os::unix::fs::FileTypeExt as _;
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        let directory = tempfile::tempdir().unwrap();
+        let fifo = directory.path().join("404.html");
+        let status = Command::new("mkfifo").arg(&fifo).status().unwrap();
+        assert!(status.success());
+        assert!(fs::metadata(&fifo).unwrap().file_type().is_fifo());
+
+        let started = Instant::now();
+        assert!(read_bounded_file_sync_with_hook(directory.path(), "404.html", || {}).is_none());
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "FIFO rejection blocked the error-rendering worker"
+        );
+
+        fs::remove_file(&fifo).unwrap();
+        fs::create_dir(&fifo).unwrap();
+        assert!(read_bounded_file_sync_with_hook(directory.path(), "404.html", || {}).is_none());
+        fs::remove_dir(&fifo).unwrap();
+
+        let _socket = std::os::unix::net::UnixListener::bind(&fifo).unwrap();
+        assert!(read_bounded_file_sync_with_hook(directory.path(), "404.html", || {}).is_none());
     }
 }

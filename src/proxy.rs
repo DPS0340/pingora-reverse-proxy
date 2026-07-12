@@ -15,9 +15,10 @@ use url::Url;
 
 use crate::activity::ActivityWriter;
 use crate::config::{AppConfig, ProxyOptions};
-use crate::errors::{ProxyErrorClass, ProxyErrorRenderer};
+use crate::errors::{ErrorRendererBuildError, ProxyErrorClass, ProxyErrorRenderer};
 use crate::route::RouteKey;
 use crate::route_table::RouteRegistry;
+use crate::store::StoreError;
 use crate::upstream::{
     apply_forwarded_headers, apply_request_headers, build_upstream_uri, rewrite_location,
     ForwardedContext, Target, TargetError, TlsClientConfig, UpstreamRoute,
@@ -56,15 +57,16 @@ impl Default for RequestContext {
 /// Failure while constructing the immutable proxy service.
 #[derive(Debug, ThisError)]
 pub enum ProxyBuildError {
-    #[error("invalid default upstream target")]
-    InvalidDefaultTarget(#[source] TargetError),
+    #[error("failed to install the default route")]
+    DefaultRoute(#[source] StoreError),
+    #[error("failed to configure custom error rendering")]
+    ErrorRenderer(#[source] ErrorRendererBuildError),
 }
 
 /// CHP routing and policy implemented through Pingora's official callbacks.
 pub struct ChpProxy {
     registry: Arc<RouteRegistry>,
     options: ProxyOptions,
-    default_target: Option<Target>,
     tls: TlsClientConfig,
     errors: ProxyErrorRenderer,
     activity: ActivityWriter,
@@ -72,17 +74,11 @@ pub struct ChpProxy {
 }
 
 impl ChpProxy {
-    pub fn from_config(
+    pub async fn from_config(
         registry: Arc<RouteRegistry>,
         config: &AppConfig,
         activity: ActivityWriter,
     ) -> Result<Self, ProxyBuildError> {
-        let default_target = config
-            .default_target
-            .as_ref()
-            .map(Target::parse)
-            .transpose()
-            .map_err(ProxyBuildError::InvalidDefaultTarget)?;
         let client_tls = config.client_tls.as_ref();
         let connection_timeout = config.proxy.timeout_ms.map(Duration::from_millis);
         let proxy_timeout = config.proxy.proxy_timeout_ms.map(Duration::from_millis);
@@ -101,16 +97,28 @@ impl ChpProxy {
             client_certificate: client_tls.and_then(|tls| tls.cert.clone()),
             client_key: client_tls.and_then(|tls| tls.key.clone()),
         };
+        let errors = ProxyErrorRenderer::with_tls_policy(
+            config.error_target.clone(),
+            config.error_path.clone(),
+            config.proxy.verify_upstream_tls,
+            config.client_tls.as_ref(),
+        )
+        .map_err(ProxyBuildError::ErrorRenderer)?;
+        if let Some(default_target) = &config.default_target {
+            registry
+                .add(
+                    route_key("/"),
+                    default_target.as_str().to_owned(),
+                    Default::default(),
+                )
+                .await
+                .map_err(ProxyBuildError::DefaultRoute)?;
+        }
         Ok(Self {
             registry,
             options: config.proxy.clone(),
-            default_target,
             tls,
-            errors: ProxyErrorRenderer::with_tls_verification(
-                config.error_target.clone(),
-                config.error_path.clone(),
-                config.proxy.verify_upstream_tls,
-            ),
+            errors,
             activity,
             downstream_protocol: if config.public_tls.is_some() {
                 "https"
@@ -148,10 +156,7 @@ impl ChpProxy {
             ctx.resolved_route_key = Some(matched.key.clone());
             return Ok(Some(UpstreamRoute::new(matched.key, target)));
         }
-        Ok(self
-            .default_target
-            .clone()
-            .map(|target| UpstreamRoute::new(route_key("/"), target)))
+        Ok(None)
     }
 
     async fn send_health(session: &mut Session) -> pingora::Result<()> {

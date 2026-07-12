@@ -604,7 +604,13 @@ impl RouteRegistry {
         key: &RouteKey,
         at: DateTime<Utc>,
     ) -> Result<(), StoreError> {
-        self.store.update_activity(key, at).await
+        let _mutation_guard = self.mutation.lock().await;
+        let Some(current) = self.get(key) else {
+            return Ok(());
+        };
+        self.store
+            .update_activity(key, current.last_activity.max(at))
+            .await
     }
 
     /// Persist a route replacement and publish it atomically on success.

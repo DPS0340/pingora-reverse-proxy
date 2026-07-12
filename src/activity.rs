@@ -77,11 +77,8 @@ impl ActivityWriter {
                         break;
                     }
                     for (key, pending_at) in pending {
-                        let at = worker_registry
-                            .get(&key)
-                            .map_or(pending_at, |route| route.last_activity.max(pending_at));
                         if worker_registry
-                            .persist_observed_activity(&key, at)
+                            .persist_observed_activity(&key, pending_at)
                             .await
                             .is_err()
                         {

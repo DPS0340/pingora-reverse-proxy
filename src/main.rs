@@ -68,7 +68,7 @@ fn run() -> Result<(), StartupError> {
     let metrics = Arc::new(Metrics::new());
     let activity = runtime
         .block_on(async { ActivityWriter::start_with_metrics(Arc::clone(&registry), 64, metrics) });
-    let proxy = ChpProxy::from_config(registry, &config, activity)?;
+    let proxy = runtime.block_on(ChpProxy::from_config(registry, &config, activity))?;
 
     let mut server = Server::new(None).map_err(|error| StartupError::Pingora(error.to_string()))?;
     server.bootstrap();

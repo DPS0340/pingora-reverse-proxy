@@ -16,6 +16,11 @@ use openssl::asn1::Asn1Time;
 use openssl::bn::{BigNum, MsbOption};
 use openssl::rsa::Rsa;
 use openssl::ssl::{SslAcceptor, SslMethod};
+use openssl::ssl::{SslVerifyMode, SslVersion};
+use openssl::x509::extension::{
+    AuthorityKeyIdentifier, BasicConstraints, ExtendedKeyUsage, KeyUsage, SubjectAlternativeName,
+    SubjectKeyIdentifier,
+};
 use pingora::protocols::l4::socket::SocketAddr;
 use pingora::tls::{
     hash::MessageDigest,
@@ -47,6 +52,97 @@ use pingora_reverse_proxy::upstream::{
     apply_forwarded_headers, apply_request_headers, build_upstream_uri, rewrite_location,
     ForwardedContext, Target, TargetError, TlsClientConfig, UpstreamRoute,
 };
+
+const RAW_NETWORK_TIMEOUT: Duration = Duration::from_secs(3);
+
+async fn timed_accept(
+    listener: &tokio::net::TcpListener,
+    diagnostic: &'static str,
+) -> (tokio::net::TcpStream, StdSocketAddr) {
+    tokio::time::timeout(RAW_NETWORK_TIMEOUT, listener.accept())
+        .await
+        .expect(diagnostic)
+        .expect(diagnostic)
+}
+
+#[cfg(unix)]
+async fn timed_unix_accept(
+    listener: &tokio::net::UnixListener,
+    diagnostic: &'static str,
+) -> (tokio::net::UnixStream, tokio::net::unix::SocketAddr) {
+    tokio::time::timeout(RAW_NETWORK_TIMEOUT, listener.accept())
+        .await
+        .expect(diagnostic)
+        .expect(diagnostic)
+}
+
+async fn timed_read<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    buffer: &mut [u8],
+    diagnostic: &'static str,
+) -> usize {
+    tokio::time::timeout(RAW_NETWORK_TIMEOUT, reader.read(buffer))
+        .await
+        .expect(diagnostic)
+        .expect(diagnostic)
+}
+
+async fn timed_read_to_end<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    buffer: &mut Vec<u8>,
+    diagnostic: &'static str,
+) {
+    tokio::time::timeout(RAW_NETWORK_TIMEOUT, reader.read_to_end(buffer))
+        .await
+        .expect(diagnostic)
+        .expect(diagnostic);
+}
+
+async fn timed_write_all<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    buffer: &[u8],
+    diagnostic: &'static str,
+) {
+    tokio::time::timeout(RAW_NETWORK_TIMEOUT, writer.write_all(buffer))
+        .await
+        .expect(diagnostic)
+        .expect(diagnostic);
+}
+
+async fn timed_write_all_allow_disconnect<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    buffer: &[u8],
+    diagnostic: &'static str,
+) {
+    let result = tokio::time::timeout(RAW_NETWORK_TIMEOUT, writer.write_all(buffer))
+        .await
+        .expect(diagnostic);
+    if let Err(error) = result {
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+            ),
+            "{diagnostic}: {error}"
+        );
+    }
+}
+
+async fn timed_flush<W: AsyncWriteExt + Unpin>(writer: &mut W, diagnostic: &'static str) {
+    tokio::time::timeout(RAW_NETWORK_TIMEOUT, writer.flush())
+        .await
+        .expect(diagnostic)
+        .expect(diagnostic);
+}
+
+async fn timed_join<T>(task: tokio::task::JoinHandle<T>, diagnostic: &'static str) -> T {
+    tokio::time::timeout(RAW_NETWORK_TIMEOUT, task)
+        .await
+        .expect(diagnostic)
+        .expect(diagnostic)
+}
 
 struct ReservedPort {
     listener: Option<StdTcpListener>,
@@ -282,8 +378,9 @@ impl ProxyHarness {
                     .unwrap();
             }
             let activity = ActivityWriter::start(Arc::clone(&registry), 1);
-            let proxy =
-                ChpProxy::from_config(Arc::clone(&registry), &config, activity.clone()).unwrap();
+            let proxy = ChpProxy::from_config(Arc::clone(&registry), &config, activity.clone())
+                .await
+                .unwrap();
             let stop = Arc::new(AtomicBool::new(false));
             let thread_stop = Arc::clone(&stop);
             reservation.release();
@@ -315,7 +412,7 @@ impl ProxyHarness {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             stop.store(true, Ordering::Release);
-            let _ = thread.join();
+            join_thread_with_timeout(thread, "failed Pingora bind attempt did not stop");
         }
         panic!("in-process Pingora server did not bind and pass exact health after retries");
     }
@@ -355,7 +452,7 @@ impl Drop for ProxyHarness {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            join_thread_with_timeout(thread, "Pingora test server did not stop");
         }
     }
 }
@@ -381,17 +478,22 @@ impl CustomErrorProbe {
         let task_requests = Arc::clone(&requests);
         let task = tokio::spawn(async move {
             loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    break;
-                };
+                let (mut stream, _) =
+                    timed_accept(&listener, "custom-error probe accept timed out").await;
                 task_requests.fetch_add(1, Ordering::Relaxed);
                 let mut request = [0; 1024];
-                let _ = stream.read(&mut request).await;
-                let _ = stream
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\ncustom error",
-                    )
-                    .await;
+                timed_read(
+                    &mut stream,
+                    &mut request,
+                    "custom-error probe read timed out",
+                )
+                .await;
+                timed_write_all(
+                    &mut stream,
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\ncustom error",
+                    "custom-error probe write timed out",
+                )
+                .await;
             }
         });
         Self {
@@ -430,12 +532,23 @@ impl RawErrorServer {
         let address = listener.local_addr().unwrap();
         let (request_tx, request) = oneshot::channel();
         let task = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
+            let (mut stream, _) =
+                timed_accept(&listener, "raw custom-error server accept timed out").await;
             let mut bytes = vec![0; 32 * 1024];
-            let count = stream.read(&mut bytes).await.unwrap();
+            let count = timed_read(
+                &mut stream,
+                &mut bytes,
+                "raw custom-error request read timed out",
+            )
+            .await;
             let _ = request_tx.send(String::from_utf8_lossy(&bytes[..count]).into_owned());
             tokio::time::sleep(delay).await;
-            let _ = stream.write_all(&response).await;
+            timed_write_all_allow_disconnect(
+                &mut stream,
+                &response,
+                "raw custom-error response write timed out",
+            )
+            .await;
         });
         Self {
             address,
@@ -455,15 +568,20 @@ async fn partial_response_upstream() -> (String, tokio::task::JoinHandle<()>) {
         .unwrap();
     let address = listener.local_addr().unwrap();
     let task = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
+        let (mut stream, _) = timed_accept(&listener, "partial upstream accept timed out").await;
         let mut request = [0; 1024];
-        let _ = stream.read(&mut request).await.unwrap();
-        stream
-            .write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\npartial-200",
-            )
-            .await
-            .unwrap();
+        timed_read(
+            &mut stream,
+            &mut request,
+            "partial upstream request read timed out",
+        )
+        .await;
+        timed_write_all(
+            &mut stream,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\npartial-200",
+            "partial upstream response write timed out",
+        )
+        .await;
     });
     (format!("http://{address}"), task)
 }
@@ -474,9 +592,14 @@ async fn stalled_request_upstream() -> (String, tokio::task::JoinHandle<()>) {
         .unwrap();
     let address = listener.local_addr().unwrap();
     let task = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
+        let (mut stream, _) = timed_accept(&listener, "stalled upstream accept timed out").await;
         let mut request = [0; 1024];
-        let _ = stream.read(&mut request).await;
+        timed_read(
+            &mut stream,
+            &mut request,
+            "stalled upstream request read timed out",
+        )
+        .await;
         tokio::time::sleep(Duration::from_millis(250)).await;
     });
     (format!("http://{address}"), task)
@@ -511,16 +634,222 @@ fn https_error_server(response: Vec<u8>) -> (String, JoinHandle<()>) {
     let acceptor = acceptor.build();
     let listener = StdTcpListener::bind(("127.0.0.1", 0)).unwrap();
     let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
     let thread = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "HTTPS server accept timed out"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("HTTPS server accept failed: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         let Ok(mut stream) = acceptor.accept(stream) else {
             return;
         };
         let mut request = [0; 2048];
-        let _ = std::io::Read::read(&mut stream, &mut request);
-        let _ = std::io::Write::write_all(&mut stream, &response);
+        std::io::Read::read(&mut stream, &mut request).expect("HTTPS request read timed out");
+        if let Err(error) = std::io::Write::write_all(&mut stream, &response) {
+            assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                ),
+                "HTTPS response write failed: {error}"
+            );
+        }
     });
     (format!("https://{address}/errors/"), thread)
+}
+
+fn signed_certificate(
+    common_name: &str,
+    key: &PKey<openssl::pkey::Private>,
+    issuer: Option<(&X509, &PKey<openssl::pkey::Private>)>,
+    server: bool,
+) -> X509 {
+    let mut name = X509NameBuilder::new().unwrap();
+    name.append_entry_by_text("CN", common_name).unwrap();
+    let name = name.build();
+    let mut certificate = X509::builder().unwrap();
+    certificate.set_version(2).unwrap();
+    let mut serial = BigNum::new().unwrap();
+    serial.rand(64, MsbOption::MAYBE_ZERO, false).unwrap();
+    certificate
+        .set_serial_number(&serial.to_asn1_integer().unwrap())
+        .unwrap();
+    certificate.set_subject_name(&name).unwrap();
+    certificate
+        .set_issuer_name(issuer.map_or(&name, |(issuer, _)| issuer.subject_name()))
+        .unwrap();
+    certificate.set_pubkey(key).unwrap();
+    certificate
+        .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+        .unwrap();
+    certificate
+        .set_not_after(&Asn1Time::days_from_now(1).unwrap())
+        .unwrap();
+    if issuer.is_none() {
+        certificate
+            .append_extension(BasicConstraints::new().critical().ca().build().unwrap())
+            .unwrap();
+        certificate
+            .append_extension(
+                KeyUsage::new()
+                    .critical()
+                    .key_cert_sign()
+                    .crl_sign()
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        let extension = {
+            let context = certificate.x509v3_context(None, None);
+            SubjectKeyIdentifier::new().build(&context).unwrap()
+        };
+        certificate.append_extension(extension).unwrap();
+    } else {
+        certificate
+            .append_extension(BasicConstraints::new().critical().build().unwrap())
+            .unwrap();
+        let extension = {
+            let context = certificate
+                .x509v3_context(issuer.map(|(certificate, _)| certificate.as_ref()), None);
+            AuthorityKeyIdentifier::new()
+                .keyid(true)
+                .issuer(true)
+                .build(&context)
+                .unwrap()
+        };
+        certificate.append_extension(extension).unwrap();
+        certificate
+            .append_extension(
+                KeyUsage::new()
+                    .critical()
+                    .digital_signature()
+                    .key_encipherment()
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        let extended_key_usage = if server {
+            ExtendedKeyUsage::new().server_auth().build().unwrap()
+        } else {
+            ExtendedKeyUsage::new().client_auth().build().unwrap()
+        };
+        certificate.append_extension(extended_key_usage).unwrap();
+        if server {
+            let extension = {
+                let context = certificate
+                    .x509v3_context(issuer.map(|(certificate, _)| certificate.as_ref()), None);
+                SubjectAlternativeName::new()
+                    .ip("127.0.0.1")
+                    .dns("localhost")
+                    .build(&context)
+                    .unwrap()
+            };
+            certificate.append_extension(extension).unwrap();
+        }
+    }
+    let signer = issuer.map_or(key, |(_, key)| key);
+    certificate.sign(signer, MessageDigest::sha256()).unwrap();
+    certificate.build()
+}
+
+fn private_ca_mtls_error_server(
+    directory: &tempfile::TempDir,
+    response: Vec<u8>,
+) -> (String, PathBuf, PathBuf, PathBuf, JoinHandle<()>) {
+    let ca_key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+    let ca = signed_certificate("task-7-private-ca", &ca_key, None, false);
+    let server_key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+    let server = signed_certificate("localhost", &server_key, Some((&ca, &ca_key)), true);
+    let client_key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+    let client = signed_certificate("task-7-client", &client_key, Some((&ca, &ca_key)), false);
+
+    let ca_path = directory.path().join("ca.pem");
+    let client_path = directory.path().join("client.pem");
+    let key_path = directory.path().join("client-key.pem");
+    fs::write(&ca_path, ca.to_pem().unwrap()).unwrap();
+    fs::write(&client_path, client.to_pem().unwrap()).unwrap();
+    fs::write(&key_path, client_key.private_key_to_pem_pkcs8().unwrap()).unwrap();
+
+    let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
+    acceptor
+        .set_min_proto_version(Some(SslVersion::TLS1_2))
+        .unwrap();
+    acceptor
+        .set_max_proto_version(Some(SslVersion::TLS1_2))
+        .unwrap();
+    acceptor.set_private_key(&server_key).unwrap();
+    acceptor.set_certificate(&server).unwrap();
+    acceptor.cert_store_mut().add_cert(ca).unwrap();
+    acceptor.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+    acceptor.check_private_key().unwrap();
+    let acceptor = acceptor.build();
+    let listener = StdTcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let thread = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "mTLS server accept timed out"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("mTLS server accept failed: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let Ok(mut stream) = acceptor.accept(stream) else {
+            return;
+        };
+        let mut request = [0; 2048];
+        std::io::Read::read(&mut stream, &mut request).expect("mTLS request read timed out");
+        std::io::Write::write_all(&mut stream, &response).expect("mTLS response write timed out");
+    });
+    (
+        format!("https://localhost:{}/errors/", address.port()),
+        ca_path,
+        client_path,
+        key_path,
+        thread,
+    )
+}
+
+fn join_thread_with_timeout(thread: JoinHandle<()>, diagnostic: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while !thread.is_finished() {
+        assert!(std::time::Instant::now() < deadline, "{diagnostic}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    thread.join().unwrap();
 }
 
 impl ChunkedUpstream {
@@ -534,26 +863,44 @@ impl ChunkedUpstream {
             .unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
+            let (mut stream, _) =
+                timed_accept(&listener, "chunked upstream accept timed out").await;
             let mut request = vec![0; 4096];
-            let _ = stream.read(&mut request).await.unwrap();
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
-                )
-                .await
-                .unwrap();
+            timed_read(
+                &mut stream,
+                &mut request,
+                "chunked upstream request read timed out",
+            )
+            .await;
+            timed_write_all(
+                &mut stream,
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                "chunked upstream headers write timed out",
+            )
+            .await;
             for chunk in chunks {
-                stream
-                    .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
-                    .await
-                    .unwrap();
-                stream.write_all(chunk).await.unwrap();
-                stream.write_all(b"\r\n").await.unwrap();
-                stream.flush().await.unwrap();
+                timed_write_all(
+                    &mut stream,
+                    format!("{:x}\r\n", chunk.len()).as_bytes(),
+                    "chunked upstream size write timed out",
+                )
+                .await;
+                timed_write_all(&mut stream, chunk, "chunked upstream body write timed out").await;
+                timed_write_all(
+                    &mut stream,
+                    b"\r\n",
+                    "chunked upstream delimiter write timed out",
+                )
+                .await;
+                timed_flush(&mut stream, "chunked upstream flush timed out").await;
                 tokio::time::sleep(chunk_delay).await;
             }
-            stream.write_all(b"0\r\n\r\n").await.unwrap();
+            timed_write_all(
+                &mut stream,
+                b"0\r\n\r\n",
+                "chunked upstream end write timed out",
+            )
+            .await;
         });
         Self { address, task }
     }
@@ -595,6 +942,47 @@ async fn network_binary_proxies_default_route_and_health_takes_precedence() {
 
 #[tokio::test]
 #[serial_test::serial]
+async fn network_default_target_is_a_persisted_root_route_with_activity_policy() {
+    let upstream = EchoServer::start().await;
+    let harness = ProxyHarness::start(
+        &["--default-target".to_owned(), upstream.target("/default/")],
+        &[],
+    )
+    .await;
+    let root = RouteKey::parse("/").unwrap();
+    let installed = harness
+        .registry
+        .get(&root)
+        .expect("default target must be visible as the registry root route");
+    assert_eq!(installed.target, upstream.target("/default/"));
+    let response = harness.get("/eligible").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    harness.activity.flush().await;
+    assert!(harness.registry.get(&root).unwrap().last_activity > installed.last_activity);
+
+    let mut unavailable = ReservedPort::new();
+    let harness = ProxyHarness::start(
+        &[
+            "--default-target".to_owned(),
+            format!("http://{}", unavailable.release()),
+        ],
+        &[],
+    )
+    .await;
+    let installed = harness.registry.get(&root).unwrap();
+    assert_eq!(
+        harness.get("/ineligible").await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    harness.activity.flush().await;
+    assert_eq!(
+        harness.registry.get(&root).unwrap().last_activity,
+        installed.last_activity
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn network_binary_without_route_returns_404() {
     let proxy = ProxyProcess::start(&[]).await;
     let response = proxy.get("/missing").await;
@@ -619,30 +1007,51 @@ async fn network_registered_route_streams_request_and_applies_forwarding_policy(
     let before = harness.route("/external").last_activity;
     let url = Url::parse(&harness.url("/external/tree?q=%2F")).unwrap();
     let address = (url.host_str().unwrap(), url.port().unwrap());
-    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
-    let host = format!("{}:{}", url.host_str().unwrap(), url.port().unwrap());
-    stream
-        .write_all(
-            format!(
-                "POST /external/tree?q=%2F HTTP/1.1\r\nHost: {host}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
-            )
-            .as_bytes(),
-        )
-        .await
-        .unwrap();
-    for chunk in [b"streamed-".as_slice(), b"request".as_slice()] {
-        stream
-            .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+    let mut stream =
+        tokio::time::timeout(RAW_NETWORK_TIMEOUT, tokio::net::TcpStream::connect(address))
             .await
-            .unwrap();
-        stream.write_all(chunk).await.unwrap();
-        stream.write_all(b"\r\n").await.unwrap();
-        stream.flush().await.unwrap();
+            .expect("streaming client connect timed out")
+            .expect("streaming client connect failed");
+    let host = format!("{}:{}", url.host_str().unwrap(), url.port().unwrap());
+    timed_write_all(
+        &mut stream,
+        format!(
+            "POST /external/tree?q=%2F HTTP/1.1\r\nHost: {host}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        )
+        .as_bytes(),
+        "streaming request headers write timed out",
+    )
+    .await;
+    for chunk in [b"streamed-".as_slice(), b"request".as_slice()] {
+        timed_write_all(
+            &mut stream,
+            format!("{:x}\r\n", chunk.len()).as_bytes(),
+            "streaming request chunk size write timed out",
+        )
+        .await;
+        timed_write_all(&mut stream, chunk, "streaming request body write timed out").await;
+        timed_write_all(
+            &mut stream,
+            b"\r\n",
+            "streaming request delimiter write timed out",
+        )
+        .await;
+        timed_flush(&mut stream, "streaming request flush timed out").await;
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    stream.write_all(b"0\r\n\r\n").await.unwrap();
+    timed_write_all(
+        &mut stream,
+        b"0\r\n\r\n",
+        "streaming request end write timed out",
+    )
+    .await;
     let mut response = Vec::new();
-    stream.read_to_end(&mut response).await.unwrap();
+    timed_read_to_end(
+        &mut stream,
+        &mut response,
+        "streaming response read timed out",
+    )
+    .await;
     let body_offset = response
         .windows(4)
         .position(|bytes| bytes == b"\r\n\r\n")
@@ -672,11 +1081,17 @@ async fn network_request_body_is_forwarded_incrementally_before_downstream_compl
     let address = listener.local_addr().unwrap();
     let (first_tx, first_rx) = oneshot::channel();
     let upstream = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
+        let (mut stream, _) =
+            timed_accept(&listener, "incremental upstream accept timed out").await;
         let mut received = Vec::new();
         let mut chunk = [0; 1024];
         loop {
-            let count = stream.read(&mut chunk).await.unwrap();
+            let count = timed_read(
+                &mut stream,
+                &mut chunk,
+                "incremental upstream read timed out",
+            )
+            .await;
             received.extend_from_slice(&chunk[..count]);
             if received
                 .windows(b"first".len())
@@ -687,48 +1102,69 @@ async fn network_request_body_is_forwarded_incrementally_before_downstream_compl
         }
         let _ = first_tx.send(());
         while !received.windows(5).any(|part| part == b"0\r\n\r\n") {
-            let count = stream.read(&mut chunk).await.unwrap();
+            let count = timed_read(
+                &mut stream,
+                &mut chunk,
+                "incremental upstream completion read timed out",
+            )
+            .await;
             assert!(count > 0);
             received.extend_from_slice(&chunk[..count]);
         }
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
-            .await
-            .unwrap();
+        timed_write_all(
+            &mut stream,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            "incremental upstream response write timed out",
+        )
+        .await;
     });
     let harness =
         ProxyHarness::start(&[], &[("/stream-request", format!("http://{address}"))]).await;
     let url = Url::parse(&harness.base_url).unwrap();
-    let mut client = tokio::net::TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
-        .await
-        .unwrap();
-    client
-        .write_all(
-            format!(
-                "POST /stream-request HTTP/1.1\r\nHost: {}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nfirst\r\n",
-                url.authority()
-            )
-            .as_bytes(),
+    let mut client = tokio::time::timeout(
+        RAW_NETWORK_TIMEOUT,
+        tokio::net::TcpStream::connect((url.host_str().unwrap(), url.port().unwrap())),
+    )
+    .await
+    .expect("incremental client connect timed out")
+    .expect("incremental client connect failed");
+    timed_write_all(
+        &mut client,
+        format!(
+            "POST /stream-request HTTP/1.1\r\nHost: {}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nfirst\r\n",
+            url.authority()
         )
-        .await
-        .unwrap();
-    client.flush().await.unwrap();
+        .as_bytes(),
+        "incremental client first write timed out",
+    )
+    .await;
+    timed_flush(&mut client, "incremental client flush timed out").await;
     tokio::time::timeout(Duration::from_millis(500), first_rx)
         .await
         .expect("upstream sees the first chunk before the request is complete")
         .unwrap();
-    client.write_all(b"6\r\nsecond\r\n0\r\n\r\n").await.unwrap();
+    timed_write_all(
+        &mut client,
+        b"6\r\nsecond\r\n0\r\n\r\n",
+        "incremental client final write timed out",
+    )
+    .await;
     let mut response = Vec::new();
-    client.read_to_end(&mut response).await.unwrap();
+    timed_read_to_end(
+        &mut client,
+        &mut response,
+        "incremental client response read timed out",
+    )
+    .await;
     assert!(response.starts_with(b"HTTP/1.1 200"));
-    upstream.await.unwrap();
+    timed_join(upstream, "incremental upstream task did not join").await;
 }
 
 async fn read_raw_response(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
     let mut response = Vec::new();
     let mut chunk = [0; 1024];
     loop {
-        let count = stream.read(&mut chunk).await.unwrap();
+        let count = timed_read(stream, &mut chunk, "raw response read timed out").await;
         assert!(count > 0);
         response.extend_from_slice(&chunk[..count]);
         let Some(header_end) = response.windows(4).position(|part| part == b"\r\n\r\n") else {
@@ -760,13 +1196,18 @@ async fn network_reuses_the_same_downstream_socket_and_upstream_connection() {
     let accepts = Arc::new(AtomicUsize::new(0));
     let task_accepts = Arc::clone(&accepts);
     let upstream = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
+        let (mut stream, _) = timed_accept(&listener, "reuse upstream accept timed out").await;
         task_accepts.fetch_add(1, Ordering::Relaxed);
         let mut buffered = Vec::new();
         let mut chunk = [0; 1024];
         for _ in 0..2 {
             while !buffered.windows(4).any(|part| part == b"\r\n\r\n") {
-                let count = stream.read(&mut chunk).await.unwrap();
+                let count = timed_read(
+                    &mut stream,
+                    &mut chunk,
+                    "reuse upstream request read timed out",
+                )
+                .await;
                 assert!(count > 0);
                 buffered.extend_from_slice(&chunk[..count]);
             }
@@ -776,35 +1217,39 @@ async fn network_reuses_the_same_downstream_socket_and_upstream_connection() {
                 .unwrap()
                 + 4;
             buffered.drain(..end);
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok",
-                )
-                .await
-                .unwrap();
+            timed_write_all(
+                &mut stream,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok",
+                "reuse upstream response write timed out",
+            )
+            .await;
         }
     });
     let harness = ProxyHarness::start(&[], &[("/reuse", format!("http://{address}"))]).await;
     let url = Url::parse(&harness.base_url).unwrap();
-    let mut client = tokio::net::TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
-        .await
-        .unwrap();
+    let mut client = tokio::time::timeout(
+        RAW_NETWORK_TIMEOUT,
+        tokio::net::TcpStream::connect((url.host_str().unwrap(), url.port().unwrap())),
+    )
+    .await
+    .expect("reuse client connect timed out")
+    .expect("reuse client connect failed");
     for index in 0..2 {
-        client
-            .write_all(
-                format!(
-                    "GET /reuse/{index} HTTP/1.1\r\nHost: {}\r\nConnection: keep-alive\r\n\r\n",
-                    url.authority()
-                )
-                .as_bytes(),
+        timed_write_all(
+            &mut client,
+            format!(
+                "GET /reuse/{index} HTTP/1.1\r\nHost: {}\r\nConnection: keep-alive\r\n\r\n",
+                url.authority()
             )
-            .await
-            .unwrap();
+            .as_bytes(),
+            "reuse client request write timed out",
+        )
+        .await;
         let response = read_raw_response(&mut client).await;
         assert!(response.starts_with(b"HTTP/1.1 200"));
         assert!(response.ends_with(b"ok"));
     }
-    upstream.await.unwrap();
+    timed_join(upstream, "reuse upstream task did not join").await;
     assert_eq!(accepts.load(Ordering::Relaxed), 1);
 }
 
@@ -1000,21 +1445,30 @@ async fn network_proxy_failures_never_render_after_response_start_or_downstream_
     )
     .await;
     let url = Url::parse(&partial.url("/partial")).unwrap();
-    let mut stream = tokio::net::TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
-        .await
-        .unwrap();
-    stream
-        .write_all(
-            format!(
-                "GET /partial HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-                url.authority()
-            )
-            .as_bytes(),
+    let mut stream = tokio::time::timeout(
+        RAW_NETWORK_TIMEOUT,
+        tokio::net::TcpStream::connect((url.host_str().unwrap(), url.port().unwrap())),
+    )
+    .await
+    .expect("partial-response client connect timed out")
+    .expect("partial-response client connect failed");
+    timed_write_all(
+        &mut stream,
+        format!(
+            "GET /partial HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            url.authority()
         )
-        .await
-        .unwrap();
+        .as_bytes(),
+        "partial-response request write timed out",
+    )
+    .await;
     let mut response = Vec::new();
-    stream.read_to_end(&mut response).await.unwrap();
+    timed_read_to_end(
+        &mut stream,
+        &mut response,
+        "partial-response read timed out",
+    )
+    .await;
     assert!(response.starts_with(b"HTTP/1.1 200"));
     assert_eq!(
         response
@@ -1024,7 +1478,7 @@ async fn network_proxy_failures_never_render_after_response_start_or_downstream_
         1,
         "a partial success response must not be followed by a second status"
     );
-    partial_task.await.unwrap();
+    timed_join(partial_task, "partial-response upstream task did not join").await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(errors.request_count(), 0);
 
@@ -1035,21 +1489,25 @@ async fn network_proxy_failures_never_render_after_response_start_or_downstream_
     )
     .await;
     let url = Url::parse(&disconnected.url("/disconnect")).unwrap();
-    let mut stream = tokio::net::TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
-        .await
-        .unwrap();
-    stream
-        .write_all(
-            format!(
-                "POST /disconnect HTTP/1.1\r\nHost: {}\r\nContent-Length: 100\r\n\r\nx",
-                url.authority()
-            )
-            .as_bytes(),
+    let mut stream = tokio::time::timeout(
+        RAW_NETWORK_TIMEOUT,
+        tokio::net::TcpStream::connect((url.host_str().unwrap(), url.port().unwrap())),
+    )
+    .await
+    .expect("disconnect client connect timed out")
+    .expect("disconnect client connect failed");
+    timed_write_all(
+        &mut stream,
+        format!(
+            "POST /disconnect HTTP/1.1\r\nHost: {}\r\nContent-Length: 100\r\n\r\nx",
+            url.authority()
         )
-        .await
-        .unwrap();
+        .as_bytes(),
+        "disconnect request write timed out",
+    )
+    .await;
     drop(stream);
-    stalled_task.await.unwrap();
+    timed_join(stalled_task, "stalled upstream task did not join").await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
         errors.request_count(),
@@ -1218,30 +1676,41 @@ async fn network_custom_error_url_preserves_literal_target_shape_and_uri_compone
         let target = server.target(suffix);
         let harness = ProxyHarness::start(&["--error-target".to_owned(), target], &[]).await;
         let url = Url::parse(&harness.base_url).unwrap();
-        let mut stream =
-            tokio::net::TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
-                .await
-                .unwrap();
-        stream
-            .write_all(
-                format!(
-                    "GET /special/!~*()'%25 HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-                    url.authority()
-                )
-                .as_bytes(),
+        let mut stream = tokio::time::timeout(
+            RAW_NETWORK_TIMEOUT,
+            tokio::net::TcpStream::connect((url.host_str().unwrap(), url.port().unwrap())),
+        )
+        .await
+        .expect("custom URL client connect timed out")
+        .expect("custom URL client connect failed");
+        timed_write_all(
+            &mut stream,
+            format!(
+                "GET /special/!~*()'%25 HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                url.authority()
             )
-            .await
-            .unwrap();
+            .as_bytes(),
+            "custom URL request write timed out",
+        )
+        .await;
         let mut response = Vec::new();
-        stream.read_to_end(&mut response).await.unwrap();
+        timed_read_to_end(
+            &mut stream,
+            &mut response,
+            "custom URL response read timed out",
+        )
+        .await;
         assert!(response.starts_with(b"HTTP/1.1 404"));
         let RawErrorServer { request, task, .. } = server;
-        let request = request.await.unwrap();
+        let request = tokio::time::timeout(RAW_NETWORK_TIMEOUT, request)
+            .await
+            .expect("custom URL request capture timed out")
+            .unwrap();
         assert!(
             request.starts_with(&format!("GET {expected} HTTP/1.1\r\n")),
             "unexpected custom error request for target suffix {suffix:?}: {request:?}"
         );
-        task.await.unwrap();
+        timed_join(task, "custom URL server task did not join").await;
     }
 }
 
@@ -1313,6 +1782,75 @@ async fn network_custom_error_slow_and_oversized_responses_fall_back_within_boun
     );
 }
 
+fn exact_wire_header_response(wire_header_bytes: usize) -> Vec<u8> {
+    let prefix = b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nX-Fill: ";
+    let mut response = prefix.to_vec();
+    response.extend(vec![b'x'; wire_header_bytes - prefix.len() - 4]);
+    response.extend_from_slice(b"\r\n\r\naccepted");
+    response
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn network_custom_error_wire_header_bound_is_exact_for_http_https_and_unix() {
+    for wire_header_bytes in [16 * 1024 - 1, 16 * 1024, 16 * 1024 + 1] {
+        let expected = if wire_header_bytes <= 16 * 1024 {
+            "accepted"
+        } else {
+            "Not Found"
+        };
+
+        let server = RawErrorServer::start(
+            exact_wire_header_response(wire_header_bytes),
+            Duration::ZERO,
+        )
+        .await;
+        let harness = ProxyHarness::start(
+            &["--error-target".to_owned(), server.target("/errors/")],
+            &[],
+        )
+        .await;
+        assert_eq!(
+            harness.get("/missing").await.text().await.unwrap(),
+            expected
+        );
+        tokio::time::timeout(Duration::from_secs(2), server.task)
+            .await
+            .expect("HTTP boundary server task did not join")
+            .unwrap();
+
+        let (target, server) = https_error_server(exact_wire_header_response(wire_header_bytes));
+        let harness = ProxyHarness::start(
+            &["--insecure".to_owned(), "--error-target".to_owned(), target],
+            &[],
+        )
+        .await;
+        assert_eq!(
+            harness.get("/missing").await.text().await.unwrap(),
+            expected
+        );
+        join_thread_with_timeout(server, "HTTPS boundary server thread did not join");
+
+        #[cfg(unix)]
+        {
+            let (_directory, target, task) = unix_error_server(
+                exact_wire_header_response(wire_header_bytes),
+                Duration::ZERO,
+            )
+            .await;
+            let harness = ProxyHarness::start(&["--error-target".to_owned(), target], &[]).await;
+            assert_eq!(
+                harness.get("/missing").await.text().await.unwrap(),
+                expected
+            );
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .expect("Unix boundary server task did not join")
+                .unwrap();
+        }
+    }
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn network_https_custom_errors_support_insecure_success_and_verified_failure() {
@@ -1326,14 +1864,14 @@ async fn network_https_custom_errors_support_insecure_success_and_verified_failu
     let response = harness.get("/missing").await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(response.text().await.unwrap(), "tls error");
-    server.join().unwrap();
+    join_thread_with_timeout(server, "insecure HTTPS custom-error server did not join");
 
     let (target, server) = https_error_server(success);
     let harness = ProxyHarness::start(&["--error-target".to_owned(), target], &[]).await;
     let response = harness.get("/missing").await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(response.text().await.unwrap(), "Not Found");
-    server.join().unwrap();
+    join_thread_with_timeout(server, "verified-failure HTTPS server did not join");
 
     let large = vec![b'x'; 1_048_577];
     let mut fixed = format!(
@@ -1352,7 +1890,7 @@ async fn network_https_custom_errors_support_insecure_success_and_verified_failu
         harness.get("/missing").await.text().await.unwrap(),
         "Not Found"
     );
-    server.join().unwrap();
+    join_thread_with_timeout(server, "fixed-size HTTPS server did not join");
 
     let mut chunked =
         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();
@@ -1369,7 +1907,56 @@ async fn network_https_custom_errors_support_insecure_success_and_verified_failu
         harness.get("/missing").await.text().await.unwrap(),
         "Not Found"
     );
-    server.join().unwrap();
+    join_thread_with_timeout(server, "chunked HTTPS server did not join");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn network_https_custom_errors_apply_private_ca_and_client_identity() {
+    let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 10\r\nConnection: close\r\n\r\nmtls error".to_vec();
+    let directory = tempfile::tempdir().unwrap();
+    let (target, ca, certificate, key, server) =
+        private_ca_mtls_error_server(&directory, response.clone());
+    let harness = ProxyHarness::start(
+        &[
+            "--error-target".to_owned(),
+            target,
+            "--client-ssl-ca".to_owned(),
+            ca.to_string_lossy().into_owned(),
+            "--client-ssl-cert".to_owned(),
+            certificate.to_string_lossy().into_owned(),
+            "--client-ssl-key".to_owned(),
+            key.to_string_lossy().into_owned(),
+        ],
+        &[],
+    )
+    .await;
+    let rendered = harness.get("/missing").await;
+    assert_eq!(rendered.status(), StatusCode::NOT_FOUND);
+    let rendered = rendered.text().await.unwrap();
+    join_thread_with_timeout(server, "verified mTLS custom-error server did not finish");
+    assert_eq!(rendered, "mtls error");
+
+    let failed_directory = tempfile::tempdir().unwrap();
+    let (target, ca, _certificate, _key, server) =
+        private_ca_mtls_error_server(&failed_directory, response);
+    let harness = ProxyHarness::start(
+        &[
+            "--error-target".to_owned(),
+            target,
+            "--client-ssl-ca".to_owned(),
+            ca.to_string_lossy().into_owned(),
+        ],
+        &[],
+    )
+    .await;
+    let rendered = harness.get("/missing").await;
+    assert_eq!(rendered.status(), StatusCode::NOT_FOUND);
+    assert_eq!(rendered.text().await.unwrap(), "Not Found");
+    join_thread_with_timeout(
+        server,
+        "failed client-auth custom-error server did not finish",
+    );
 }
 
 #[cfg(unix)]
@@ -1399,6 +1986,33 @@ async fn network_error_files_are_bounded_and_cannot_escape_the_configured_direct
         harness.get("/missing").await.text().await.unwrap(),
         "Not Found"
     );
+
+    fs::remove_file(directory.path().join("404.html")).unwrap();
+    let fifo = directory.path().join("404.html");
+    assert!(Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success());
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let client = reqwest::Client::new();
+        for _ in 0..8 {
+            let mut requests = tokio::task::JoinSet::new();
+            for _ in 0..16 {
+                let client = client.clone();
+                let url = harness.url("/missing");
+                requests.spawn(async move {
+                    client.get(url).send().await.unwrap().text().await.unwrap()
+                });
+            }
+            while let Some(response) = requests.join_next().await {
+                assert_eq!(response.unwrap(), "Not Found");
+            }
+        }
+    })
+    .await
+    .expect("FIFO error-file rejection blocked or exhausted the worker pool");
+    assert!(exact_health_ready(&reqwest::Client::new(), &harness.base_url).await);
 }
 
 #[cfg(unix)]
@@ -1410,11 +2024,22 @@ async fn unix_error_server(
     let socket_path = directory.path().join("bounded-errors.sock");
     let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
     let task = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
+        let (mut stream, _) =
+            timed_unix_accept(&listener, "Unix custom-error server accept timed out").await;
         let mut request = [0; 2048];
-        let _ = stream.read(&mut request).await;
+        timed_read(
+            &mut stream,
+            &mut request,
+            "Unix custom-error request read timed out",
+        )
+        .await;
         tokio::time::sleep(delay).await;
-        let _ = stream.write_all(&response).await;
+        timed_write_all_allow_disconnect(
+            &mut stream,
+            &response,
+            "Unix custom-error response write timed out",
+        )
+        .await;
     });
     let encoded = socket_path.to_string_lossy().replace('/', "%2F");
     (directory, format!("http+unix://{encoded}/errors/"), task)
@@ -1446,7 +2071,7 @@ async fn network_unix_custom_errors_apply_deadlines_and_fixed_chunked_header_bou
         harness.get("/missing").await.text().await.unwrap(),
         "Not Found"
     );
-    task.await.unwrap();
+    timed_join(task, "Unix fixed-size server task did not join").await;
 
     let mut chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
     chunked.extend_from_slice(format!("{:x}\r\n", large.len()).as_bytes());
@@ -1458,7 +2083,7 @@ async fn network_unix_custom_errors_apply_deadlines_and_fixed_chunked_header_bou
         harness.get("/missing").await.text().await.unwrap(),
         "Not Found"
     );
-    task.await.unwrap();
+    timed_join(task, "Unix chunked server task did not join").await;
 
     let oversized_header = format!(
         "HTTP/1.1 200 OK\r\nX-Oversized: {}\r\nContent-Length: 4\r\n\r\nleak",
@@ -1471,7 +2096,7 @@ async fn network_unix_custom_errors_apply_deadlines_and_fixed_chunked_header_bou
         harness.get("/missing").await.text().await.unwrap(),
         "Not Found"
     );
-    task.await.unwrap();
+    timed_join(task, "Unix oversized-header server task did not join").await;
 }
 
 #[tokio::test]
@@ -1496,17 +2121,26 @@ async fn network_typed_internal_errors_are_500_and_custom_failure_uses_reason_ph
     )
     .await;
     let url = Url::parse(&redirect.base_url).unwrap();
-    let mut stream = tokio::net::TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
-        .await
-        .unwrap();
-    stream
-        .write_all(
-            b"GET /redirect/redirect HTTP/1.1\r\nHost: bad%host\r\nConnection: close\r\n\r\n",
-        )
-        .await
-        .unwrap();
+    let mut stream = tokio::time::timeout(
+        RAW_NETWORK_TIMEOUT,
+        tokio::net::TcpStream::connect((url.host_str().unwrap(), url.port().unwrap())),
+    )
+    .await
+    .expect("internal-error client connect timed out")
+    .expect("internal-error client connect failed");
+    timed_write_all(
+        &mut stream,
+        b"GET /redirect/redirect HTTP/1.1\r\nHost: bad%host\r\nConnection: close\r\n\r\n",
+        "internal-error request write timed out",
+    )
+    .await;
     let mut response = Vec::new();
-    stream.read_to_end(&mut response).await.unwrap();
+    timed_read_to_end(
+        &mut stream,
+        &mut response,
+        "internal-error response read timed out",
+    )
+    .await;
     assert!(
         response.starts_with(b"HTTP/1.1 500"),
         "an upstream response-filter failure must remain an internal 500: {}",
@@ -1538,16 +2172,22 @@ async fn network_unix_custom_error_target_uses_get_and_copies_only_content_heade
     let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
     let (request_tx, request_rx) = oneshot::channel();
     let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
+        let (mut stream, _) =
+            timed_unix_accept(&listener, "Unix content-header server accept timed out").await;
         let mut request = vec![0; 4096];
-        let count = stream.read(&mut request).await.unwrap();
+        let count = timed_read(
+            &mut stream,
+            &mut request,
+            "Unix content-header request read timed out",
+        )
+        .await;
         let _ = request_tx.send(String::from_utf8_lossy(&request[..count]).into_owned());
-        stream
-            .write_all(
-                b"HTTP/1.1 418 Teapot\r\nContent-Type: text/plain\r\nContent-Encoding: identity\r\nX-Disallowed: secret\r\nContent-Length: 10\r\nConnection: close\r\n\r\nunix error",
-            )
-            .await
-            .unwrap();
+        timed_write_all(
+            &mut stream,
+            b"HTTP/1.1 418 Teapot\r\nContent-Type: text/plain\r\nContent-Encoding: identity\r\nX-Disallowed: secret\r\nContent-Length: 10\r\nConnection: close\r\n\r\nunix error",
+            "Unix content-header response write timed out",
+        )
+        .await;
     });
     let encoded_socket = socket_path.to_string_lossy().replace('/', "%2F");
     let harness = ProxyHarness::start(
@@ -1566,9 +2206,12 @@ async fn network_unix_custom_error_target_uses_get_and_copies_only_content_heade
     assert_eq!(response.headers()["content-encoding"], "identity");
     assert!(!response.headers().contains_key("x-disallowed"));
     assert_eq!(response.text().await.unwrap(), "unix error");
-    let request = request_rx.await.unwrap();
+    let request = tokio::time::timeout(RAW_NETWORK_TIMEOUT, request_rx)
+        .await
+        .expect("Unix request capture timed out")
+        .unwrap();
     assert!(request.starts_with("GET /errors/404?url=%2Fmissing%3Fq%3D%252F HTTP/1.1\r\n"));
-    server.await.unwrap();
+    timed_join(server, "Unix content-header server task did not join").await;
 }
 
 struct FailingActivityStore {
@@ -1751,6 +2394,223 @@ async fn activity_pending_keys_are_bounded_and_recover_with_newest_accepted_time
     assert!(writes.contains(&(keys[1].clone(), newest)));
     assert!(writes.iter().all(|(key, _)| key != &keys[3]));
     assert_eq!(writer.pending_routes(), 0);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PersistenceOperation {
+    Activity,
+    Add,
+    Put,
+    Delete,
+}
+
+struct OrderedPersistenceStore {
+    routes: tokio::sync::RwLock<BTreeMap<RouteKey, RouteData>>,
+    blocked: PersistenceOperation,
+    entered: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+    operations: std::sync::Mutex<Vec<PersistenceOperation>>,
+    replacement_activity: chrono::DateTime<chrono::Utc>,
+}
+
+impl OrderedPersistenceStore {
+    async fn gate(&self, operation: PersistenceOperation) {
+        self.operations.lock().unwrap().push(operation);
+        self.entered.add_permits(1);
+        if operation == self.blocked {
+            self.release.acquire().await.unwrap().forget();
+        }
+    }
+
+    fn operations(&self) -> Vec<PersistenceOperation> {
+        self.operations.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl Store for OrderedPersistenceStore {
+    async fn snapshot(&self) -> Result<BTreeMap<RouteKey, RouteData>, StoreError> {
+        Ok(self.routes.read().await.clone())
+    }
+
+    async fn add(
+        &self,
+        key: RouteKey,
+        target: String,
+        extra: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<RouteData, StoreError> {
+        self.gate(PersistenceOperation::Add).await;
+        let data = RouteData {
+            target,
+            last_activity: self.replacement_activity,
+            extra,
+        };
+        self.routes.write().await.insert(key, data.clone());
+        Ok(data)
+    }
+
+    async fn put(&self, key: RouteKey, data: RouteData) -> Result<(), StoreError> {
+        self.gate(PersistenceOperation::Put).await;
+        self.routes.write().await.insert(key, data);
+        Ok(())
+    }
+
+    async fn update_activity(
+        &self,
+        key: &RouteKey,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), StoreError> {
+        // Deliberately model a backend that reads then writes the whole record.
+        // Serialization must keep this stale clone from racing replacements/deletes.
+        let stale = self.routes.read().await.get(key).cloned();
+        self.gate(PersistenceOperation::Activity).await;
+        if let Some(mut route) = stale {
+            route.last_activity = at;
+            self.routes.write().await.insert(key.clone(), route);
+        }
+        Ok(())
+    }
+
+    async fn delete(&self, key: &RouteKey) -> Result<Option<RouteData>, StoreError> {
+        self.gate(PersistenceOperation::Delete).await;
+        Ok(self.routes.write().await.remove(key))
+    }
+}
+
+async fn assert_activity_and_management_are_persisted_in_order(
+    management: PersistenceOperation,
+    activity_first: bool,
+) {
+    let key = RouteKey::parse("/ordered").unwrap();
+    let initial = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:01Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let activity_at = initial + chrono::Duration::seconds(4);
+    let replacement_at = initial + chrono::Duration::seconds(9);
+    let store = Arc::new(OrderedPersistenceStore {
+        routes: tokio::sync::RwLock::new(BTreeMap::from([(
+            key.clone(),
+            RouteData {
+                target: "http://old.example".to_owned(),
+                last_activity: initial,
+                extra: Default::default(),
+            },
+        )])),
+        blocked: if activity_first {
+            PersistenceOperation::Activity
+        } else {
+            management
+        },
+        entered: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+        operations: std::sync::Mutex::new(Vec::new()),
+        replacement_activity: replacement_at,
+    });
+    let registry = RouteRegistry::load(store.clone()).await.unwrap();
+    let writer = ActivityWriter::start(Arc::clone(&registry), 4);
+
+    let start_management = || {
+        let registry = Arc::clone(&registry);
+        let key = key.clone();
+        tokio::spawn(async move {
+            match management {
+                PersistenceOperation::Add => registry
+                    .add(key, "http://new.example".to_owned(), Default::default())
+                    .await
+                    .map(|_| ()),
+                PersistenceOperation::Put => {
+                    registry
+                        .put(
+                            key,
+                            RouteData {
+                                target: "http://new.example".to_owned(),
+                                last_activity: replacement_at,
+                                extra: Default::default(),
+                            },
+                        )
+                        .await
+                }
+                PersistenceOperation::Delete => registry.delete(&key).await.map(|_| ()),
+                PersistenceOperation::Activity => unreachable!(),
+            }
+        })
+    };
+
+    let management_task;
+    if activity_first {
+        writer.record_at(&key, activity_at);
+        tokio::time::timeout(Duration::from_secs(1), store.entered.acquire())
+            .await
+            .expect("activity backend write did not enter")
+            .unwrap()
+            .forget();
+        management_task = start_management();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(store.operations(), vec![PersistenceOperation::Activity]);
+    } else {
+        management_task = start_management();
+        tokio::time::timeout(Duration::from_secs(1), store.entered.acquire())
+            .await
+            .expect("management backend write did not enter")
+            .unwrap()
+            .forget();
+        writer.record_at(&key, activity_at);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(store.operations(), vec![management]);
+    }
+
+    store.release.add_permits(1);
+    if activity_first || management != PersistenceOperation::Delete {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while store.operations().len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("serialized second backend operation did not enter");
+    }
+    writer.flush().await;
+    tokio::time::timeout(Duration::from_secs(1), management_task)
+        .await
+        .expect("management task did not join")
+        .unwrap()
+        .unwrap();
+
+    let persisted = store.snapshot().await.unwrap();
+    let reloaded = RouteRegistry::load(store.clone()).await.unwrap();
+    assert_eq!(
+        reloaded.all(),
+        persisted,
+        "restart-equivalent load diverged"
+    );
+    match management {
+        PersistenceOperation::Add | PersistenceOperation::Put => {
+            let route = persisted.get(&key).unwrap();
+            assert_eq!(route.target, "http://new.example");
+            assert_eq!(
+                route.last_activity,
+                if activity_first {
+                    replacement_at
+                } else {
+                    replacement_at.max(activity_at)
+                }
+            );
+        }
+        PersistenceOperation::Delete => assert!(!persisted.contains_key(&key)),
+        PersistenceOperation::Activity => unreachable!(),
+    }
+}
+
+#[tokio::test]
+async fn activity_backend_writes_are_ordered_with_add_put_and_delete() {
+    for management in [
+        PersistenceOperation::Add,
+        PersistenceOperation::Put,
+        PersistenceOperation::Delete,
+    ] {
+        assert_activity_and_management_are_persisted_in_order(management, true).await;
+        assert_activity_and_management_are_persisted_in_order(management, false).await;
+    }
 }
 
 fn options(include_prefix: bool, prepend_path: bool) -> ProxyOptions {
