@@ -1,0 +1,493 @@
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+use clap::{CommandFactory, Parser};
+use pingora_reverse_proxy::config::{AppConfig, Cli, ListenerConfig, LogLevel, StoreConfig};
+use serial_test::serial;
+
+fn parse_ok<const N: usize>(args: [&str; N]) -> AppConfig {
+    let cli = Cli::try_parse_from(args).unwrap_or_else(|error| panic!("CLI parse failed: {error}"));
+    AppConfig::try_from(cli).unwrap_or_else(|error| panic!("config validation failed: {error}"))
+}
+
+#[test]
+fn listener_defaults_match_chp() {
+    let cfg = parse_ok(["proxy"]);
+    assert_eq!(cfg.public_listener, ListenerConfig::Tcp(":8000".into()));
+    assert_eq!(
+        cfg.api_listener,
+        ListenerConfig::Tcp("localhost:8001".into())
+    );
+    assert_eq!(cfg.metrics_listener, None);
+}
+
+#[test]
+fn star_ip_alias_matches_chp_all_interfaces_behavior() {
+    let cfg = parse_ok(["proxy", "--ip", "*"]);
+    assert_eq!(cfg.public_listener, ListenerConfig::Tcp(":8000".into()));
+}
+
+#[test]
+fn api_port_defaults_to_public_port_plus_one() {
+    let cfg = parse_ok(["proxy", "--port", "9100"]);
+    assert_eq!(
+        cfg.api_listener,
+        ListenerConfig::Tcp("localhost:9101".into())
+    );
+}
+
+#[test]
+fn explicit_api_port_avoids_public_port_overflow() {
+    let cfg = parse_ok(["proxy", "--port", "65535", "--api-port", "8001"]);
+    assert_eq!(
+        cfg.api_listener,
+        ListenerConfig::Tcp("localhost:8001".into())
+    );
+}
+
+#[test]
+fn listener_options_are_typed() {
+    let cases = [
+        (
+            vec!["proxy", "--ip", "127.0.0.2", "--port", "9100"],
+            ListenerConfig::Tcp("127.0.0.2:9100".into()),
+            ListenerConfig::Tcp("localhost:9101".into()),
+            None,
+        ),
+        (
+            vec![
+                "proxy",
+                "--socket",
+                "/tmp/proxy.sock",
+                "--api-socket",
+                "/tmp/api.sock",
+            ],
+            ListenerConfig::Unix(PathBuf::from("/tmp/proxy.sock")),
+            ListenerConfig::Unix(PathBuf::from("/tmp/api.sock")),
+            None,
+        ),
+        (
+            vec![
+                "proxy",
+                "--api-ip",
+                "127.0.0.3",
+                "--api-port",
+                "9102",
+                "--metrics-ip",
+                "127.0.0.4",
+                "--metrics-port",
+                "9103",
+            ],
+            ListenerConfig::Tcp(":8000".into()),
+            ListenerConfig::Tcp("127.0.0.3:9102".into()),
+            Some(ListenerConfig::Tcp("127.0.0.4:9103".into())),
+        ),
+        (
+            vec!["proxy", "--metrics-socket", "/tmp/metrics.sock"],
+            ListenerConfig::Tcp(":8000".into()),
+            ListenerConfig::Tcp("localhost:8001".into()),
+            Some(ListenerConfig::Unix(PathBuf::from("/tmp/metrics.sock"))),
+        ),
+    ];
+
+    for (args, public, api, metrics) in cases {
+        let cli = Cli::try_parse_from(args).unwrap();
+        let cfg = AppConfig::try_from(cli).unwrap();
+        assert_eq!(cfg.public_listener, public);
+        assert_eq!(cfg.api_listener, api);
+        assert_eq!(cfg.metrics_listener, metrics);
+    }
+}
+
+#[test]
+fn socket_options_conflict_with_tcp_options() {
+    for args in [
+        vec!["proxy", "--socket", "/tmp/proxy.sock", "--port", "8000"],
+        vec!["proxy", "--socket", "/tmp/proxy.sock", "--ip", "127.0.0.1"],
+        vec![
+            "proxy",
+            "--api-socket",
+            "/tmp/api.sock",
+            "--api-port",
+            "8001",
+        ],
+        vec![
+            "proxy",
+            "--api-socket",
+            "/tmp/api.sock",
+            "--api-ip",
+            "localhost",
+        ],
+        vec![
+            "proxy",
+            "--metrics-socket",
+            "/tmp/metrics.sock",
+            "--metrics-port",
+            "9000",
+        ],
+        vec![
+            "proxy",
+            "--metrics-socket",
+            "/tmp/metrics.sock",
+            "--metrics-ip",
+            "localhost",
+        ],
+    ] {
+        let error = Cli::try_parse_from(args).expect_err("conflicting listeners accepted");
+        assert!(error.to_string().contains("cannot be used with"));
+    }
+}
+
+#[test]
+fn all_tls_options_are_preserved() {
+    let cfg = parse_ok([
+        "proxy",
+        "--ssl-key",
+        "public.key",
+        "--ssl-cert",
+        "public.crt",
+        "--ssl-ca",
+        "public.ca",
+        "--ssl-request-cert",
+        "--ssl-reject-unauthorized",
+        "--ssl-protocol",
+        "TLSv1_2",
+        "--ssl-ciphers",
+        "HIGH:!aNULL",
+        "--ssl-dhparam",
+        "dh.pem",
+        "--api-ssl-key",
+        "api.key",
+        "--api-ssl-cert",
+        "api.crt",
+        "--api-ssl-ca",
+        "api.ca",
+        "--api-ssl-request-cert",
+        "--api-ssl-reject-unauthorized",
+        "--client-ssl-key",
+        "client.key",
+        "--client-ssl-cert",
+        "client.crt",
+        "--client-ssl-ca",
+        "client.ca",
+        "--client-ssl-request-cert",
+        "--client-ssl-reject-unauthorized",
+    ]);
+
+    let public = cfg.public_tls.unwrap();
+    assert_eq!(public.key, Some(PathBuf::from("public.key")));
+    assert_eq!(public.cert, Some(PathBuf::from("public.crt")));
+    assert_eq!(public.ca, Some(PathBuf::from("public.ca")));
+    assert!(public.request_cert && public.reject_unauthorized);
+    assert_eq!(public.protocol.as_deref(), Some("TLSv1_2"));
+    assert_eq!(public.ciphers.as_deref(), Some("HIGH:!aNULL"));
+    assert_eq!(public.dhparam, Some(PathBuf::from("dh.pem")));
+
+    let api = cfg.api_tls.unwrap();
+    assert_eq!(api.key, Some(PathBuf::from("api.key")));
+    assert_eq!(api.cert, Some(PathBuf::from("api.crt")));
+    assert_eq!(api.ca, Some(PathBuf::from("api.ca")));
+    assert!(api.request_cert && api.reject_unauthorized);
+
+    let client = cfg.client_tls.unwrap();
+    assert_eq!(client.key, Some(PathBuf::from("client.key")));
+    assert_eq!(client.cert, Some(PathBuf::from("client.crt")));
+    assert_eq!(client.ca, Some(PathBuf::from("client.ca")));
+    assert!(client.request_cert && client.reject_unauthorized);
+}
+
+#[test]
+fn client_ca_can_configure_target_trust_without_a_client_identity() {
+    let cfg = parse_ok(["proxy", "--client-ssl-ca", "targets.ca"]);
+    let client = cfg.client_tls.unwrap();
+    assert_eq!(client.key, None);
+    assert_eq!(client.cert, None);
+    assert_eq!(client.ca, Some(PathBuf::from("targets.ca")));
+}
+
+#[test]
+fn proxy_and_process_options_match_chp_surface() {
+    let cfg = parse_ok([
+        "proxy",
+        "--ssl-key",
+        "public.key",
+        "--ssl-cert",
+        "public.crt",
+        "--default-target",
+        "http://default.example/base",
+        "--error-target",
+        "https://errors.example",
+        "--redirect-port",
+        "8080",
+        "--redirect-to",
+        "8443",
+        "--pid-file",
+        "/tmp/proxy.pid",
+        "--no-x-forward",
+        "--no-prepend-path",
+        "--no-include-prefix",
+        "--auto-rewrite",
+        "--change-origin",
+        "--protocol-rewrite",
+        "https",
+        "--custom-header",
+        " X-One : first ",
+        "--custom-header",
+        "X-Two: second:value",
+        "--insecure",
+        "--host-routing",
+        "--log-level",
+        "DEBUG",
+        "--timeout",
+        "1000",
+        "--proxy-timeout",
+        "2000",
+        "--storage-backend",
+        "redis",
+        "--keep-alive-timeout",
+        "3000",
+    ]);
+
+    assert_eq!(
+        cfg.default_target.unwrap().as_str(),
+        "http://default.example/base"
+    );
+    assert_eq!(
+        cfg.error_target.unwrap().as_str(),
+        "https://errors.example/"
+    );
+    assert_eq!(cfg.redirect_port, Some(8080));
+    assert_eq!(cfg.redirect_to, Some(8443));
+    assert_eq!(cfg.pid_file, Some(PathBuf::from("/tmp/proxy.pid")));
+    assert_eq!(cfg.log_level, LogLevel::Debug);
+    assert_eq!(cfg.store, StoreConfig::Redis);
+    assert!(!cfg.proxy.x_forward);
+    assert!(!cfg.proxy.prepend_path);
+    assert!(!cfg.proxy.include_prefix);
+    assert!(cfg.proxy.auto_rewrite);
+    assert!(cfg.proxy.change_origin);
+    assert_eq!(cfg.proxy.protocol_rewrite.as_deref(), Some("https"));
+    assert!(!cfg.proxy.verify_upstream_tls);
+    assert!(cfg.proxy.host_routing);
+    assert_eq!(cfg.proxy.timeout_ms, Some(1000));
+    assert_eq!(cfg.proxy.proxy_timeout_ms, Some(2000));
+    assert_eq!(cfg.proxy.keep_alive_timeout_ms, Some(3000));
+    assert_eq!(
+        cfg.proxy.custom_headers,
+        BTreeMap::from([
+            ("X-One".into(), "first".into()),
+            ("X-Two".into(), "second:value".into()),
+        ])
+    );
+}
+
+#[test]
+fn negative_boolean_flags_default_to_enabled() {
+    let cfg = parse_ok(["proxy"]);
+    assert!(cfg.proxy.x_forward);
+    assert!(cfg.proxy.prepend_path);
+    assert!(cfg.proxy.include_prefix);
+}
+
+#[test]
+fn repeated_custom_header_uses_last_value_like_chp() {
+    let cfg = parse_ok([
+        "proxy",
+        "--custom-header",
+        "X-Test: first",
+        "--custom-header",
+        "X-Test: second",
+    ]);
+    assert_eq!(cfg.proxy.custom_headers.get("X-Test").unwrap(), "second");
+}
+
+#[test]
+fn error_path_is_supported() {
+    let cfg = parse_ok(["proxy", "--error-path", "/srv/chp-errors"]);
+    assert_eq!(cfg.error_path, Some(PathBuf::from("/srv/chp-errors")));
+}
+
+#[test]
+fn validation_errors_are_explicit_and_non_panicking() {
+    let cases = [
+        (
+            vec![
+                "proxy",
+                "--error-target",
+                "http://errors",
+                "--error-path",
+                "/errors",
+            ],
+            "both --error-target and --error-path",
+        ),
+        (
+            vec!["proxy", "--redirect-port", "8080"],
+            "TLS key and certificate",
+        ),
+        (
+            vec!["proxy", "--ssl-key", "key.pem"],
+            "--ssl-key and --ssl-cert",
+        ),
+        (
+            vec!["proxy", "--api-ssl-cert", "cert.pem"],
+            "--api-ssl-key and --api-ssl-cert",
+        ),
+        (
+            vec!["proxy", "--client-ssl-key", "key.pem"],
+            "--client-ssl-key and --client-ssl-cert",
+        ),
+        (vec!["proxy", "--log-level", "verbose"], "log level"),
+        (
+            vec!["proxy", "--default-target", "not a URL"],
+            "default target",
+        ),
+        (
+            vec!["proxy", "--error-target", "file:///tmp/error"],
+            "error target",
+        ),
+        (
+            vec!["proxy", "--storage-backend", "sqlite"],
+            "unknown storage backend",
+        ),
+        (
+            vec!["proxy", "--storage-backend", "./custom-store.js"],
+            "sidecar protocol",
+        ),
+        (vec!["proxy", "--ssl-allow-rc4"], "RC4"),
+        (vec!["proxy", "--custom-header", "missing-colon"], "colon"),
+    ];
+
+    for (args, expected) in cases {
+        let error = match Cli::try_parse_from(args) {
+            Ok(cli) => AppConfig::try_from(cli).unwrap_err().to_string(),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains(expected),
+            "expected {expected:?} in {error:?}"
+        );
+    }
+}
+
+#[test]
+fn supported_storage_backends_are_typed() {
+    for (name, expected) in [
+        ("memory", StoreConfig::Memory),
+        ("redis", StoreConfig::Redis),
+        ("sidecar", StoreConfig::Sidecar),
+    ] {
+        let cfg = parse_ok(["proxy", "--storage-backend", name]);
+        assert_eq!(cfg.store, expected);
+    }
+}
+
+#[test]
+#[serial]
+fn chp_environment_variables_are_consumed() {
+    std::env::set_var("CONFIGPROXY_AUTH_TOKEN", "secret-token");
+    std::env::set_var("CONFIGPROXY_SSL_KEY_PASSPHRASE", "public-passphrase");
+    std::env::set_var("CONFIGPROXY_API_SSL_KEY_PASSPHRASE", "api-passphrase");
+
+    let cfg = parse_ok([
+        "proxy",
+        "--ssl-key",
+        "public.key",
+        "--ssl-cert",
+        "public.crt",
+        "--api-ssl-key",
+        "api.key",
+        "--api-ssl-cert",
+        "api.crt",
+    ]);
+
+    std::env::remove_var("CONFIGPROXY_AUTH_TOKEN");
+    std::env::remove_var("CONFIGPROXY_SSL_KEY_PASSPHRASE");
+    std::env::remove_var("CONFIGPROXY_API_SSL_KEY_PASSPHRASE");
+
+    assert_eq!(cfg.auth_token.as_deref(), Some("secret-token"));
+    assert_eq!(
+        cfg.public_tls.unwrap().key_passphrase.as_deref(),
+        Some("public-passphrase")
+    );
+    assert_eq!(
+        cfg.api_tls.unwrap().key_passphrase.as_deref(),
+        Some("api-passphrase")
+    );
+}
+
+#[test]
+fn help_covers_every_chp_5_3_0_long_option() {
+    const CHP_LONG_OPTIONS: &[&str] = &[
+        "--ip",
+        "--port",
+        "--socket",
+        "--ssl-key",
+        "--ssl-cert",
+        "--ssl-ca",
+        "--ssl-request-cert",
+        "--ssl-reject-unauthorized",
+        "--ssl-protocol",
+        "--ssl-ciphers",
+        "--ssl-allow-rc4",
+        "--ssl-dhparam",
+        "--api-ip",
+        "--api-port",
+        "--api-socket",
+        "--api-ssl-key",
+        "--api-ssl-cert",
+        "--api-ssl-ca",
+        "--api-ssl-request-cert",
+        "--api-ssl-reject-unauthorized",
+        "--client-ssl-key",
+        "--client-ssl-cert",
+        "--client-ssl-ca",
+        "--client-ssl-request-cert",
+        "--client-ssl-reject-unauthorized",
+        "--default-target",
+        "--error-target",
+        "--error-path",
+        "--redirect-port",
+        "--redirect-to",
+        "--pid-file",
+        "--no-x-forward",
+        "--no-prepend-path",
+        "--no-include-prefix",
+        "--auto-rewrite",
+        "--change-origin",
+        "--protocol-rewrite",
+        "--custom-header",
+        "--insecure",
+        "--host-routing",
+        "--metrics-ip",
+        "--metrics-port",
+        "--metrics-socket",
+        "--log-level",
+        "--timeout",
+        "--proxy-timeout",
+        "--storage-backend",
+        "--keep-alive-timeout",
+    ];
+
+    let help = Cli::command().render_long_help().to_string();
+    let documented_differences = ["--ssl-allow-rc4"];
+    let missing: Vec<_> = CHP_LONG_OPTIONS
+        .iter()
+        .copied()
+        .filter(|option| !help.contains(option) && !documented_differences.contains(option))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "Rust help is missing CHP options: {missing:?}"
+    );
+    assert!(
+        help.contains("--ssl-allow-rc4"),
+        "RC4 must be startup-visible, not silently omitted"
+    );
+}
+
+#[test]
+fn unknown_long_options_are_rejected() {
+    let error = Cli::try_parse_from(["proxy", "--made-up-flag"])
+        .expect_err("unknown option was silently accepted");
+    assert!(error.to_string().contains("unexpected argument"));
+}

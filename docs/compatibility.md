@@ -1,0 +1,82 @@
+# CHP 5.3.0 CLI compatibility
+
+This matrix is audited against the pinned CHP 5.3.0 CLI source,
+`bin/configurable-http-proxy` lines 24–120. “Identical” means the option name,
+value shape, default, and typed configuration intent match CHP. “Semantic
+equivalent” means the same purpose is provided through a Rust-native mechanism.
+“Intentional difference” means startup rejects an unsafe or binary-incompatible
+request with an actionable error; it is never silently ignored.
+
+The configuration contract is exercised by `tests/config_contract.rs`. Runtime
+features are only claimed here at the CLI/configuration boundary until their
+service-level contract tests land.
+
+| CHP long option | Classification | Configuration behavior and contract test |
+|---|---|---|
+| `--ip` | Identical | Selects the public TCP address; omission and `*` mean all interfaces as in CHP; `listener_options_are_typed`, `star_ip_alias_matches_chp_all_interfaces_behavior`. |
+| `--port` | Identical | Public port defaults to 8000; `listener_defaults_match_chp`, `api_port_defaults_to_public_port_plus_one`. |
+| `--socket` | Identical | Selects a public Unix socket and conflicts with explicitly supplied IP/port; `listener_options_are_typed`, `socket_options_conflict_with_tcp_options`. |
+| `--ssl-key` | Identical | Public TLS private key; a key/certificate identity must be complete; `all_tls_options_are_preserved`, `validation_errors_are_explicit_and_non_panicking`. |
+| `--ssl-cert` | Identical | Public TLS certificate; `all_tls_options_are_preserved`. |
+| `--ssl-ca` | Identical | Public listener client CA; `all_tls_options_are_preserved`. |
+| `--ssl-request-cert` | Identical | Requests public-listener client certificates; `all_tls_options_are_preserved`. |
+| `--ssl-reject-unauthorized` | Identical | Rejects unauthorized public-listener clients; `all_tls_options_are_preserved`. |
+| `--ssl-protocol` | Identical | Preserves the requested TLS protocol for public, API, and client TLS setup; `all_tls_options_are_preserved`. |
+| `--ssl-ciphers` | Identical | Preserves the OpenSSL cipher expression for TLS setup; `all_tls_options_are_preserved`. |
+| `--ssl-allow-rc4` | **Intentional difference** | Always fails startup clearly. Modern OpenSSL security policy cannot safely re-enable removed RC4 support; `validation_errors_are_explicit_and_non_panicking`. |
+| `--ssl-dhparam` | Identical | Preserves the DH parameters path for TLS setup; `all_tls_options_are_preserved`. |
+| `--api-ip` | Identical | API host defaults to `localhost`; `listener_defaults_match_chp`, `listener_options_are_typed`. |
+| `--api-port` | Identical | Defaults to public port plus one, or 8001 for a public Unix socket; `api_port_defaults_to_public_port_plus_one`, `listener_options_are_typed`. |
+| `--api-socket` | Identical | Selects an API Unix socket and conflicts with explicitly supplied API IP/port; `listener_options_are_typed`, `socket_options_conflict_with_tcp_options`. |
+| `--api-ssl-key` | Identical | API TLS private key; requires its certificate; `all_tls_options_are_preserved`, `validation_errors_are_explicit_and_non_panicking`. |
+| `--api-ssl-cert` | Identical | API TLS certificate; `all_tls_options_are_preserved`. |
+| `--api-ssl-ca` | Identical | API client CA; `all_tls_options_are_preserved`. |
+| `--api-ssl-request-cert` | Identical | Requests API-client certificates; `all_tls_options_are_preserved`. |
+| `--api-ssl-reject-unauthorized` | Identical | Rejects unauthorized API clients; `all_tls_options_are_preserved`. |
+| `--client-ssl-key` | Identical | Target-facing client identity key; requires its certificate; `all_tls_options_are_preserved`, `validation_errors_are_explicit_and_non_panicking`. |
+| `--client-ssl-cert` | Identical | Target-facing client identity certificate; `all_tls_options_are_preserved`. |
+| `--client-ssl-ca` | Identical | Target trust CA, including CA-only configuration; `all_tls_options_are_preserved`, `client_ca_can_configure_target_trust_without_a_client_identity`. |
+| `--client-ssl-request-cert` | Identical | Preserved target-facing TLS request-cert setting; `all_tls_options_are_preserved`. |
+| `--client-ssl-reject-unauthorized` | Identical | Preserved target-facing TLS rejection setting; `all_tls_options_are_preserved`. |
+| `--default-target` | Identical | Accepts a validated HTTP(S) or `http+unix` target URL; invalid targets return errors; `proxy_and_process_options_match_chp_surface`, `validation_errors_are_explicit_and_non_panicking`. |
+| `--error-target` | Identical | Accepts a validated HTTP(S) error target and conflicts with error path; `proxy_and_process_options_match_chp_surface`, `validation_errors_are_explicit_and_non_panicking`. |
+| `--error-path` | Identical | Selects filesystem error pages and conflicts with error target; `error_path_is_supported`, `validation_errors_are_explicit_and_non_panicking`. |
+| `--redirect-port` | Identical | Configures the HTTP redirect listener and requires public TLS material; `proxy_and_process_options_match_chp_surface`, `validation_errors_are_explicit_and_non_panicking`. |
+| `--redirect-to` | Identical | Selects the HTTPS port emitted by redirects; `proxy_and_process_options_match_chp_surface`. |
+| `--pid-file` | Identical | Preserves the PID-file path for lifecycle setup; `proxy_and_process_options_match_chp_surface`. |
+| `--no-x-forward` | Identical | Changes the positive `x_forward` default from true to false; `negative_boolean_flags_default_to_enabled`, `proxy_and_process_options_match_chp_surface`. |
+| `--no-prepend-path` | Identical | Changes the positive `prepend_path` default from true to false; `negative_boolean_flags_default_to_enabled`, `proxy_and_process_options_match_chp_surface`. |
+| `--no-include-prefix` | Identical | Changes the positive `include_prefix` default from true to false; `negative_boolean_flags_default_to_enabled`, `proxy_and_process_options_match_chp_surface`. |
+| `--auto-rewrite` | Identical | Enables redirect Location host/port rewriting; `proxy_and_process_options_match_chp_surface`. |
+| `--change-origin` | Identical | Enables target-origin Host rewriting; `proxy_and_process_options_match_chp_surface`. |
+| `--protocol-rewrite` | Identical | Preserves CHP’s free-form redirect protocol value; `proxy_and_process_options_match_chp_surface`. |
+| `--custom-header` | Identical | Repeatable `name:value`, whitespace-trimmed, with the last duplicate winning; `proxy_and_process_options_match_chp_surface`, `repeated_custom_header_uses_last_value_like_chp`, `validation_errors_are_explicit_and_non_panicking`. |
+| `--insecure` | Identical | Disables upstream certificate verification; `proxy_and_process_options_match_chp_surface`. |
+| `--host-routing` | Identical | Enables host-as-first-route-component behavior; `proxy_and_process_options_match_chp_surface`. |
+| `--metrics-ip` | Identical | Selects the metrics TCP host when metrics port is enabled; `listener_options_are_typed`. |
+| `--metrics-port` | Identical | Enables the metrics TCP listener; omission disables metrics; `listener_defaults_match_chp`, `listener_options_are_typed`. |
+| `--metrics-socket` | Identical | Enables metrics on a Unix socket and conflicts with metrics IP/port; `listener_options_are_typed`, `socket_options_conflict_with_tcp_options`. |
+| `--log-level` | Identical | Case-insensitive debug/info/warn/error, default info; invalid levels return errors; `proxy_and_process_options_match_chp_surface`, `validation_errors_are_explicit_and_non_panicking`. |
+| `--timeout` | Identical | Typed request timeout in milliseconds; `proxy_and_process_options_match_chp_surface`. |
+| `--proxy-timeout` | Identical | Typed target response timeout in milliseconds; `proxy_and_process_options_match_chp_surface`. |
+| `--storage-backend` | **Semantic equivalent with intentional Node-module difference** | `memory`, `redis`, and `sidecar` are typed backends. Arbitrary Node module names/paths fail startup and direct users to the versioned sidecar protocol because Rust cannot `require()` Node classes; `supported_storage_backends_are_typed`, `validation_errors_are_explicit_and_non_panicking`. |
+| `--keep-alive-timeout` | Identical | Typed keep-alive timeout in milliseconds; `proxy_and_process_options_match_chp_surface`. |
+
+## Environment variables
+
+| CHP environment variable | Classification | Behavior |
+|---|---|---|
+| `CONFIGPROXY_AUTH_TOKEN` | Identical | Supplies management API authentication without exposing a CLI secret option. |
+| `CONFIGPROXY_SSL_KEY_PASSPHRASE` | Identical | Supplies the public-listener key passphrase. |
+| `CONFIGPROXY_API_SSL_KEY_PASSPHRASE` | Identical | Supplies the API-listener key passphrase. |
+
+All three are covered by `chp_environment_variables_are_consumed` and are held as
+typed configuration values rather than logged. Unknown long options are rejected
+by Clap and covered by `unknown_long_options_are_rejected`.
+
+## Help coverage
+
+`help_covers_every_chp_5_3_0_long_option` owns the normalized list extracted from
+the pinned CHP 5.3.0 source and verifies that every long option occurs in Rust
+help. The two intentional runtime differences remain visible in help and fail
+during validation; neither is hidden or silently accepted.
