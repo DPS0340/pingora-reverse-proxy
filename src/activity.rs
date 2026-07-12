@@ -30,9 +30,8 @@ struct PendingActivities {
 #[derive(Clone, Copy)]
 struct PendingActivity {
     latest: DateTime<Utc>,
-    latest_sequence: u64,
     pending_oldest_sequence: Option<u64>,
-    in_flight_sequence: Option<u64>,
+    in_flight_oldest_sequence: Option<u64>,
 }
 
 /// Non-blocking activity recorder backed by one bounded wake-up channel.
@@ -84,9 +83,12 @@ impl ActivityWriter {
                                 .by_key
                                 .get_mut(&key)
                                 .expect("ready activity key must remain resident");
-                            pending.in_flight_sequence = Some(pending.latest_sequence);
-                            pending.pending_oldest_sequence = None;
-                            (key, pending.latest, pending.latest_sequence)
+                            let oldest_sequence = pending
+                                .pending_oldest_sequence
+                                .take()
+                                .expect("ready activity must have a pending acceptance");
+                            pending.in_flight_oldest_sequence = Some(oldest_sequence);
+                            (key, pending.latest, oldest_sequence)
                         })
                     };
                     let Some((key, pending_at, pending_sequence)) = pending else {
@@ -111,8 +113,8 @@ impl ActivityWriter {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     let has_later_activity = guard.by_key.get_mut(&key).is_some_and(|pending| {
-                        debug_assert_eq!(pending.in_flight_sequence, Some(pending_sequence));
-                        pending.in_flight_sequence = None;
+                        debug_assert_eq!(pending.in_flight_oldest_sequence, Some(pending_sequence));
+                        pending.in_flight_oldest_sequence = None;
                         pending.pending_oldest_sequence.is_some()
                     });
                     if !has_later_activity {
@@ -170,16 +172,14 @@ impl ActivityWriter {
         let sequence = pending.accepted_through;
         if let Some(existing) = pending.by_key.get_mut(key) {
             existing.latest = existing.latest.max(at);
-            existing.latest_sequence = sequence;
             existing.pending_oldest_sequence.get_or_insert(sequence);
         } else {
             pending.by_key.insert(
                 key.clone(),
                 PendingActivity {
                     latest: at,
-                    latest_sequence: sequence,
                     pending_oldest_sequence: Some(sequence),
-                    in_flight_sequence: None,
+                    in_flight_oldest_sequence: None,
                 },
             );
             pending.ready.push_back(key.clone());
@@ -242,7 +242,7 @@ impl ActivityWriter {
                 .values()
                 .all(|pending| {
                     pending
-                        .in_flight_sequence
+                        .in_flight_oldest_sequence
                         .is_none_or(|sequence| sequence > watermark)
                         && pending
                             .pending_oldest_sequence

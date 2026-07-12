@@ -2652,6 +2652,92 @@ async fn activity_flush_uses_an_acceptance_watermark_for_a_continuously_advancin
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn activity_flush_tracks_oldest_acceptance_in_a_dequeued_coalesced_write() {
+    let initial = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let blocker = RouteKey::parse("/flush-blocker").unwrap();
+    let key = RouteKey::parse("/coalesced-flush").unwrap();
+    let store = Arc::new(StalledActivityStore {
+        routes: tokio::sync::RwLock::new(BTreeMap::from([
+            (
+                blocker.clone(),
+                RouteData {
+                    target: "http://upstream.example".to_owned(),
+                    last_activity: initial,
+                    extra: Default::default(),
+                },
+            ),
+            (
+                key.clone(),
+                RouteData {
+                    target: "http://upstream.example".to_owned(),
+                    last_activity: initial,
+                    extra: Default::default(),
+                },
+            ),
+        ])),
+        entries: std::sync::Mutex::new(Vec::new()),
+        writes: std::sync::Mutex::new(Vec::new()),
+        entered: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let registry = RouteRegistry::load(store.clone()).await.unwrap();
+    let writer = ActivityWriter::start(Arc::clone(&registry), 2);
+    let blocker_at = initial + chrono::Duration::milliseconds(1);
+    let before_watermark = initial + chrono::Duration::seconds(1);
+    let coalesced = initial + chrono::Duration::seconds(2);
+    let later = initial + chrono::Duration::seconds(3);
+
+    writer.record_at(&blocker, blocker_at);
+    store.entered.acquire().await.unwrap().forget();
+    writer.record_at(&key, before_watermark);
+    let mut flush = Box::pin(writer.flush());
+    tokio::select! {
+        biased;
+        () = &mut flush => panic!("pending activity flushed before worker dequeue"),
+        () = async {} => {}
+    }
+    writer.record_at(&key, coalesced);
+
+    store.release.add_permits(1);
+    store.entered.acquire().await.unwrap().forget();
+    assert_eq!(
+        store.entries.lock().unwrap().as_slice(),
+        &[blocker.clone(), key.clone()]
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut flush)
+            .await
+            .is_err(),
+        "flush returned while its oldest acceptance was in flight"
+    );
+
+    writer.record_at(&key, later);
+    store.release.add_permits(1);
+    store.entered.acquire().await.unwrap().forget();
+    tokio::time::timeout(Duration::from_millis(100), &mut flush)
+        .await
+        .expect("later activity prevented the coalesced flush watermark from completing");
+    assert_eq!(writer.pending_routes(), 1);
+    assert_eq!(
+        store.writes.lock().unwrap().as_slice(),
+        &[(blocker.clone(), blocker_at), (key.clone(), coalesced)]
+    );
+
+    store.release.add_permits(1);
+    timed_activity_flush(&writer).await;
+    assert_eq!(
+        store.writes.lock().unwrap().as_slice(),
+        &[
+            (blocker, blocker_at),
+            (key.clone(), coalesced),
+            (key, later),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn continuously_advancing_activity_key_yields_to_ready_peers() {
     let initial = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
