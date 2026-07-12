@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use clap::{CommandFactory, Parser};
@@ -8,6 +9,34 @@ use serial_test::serial;
 fn parse_ok<const N: usize>(args: [&str; N]) -> AppConfig {
     let cli = Cli::try_parse_from(args).unwrap_or_else(|error| panic!("CLI parse failed: {error}"));
     AppConfig::try_from(cli).unwrap_or_else(|error| panic!("config validation failed: {error}"))
+}
+
+struct EnvGuard {
+    original: Vec<(&'static str, Option<OsString>)>,
+}
+
+impl EnvGuard {
+    fn set(values: &[(&'static str, &'static str)]) -> Self {
+        let original = values
+            .iter()
+            .map(|(name, _)| (*name, std::env::var_os(name)))
+            .collect();
+        for (name, value) in values {
+            std::env::set_var(name, value);
+        }
+        Self { original }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (name, value) in &self.original {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
 }
 
 #[test]
@@ -197,6 +226,49 @@ fn all_tls_options_are_preserved() {
 }
 
 #[test]
+fn omitted_ssl_ciphers_use_the_exact_chp_5_3_0_policy() {
+    const CHP_5_3_0_DEFAULT: &str = "ECDHE-RSA-AES128-GCM-SHA256:\
+ECDHE-ECDSA-AES128-GCM-SHA256:\
+ECDHE-RSA-AES256-GCM-SHA384:\
+ECDHE-ECDSA-AES256-GCM-SHA384:\
+DHE-RSA-AES128-GCM-SHA256:\
+ECDHE-RSA-AES128-SHA256:\
+DHE-RSA-AES128-SHA256:\
+ECDHE-RSA-AES256-SHA384:\
+DHE-RSA-AES256-SHA384:\
+ECDHE-RSA-AES256-SHA256:\
+DHE-RSA-AES256-SHA256:\
+HIGH:!RC4:!aNULL:!eNULL:!EXPORT:!DES:!RC4:!MD5:!PSK:!SRP:!CAMELLIA";
+
+    let cfg = parse_ok([
+        "proxy",
+        "--ssl-key",
+        "public.key",
+        "--ssl-cert",
+        "public.crt",
+        "--api-ssl-key",
+        "api.key",
+        "--api-ssl-cert",
+        "api.crt",
+        "--client-ssl-ca",
+        "targets.ca",
+    ]);
+
+    assert_eq!(
+        cfg.public_tls.as_ref().unwrap().ciphers.as_deref(),
+        Some(CHP_5_3_0_DEFAULT)
+    );
+    assert_eq!(
+        cfg.api_tls.as_ref().unwrap().ciphers.as_deref(),
+        Some(CHP_5_3_0_DEFAULT)
+    );
+    assert_eq!(
+        cfg.client_tls.as_ref().unwrap().ciphers.as_deref(),
+        Some(CHP_5_3_0_DEFAULT)
+    );
+}
+
+#[test]
 fn client_ca_can_configure_target_trust_without_a_client_identity() {
     let cfg = parse_ok(["proxy", "--client-ssl-ca", "targets.ca"]);
     let client = cfg.client_tls.unwrap();
@@ -308,6 +380,45 @@ fn error_path_is_supported() {
 }
 
 #[test]
+fn default_and_error_targets_accept_valid_unix_http_urls() {
+    let cfg = parse_ok([
+        "proxy",
+        "--default-target",
+        "http+unix://%2Ftmp%2Fdefault.sock/base",
+        "--error-target",
+        "unix+http://%2Ftmp%2Ferrors.sock/errors",
+    ]);
+
+    assert_eq!(
+        cfg.default_target.unwrap().as_str(),
+        "http+unix://%2Ftmp%2Fdefault.sock/base"
+    );
+    assert_eq!(
+        cfg.error_target.unwrap().as_str(),
+        "unix+http://%2Ftmp%2Ferrors.sock/errors"
+    );
+}
+
+#[test]
+fn unix_http_targets_require_a_nonempty_percent_encoded_socket_host() {
+    for option in ["--default-target", "--error-target"] {
+        for target in [
+            "http+unix:///tmp/proxy.sock",
+            "unix+http:///tmp/proxy.sock",
+            "http+unix://tmp/proxy.sock",
+            "unix+http://tmp/proxy.sock",
+        ] {
+            let cli = Cli::try_parse_from(["proxy", option, target]).unwrap();
+            let error = AppConfig::try_from(cli).unwrap_err().to_string();
+            assert!(
+                error.contains("percent-encoded socket host"),
+                "expected malformed {option} {target:?} to fail clearly, got {error:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn validation_errors_are_explicit_and_non_panicking() {
     let cases = [
         (
@@ -384,9 +495,11 @@ fn supported_storage_backends_are_typed() {
 #[test]
 #[serial]
 fn chp_environment_variables_are_consumed() {
-    std::env::set_var("CONFIGPROXY_AUTH_TOKEN", "secret-token");
-    std::env::set_var("CONFIGPROXY_SSL_KEY_PASSPHRASE", "public-passphrase");
-    std::env::set_var("CONFIGPROXY_API_SSL_KEY_PASSPHRASE", "api-passphrase");
+    let _env = EnvGuard::set(&[
+        ("CONFIGPROXY_AUTH_TOKEN", "secret-token"),
+        ("CONFIGPROXY_SSL_KEY_PASSPHRASE", "public-passphrase"),
+        ("CONFIGPROXY_API_SSL_KEY_PASSPHRASE", "api-passphrase"),
+    ]);
 
     let cfg = parse_ok([
         "proxy",
@@ -400,10 +513,6 @@ fn chp_environment_variables_are_consumed() {
         "api.crt",
     ]);
 
-    std::env::remove_var("CONFIGPROXY_AUTH_TOKEN");
-    std::env::remove_var("CONFIGPROXY_SSL_KEY_PASSPHRASE");
-    std::env::remove_var("CONFIGPROXY_API_SSL_KEY_PASSPHRASE");
-
     assert_eq!(cfg.auth_token.as_deref(), Some("secret-token"));
     assert_eq!(
         cfg.public_tls.unwrap().key_passphrase.as_deref(),
@@ -416,72 +525,69 @@ fn chp_environment_variables_are_consumed() {
 }
 
 #[test]
-fn help_covers_every_chp_5_3_0_long_option() {
-    const CHP_LONG_OPTIONS: &[&str] = &[
-        "--ip",
-        "--port",
-        "--socket",
+#[serial]
+fn debug_output_redacts_auth_and_tls_secrets() {
+    const AUTH_SENTINEL: &str = "AUTH_TOKEN_SENTINEL_7f31";
+    const PUBLIC_SENTINEL: &str = "PUBLIC_PASSPHRASE_SENTINEL_8a42";
+    const API_SENTINEL: &str = "API_PASSPHRASE_SENTINEL_9b53";
+    let _env = EnvGuard::set(&[
+        ("CONFIGPROXY_AUTH_TOKEN", AUTH_SENTINEL),
+        ("CONFIGPROXY_SSL_KEY_PASSPHRASE", PUBLIC_SENTINEL),
+        ("CONFIGPROXY_API_SSL_KEY_PASSPHRASE", API_SENTINEL),
+    ]);
+    let cfg = parse_ok([
+        "proxy",
         "--ssl-key",
+        "public.key",
         "--ssl-cert",
-        "--ssl-ca",
-        "--ssl-request-cert",
-        "--ssl-reject-unauthorized",
-        "--ssl-protocol",
-        "--ssl-ciphers",
-        "--ssl-allow-rc4",
-        "--ssl-dhparam",
-        "--api-ip",
-        "--api-port",
-        "--api-socket",
+        "public.crt",
         "--api-ssl-key",
+        "api.key",
         "--api-ssl-cert",
-        "--api-ssl-ca",
-        "--api-ssl-request-cert",
-        "--api-ssl-reject-unauthorized",
-        "--client-ssl-key",
-        "--client-ssl-cert",
-        "--client-ssl-ca",
-        "--client-ssl-request-cert",
-        "--client-ssl-reject-unauthorized",
-        "--default-target",
-        "--error-target",
-        "--error-path",
-        "--redirect-port",
-        "--redirect-to",
-        "--pid-file",
-        "--no-x-forward",
-        "--no-prepend-path",
-        "--no-include-prefix",
-        "--auto-rewrite",
-        "--change-origin",
-        "--protocol-rewrite",
-        "--custom-header",
-        "--insecure",
-        "--host-routing",
-        "--metrics-ip",
-        "--metrics-port",
-        "--metrics-socket",
-        "--log-level",
-        "--timeout",
-        "--proxy-timeout",
-        "--storage-backend",
-        "--keep-alive-timeout",
-    ];
+        "api.crt",
+    ]);
 
-    let help = Cli::command().render_long_help().to_string();
-    let documented_differences = ["--ssl-allow-rc4"];
-    let missing: Vec<_> = CHP_LONG_OPTIONS
-        .iter()
-        .copied()
-        .filter(|option| !help.contains(option) && !documented_differences.contains(option))
-        .collect();
-    assert!(
-        missing.is_empty(),
-        "Rust help is missing CHP options: {missing:?}"
+    assert_eq!(cfg.auth_token.as_deref(), Some(AUTH_SENTINEL));
+    assert_eq!(
+        cfg.public_tls.as_ref().unwrap().key_passphrase.as_deref(),
+        Some(PUBLIC_SENTINEL)
     );
-    assert!(
-        help.contains("--ssl-allow-rc4"),
-        "RC4 must be startup-visible, not silently omitted"
+    assert_eq!(
+        cfg.api_tls.as_ref().unwrap().key_passphrase.as_deref(),
+        Some(API_SENTINEL)
+    );
+    let debug = format!(
+        "{cfg:?} {:?} {:?}",
+        cfg.public_tls.as_ref().unwrap(),
+        cfg.api_tls.as_ref().unwrap()
+    );
+    assert!(debug.contains("<redacted>"));
+    for sentinel in [AUTH_SENTINEL, PUBLIC_SENTINEL, API_SENTINEL] {
+        assert!(!debug.contains(sentinel), "Debug leaked {sentinel}");
+    }
+}
+
+fn normalized_long_options(help: &str) -> BTreeSet<String> {
+    help.lines()
+        .filter_map(|line| {
+            let line = line.trim_start();
+            line.starts_with('-').then_some(line)
+        })
+        .flat_map(str::split_whitespace)
+        .filter(|token| token.starts_with("--"))
+        .map(|token| token.trim_end_matches(',').to_owned())
+        .collect()
+}
+
+#[test]
+fn help_long_options_exactly_match_the_pinned_chp_5_3_0_fixture() {
+    let chp_help = include_str!("fixtures/chp-5.3.0-help.txt");
+    let rust_help = Cli::command().render_long_help().to_string();
+
+    assert_eq!(
+        normalized_long_options(&rust_help),
+        normalized_long_options(chp_help),
+        "Rust and pinned CHP help long-option sets differ"
     );
 }
 

@@ -22,7 +22,7 @@ service-level contract tests land.
 | `--ssl-request-cert` | Identical | Requests public-listener client certificates; `all_tls_options_are_preserved`. |
 | `--ssl-reject-unauthorized` | Identical | Rejects unauthorized public-listener clients; `all_tls_options_are_preserved`. |
 | `--ssl-protocol` | Identical | Preserves the requested TLS protocol for public, API, and client TLS setup; `all_tls_options_are_preserved`. |
-| `--ssl-ciphers` | Identical | Preserves the OpenSSL cipher expression for TLS setup; `all_tls_options_are_preserved`. |
+| `--ssl-ciphers` | Identical | An explicit OpenSSL cipher expression is preserved. When omitted, TLS uses CHP 5.3.0’s exact lines 144–177 policy, including the duplicate `!RC4`; `all_tls_options_are_preserved`, `omitted_ssl_ciphers_use_the_exact_chp_5_3_0_policy`. |
 | `--ssl-allow-rc4` | **Intentional difference** | Always fails startup clearly. Modern OpenSSL security policy cannot safely re-enable removed RC4 support; `validation_errors_are_explicit_and_non_panicking`. |
 | `--ssl-dhparam` | Identical | Preserves the DH parameters path for TLS setup; `all_tls_options_are_preserved`. |
 | `--api-ip` | Identical | API host defaults to `localhost`; `listener_defaults_match_chp`, `listener_options_are_typed`. |
@@ -38,8 +38,8 @@ service-level contract tests land.
 | `--client-ssl-ca` | Identical | Target trust CA, including CA-only configuration; `all_tls_options_are_preserved`, `client_ca_can_configure_target_trust_without_a_client_identity`. |
 | `--client-ssl-request-cert` | Identical | Preserved target-facing TLS request-cert setting; `all_tls_options_are_preserved`. |
 | `--client-ssl-reject-unauthorized` | Identical | Preserved target-facing TLS rejection setting; `all_tls_options_are_preserved`. |
-| `--default-target` | Identical | Accepts a validated HTTP(S) or `http+unix` target URL; invalid targets return errors; `proxy_and_process_options_match_chp_surface`, `validation_errors_are_explicit_and_non_panicking`. |
-| `--error-target` | Identical | Accepts a validated HTTP(S) error target and conflicts with error path; `proxy_and_process_options_match_chp_surface`, `validation_errors_are_explicit_and_non_panicking`. |
+| `--default-target` | Identical | Accepts validated HTTP(S), `http+unix`, and `unix+http` targets. Unix HTTP requires a non-empty percent-encoded socket host; `proxy_and_process_options_match_chp_surface`, `default_and_error_targets_accept_valid_unix_http_urls`, `unix_http_targets_require_a_nonempty_percent_encoded_socket_host`. |
+| `--error-target` | Identical | Accepts the same valid TCP or Unix HTTP targets as the default target and conflicts with error path; `proxy_and_process_options_match_chp_surface`, `default_and_error_targets_accept_valid_unix_http_urls`, `unix_http_targets_require_a_nonempty_percent_encoded_socket_host`. |
 | `--error-path` | Identical | Selects filesystem error pages and conflicts with error target; `error_path_is_supported`, `validation_errors_are_explicit_and_non_panicking`. |
 | `--redirect-port` | Identical | Configures the HTTP redirect listener and requires public TLS material; `proxy_and_process_options_match_chp_surface`, `validation_errors_are_explicit_and_non_panicking`. |
 | `--redirect-to` | Identical | Selects the HTTPS port emitted by redirects; `proxy_and_process_options_match_chp_surface`. |
@@ -59,7 +59,7 @@ service-level contract tests land.
 | `--log-level` | Identical | Case-insensitive debug/info/warn/error, default info; invalid levels return errors; `proxy_and_process_options_match_chp_surface`, `validation_errors_are_explicit_and_non_panicking`. |
 | `--timeout` | Identical | Typed request timeout in milliseconds; `proxy_and_process_options_match_chp_surface`. |
 | `--proxy-timeout` | Identical | Typed target response timeout in milliseconds; `proxy_and_process_options_match_chp_surface`. |
-| `--storage-backend` | **Semantic equivalent with intentional Node-module difference** | `memory`, `redis`, and `sidecar` are typed backends. Arbitrary Node module names/paths fail startup and direct users to the versioned sidecar protocol because Rust cannot `require()` Node classes; `supported_storage_backends_are_typed`, `validation_errors_are_explicit_and_non_panicking`. |
+| `--storage-backend` | **Semantic equivalent with intentional Node-module difference** | `memory`, `redis`, and `sidecar` are typed configuration selections. Arbitrary Node module names/paths fail startup because Rust cannot `require()` Node classes. The sidecar selection reserves the planned integration boundary; this task does not claim that protocol or runtime adapter is implemented; `supported_storage_backends_are_typed`, `validation_errors_are_explicit_and_non_panicking`. |
 | `--keep-alive-timeout` | Identical | Typed keep-alive timeout in milliseconds; `proxy_and_process_options_match_chp_surface`. |
 
 ## Environment variables
@@ -70,13 +70,16 @@ service-level contract tests land.
 | `CONFIGPROXY_SSL_KEY_PASSPHRASE` | Identical | Supplies the public-listener key passphrase. |
 | `CONFIGPROXY_API_SSL_KEY_PASSPHRASE` | Identical | Supplies the API-listener key passphrase. |
 
-All three are covered by `chp_environment_variables_are_consumed` and are held as
-typed configuration values rather than logged. Unknown long options are rejected
-by Clap and covered by `unknown_long_options_are_rejected`.
+All three are covered by `chp_environment_variables_are_consumed`, restored with
+panic-safe serialized test guards, and redacted from `Debug` output by
+`debug_output_redacts_auth_and_tls_secrets`. Unknown long options are rejected by
+Clap and covered by `unknown_long_options_are_rejected`.
 
 ## Help coverage
 
-`help_covers_every_chp_5_3_0_long_option` owns the normalized list extracted from
-the pinned CHP 5.3.0 source and verifies that every long option occurs in Rust
-help. The two intentional runtime differences remain visible in help and fail
-during validation; neither is hidden or silently accepted.
+`tests/fixtures/chp-5.3.0-help.txt` is generated directly from the pinned source
+with `node /tmp/chp530/bin/configurable-http-proxy --help`. The
+`help_long_options_exactly_match_the_pinned_chp_5_3_0_fixture` test applies the
+same normalizer to that fixture and Rust help, then compares exact sets so either
+an addition or a removal fails. Intentional runtime differences remain visible
+in help and fail during validation; neither is hidden or silently accepted.

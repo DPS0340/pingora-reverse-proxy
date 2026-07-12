@@ -2,11 +2,25 @@
 
 use std::collections::BTreeMap;
 use std::env;
+use std::fmt;
 use std::path::PathBuf;
 
 use clap::{ArgAction, Parser};
 use thiserror::Error;
 use url::Url;
+
+const CHP_5_3_0_DEFAULT_TLS_CIPHERS: &str = "ECDHE-RSA-AES128-GCM-SHA256:\
+ECDHE-ECDSA-AES128-GCM-SHA256:\
+ECDHE-RSA-AES256-GCM-SHA384:\
+ECDHE-ECDSA-AES256-GCM-SHA384:\
+DHE-RSA-AES128-GCM-SHA256:\
+ECDHE-RSA-AES128-SHA256:\
+DHE-RSA-AES128-SHA256:\
+ECDHE-RSA-AES256-SHA384:\
+DHE-RSA-AES256-SHA384:\
+ECDHE-RSA-AES256-SHA256:\
+DHE-RSA-AES256-SHA256:\
+HIGH:!RC4:!aNULL:!eNULL:!EXPORT:!DES:!RC4:!MD5:!PSK:!SRP:!CAMELLIA";
 
 /// Raw command-line options. Validation that spans multiple options is performed by
 /// [`AppConfig::try_from`].
@@ -180,7 +194,7 @@ pub enum ListenerConfig {
 }
 
 /// TLS material shared by listener and target TLS configurations.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct TlsConfig {
     pub key: Option<PathBuf>,
     pub cert: Option<PathBuf>,
@@ -191,6 +205,26 @@ pub struct TlsConfig {
     pub protocol: Option<String>,
     pub ciphers: Option<String>,
     pub dhparam: Option<PathBuf>,
+}
+
+impl fmt::Debug for TlsConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TlsConfig")
+            .field("key", &self.key)
+            .field("cert", &self.cert)
+            .field("ca", &self.ca)
+            .field(
+                "key_passphrase",
+                &self.key_passphrase.as_ref().map(|_| "<redacted>"),
+            )
+            .field("request_cert", &self.request_cert)
+            .field("reject_unauthorized", &self.reject_unauthorized)
+            .field("protocol", &self.protocol)
+            .field("ciphers", &self.ciphers)
+            .field("dhparam", &self.dhparam)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,7 +258,7 @@ pub struct ProxyOptions {
     pub keep_alive_timeout_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AppConfig {
     pub public_listener: ListenerConfig,
     pub api_listener: ListenerConfig,
@@ -244,6 +278,33 @@ pub struct AppConfig {
     pub proxy: ProxyOptions,
 }
 
+impl fmt::Debug for AppConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AppConfig")
+            .field("public_listener", &self.public_listener)
+            .field("api_listener", &self.api_listener)
+            .field("metrics_listener", &self.metrics_listener)
+            .field("public_tls", &self.public_tls)
+            .field("api_tls", &self.api_tls)
+            .field("client_tls", &self.client_tls)
+            .field("default_target", &self.default_target)
+            .field("error_target", &self.error_target)
+            .field("error_path", &self.error_path)
+            .field("redirect_port", &self.redirect_port)
+            .field("redirect_to", &self.redirect_to)
+            .field("pid_file", &self.pid_file)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("log_level", &self.log_level)
+            .field("store", &self.store)
+            .field("proxy", &self.proxy)
+            .finish()
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ConfigError {
     #[error("cannot specify both --error-target and --error-path")]
@@ -254,10 +315,12 @@ pub enum ConfigError {
     IncompleteKeyPair(&'static str),
     #[error("invalid log level {0:?}; expected debug, info, warn, or error")]
     InvalidLogLevel(String),
-    #[error("invalid {kind} {value:?}; expected an HTTP(S) target URL with a host")]
+    #[error(
+        "invalid {kind} {value:?}; expected an HTTP(S) URL with a host or a Unix HTTP URL with a non-empty percent-encoded socket host"
+    )]
     InvalidTarget { kind: &'static str, value: String },
     #[error(
-        "unknown storage backend {0:?}; use memory, redis, or sidecar. Arbitrary Node storage modules cannot be loaded; use the sidecar protocol"
+        "unknown storage backend {0:?}; use memory, redis, or sidecar. Arbitrary Node storage modules cannot be loaded; use the planned sidecar protocol once implemented"
     )]
     UnknownStorageBackend(String),
     #[error("--ssl-allow-rc4 is unsupported: OpenSSL security policy will not re-enable RC4")]
@@ -332,7 +395,10 @@ impl TryFrom<Cli> for AppConfig {
 
         let inherited_tls = InheritedTls {
             protocol: cli.ssl_protocol,
-            ciphers: cli.ssl_ciphers,
+            ciphers: Some(
+                cli.ssl_ciphers
+                    .unwrap_or_else(|| CHP_5_3_0_DEFAULT_TLS_CIPHERS.to_owned()),
+            ),
             dhparam: cli.ssl_dhparam,
         };
         let public_tls = tls_config(
@@ -468,12 +534,36 @@ fn parse_target(value: Option<String>, kind: &'static str) -> Result<Option<Url>
         kind,
         value: value.clone(),
     })?;
-    if !matches!(url.scheme(), "http" | "https" | "http+unix")
-        || (url.scheme() != "http+unix" && url.host_str().is_none())
-    {
+    let valid = match url.scheme() {
+        "http" | "https" => url.host_str().is_some_and(|host| !host.is_empty()),
+        "http+unix" | "unix+http" => url.host_str().is_some_and(is_percent_encoded_socket_host),
+        _ => false,
+    };
+    if !valid {
         return Err(ConfigError::InvalidTarget { kind, value });
     }
     Ok(Some(url))
+}
+
+fn is_percent_encoded_socket_host(host: &str) -> bool {
+    let bytes = host.as_bytes();
+    let mut index = 0;
+    let mut has_percent_encoding = false;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            has_percent_encoding = true;
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    has_percent_encoding
 }
 
 fn parse_log_level(value: String) -> Result<LogLevel, ConfigError> {

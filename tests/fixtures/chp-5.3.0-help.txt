@@ -1,0 +1,98 @@
+Usage: configurable-http-proxy [options]
+
+Options:
+  -V, --version                      output the version number
+  --ip <ip-address>                  Public-facing IP of the proxy
+  --port <n> (defaults to 8000)      Public-facing port of the proxy
+  --socket <path>                    Path to a UNIX domain socket for the proxy
+                                     to listen on. Alternative to specifying IP
+                                     and port.
+  --ssl-key <keyfile>                SSL key to use, if any
+  --ssl-cert <certfile>              SSL certificate to use, if any
+  --ssl-ca <ca-file>                 SSL certificate authority, if any
+  --ssl-request-cert                 Request SSL certs to authenticate clients
+  --ssl-reject-unauthorized          Reject unauthorized SSL connections (only
+                                     meaningful if --ssl-request-cert is given)
+  --ssl-protocol <ssl-protocol>      Set specific SSL protocol, e.g. TLSv1_2,
+                                     SSLv3
+  --ssl-ciphers <ciphers>            `:`-separated ssl cipher list. Default
+                                     excludes RC4
+  --ssl-allow-rc4                    Allow RC4 cipher for SSL (disabled by
+                                     default)
+  --ssl-dhparam <dhparam-file>       SSL Diffie-Helman Parameters pem file, if
+                                     any
+  --api-ip <ip>                      Inward-facing IP for API requests (default:
+                                     "localhost")
+  --api-port <n>                     Inward-facing port for API requests
+                                     (defaults to --port=value+1)
+  --api-socket <path>                Path to a UNIX domain socket for the API
+                                     server to listen on. Alternative to
+                                     specifying API IP and port.
+  --api-ssl-key <keyfile>            SSL key to use, if any, for API requests
+  --api-ssl-cert <certfile>          SSL certificate to use, if any, for API
+                                     requests
+  --api-ssl-ca <ca-file>             SSL certificate authority, if any, for API
+                                     requests
+  --api-ssl-request-cert             Request SSL certs to authenticate clients
+                                     for API requests
+  --api-ssl-reject-unauthorized      Reject unauthorized SSL connections (only
+                                     meaningful if --api-ssl-request-cert is
+                                     given)
+  --client-ssl-key <keyfile>         SSL key to use, if any, for proxy to client
+                                     requests
+  --client-ssl-cert <certfile>       SSL certificate to use, if any, for proxy
+                                     to client requests
+  --client-ssl-ca <ca-file>          SSL certificate authority, if any, for
+                                     proxy to client requests
+  --client-ssl-request-cert          Request SSL certs to authenticate clients
+                                     for API requests
+  --client-ssl-reject-unauthorized   Reject unauthorized SSL connections (only
+                                     meaningful if --client-ssl-request-cert is
+                                     given)
+  --default-target <host>            Default proxy target (proto://host[:port])
+  --error-target <host>              Alternate server for handling proxy errors
+                                     (proto://host[:port])
+  --error-path <path>                Alternate server for handling proxy errors
+                                     (proto://host[:port])
+  --redirect-port <redirect-port>    Redirect HTTP requests on this port to the
+                                     server on HTTPS
+  --redirect-to <port>               Redirect HTTP requests from --redirect-port
+                                     to this port
+  --pid-file <pid-file>              Write our PID to a file
+  --no-x-forward                     Don't add 'X-forward-' headers to proxied
+                                     requests
+  --no-prepend-path                  Avoid prepending target paths to proxied
+                                     requests
+  --no-include-prefix                Don't include the routing prefix in proxied
+                                     requests
+  --auto-rewrite                     Rewrite the Location header host/port in
+                                     redirect responses
+  --change-origin                    Changes the origin of the host header to
+                                     the target URL
+  --protocol-rewrite <proto>         Rewrite the Location header protocol in
+                                     redirect responses to the specified
+                                     protocol
+  --custom-header <header>           Custom header to add to proxied requests.
+                                     Use same option for multiple headers
+                                     (--custom-header k1:v1 --custom-header
+                                     k2:v2) (default: {})
+  --insecure                         Disable SSL cert verification
+  --host-routing                     Use host routing (host as first level of
+                                     path)
+  --metrics-ip <ip>                  IP for metrics server (default: "")
+  --metrics-port <n>                 Port of metrics server. Defaults to no
+                                     metrics server
+  --metrics-socket <path>            Path to a UNIX domain socket for the
+                                     metrics server to listen on. Alternative to
+                                     specifying metrics IP and port.
+  --log-level <loglevel>             Log level (debug, info, warn, error)
+                                     (default: "info")
+  --timeout <n>                      Timeout (in millis) when proxy drops
+                                     connection for a request.
+  --proxy-timeout <n>                Timeout (in millis) when proxy receives no
+                                     response from target.
+  --storage-backend <storage-class>  Define an external storage class. Defaults
+                                     to in-MemoryStore.
+  --keep-alive-timeout <timeout>     Set timeout (in milliseconds) for
+                                     Keep-Alive connections
+  -h, --help                         display help for command
