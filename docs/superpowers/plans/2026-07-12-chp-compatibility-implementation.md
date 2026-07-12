@@ -481,6 +481,18 @@ git add src/api.rs src/metrics.rs tests/api_contract.rs tests/support/mod.rs
 git commit -m "feat: add CHP-compatible route management API"
 ```
 
+#### Task 5 final acceptance finding: supervised mutation lifecycle
+
+The registry owns and tracks every `add`, `put`, activity-update, and delete
+task. Caller cancellation drops only the response receiver. The shared
+supervisor observes every terminal backend result or panic, records detached
+diagnostics without mutation data or panic payloads, decrements active count,
+and wakes bounded `drain_mutations(timeout)` waiters. Live callers retain exact
+backend `Result` behavior, with a fixed operation-specific `StoreError` for a
+task panic. Contract tests cover cancelled success and failure, panic, timeout
+and later release, concurrent drain, unavailable-runtime spawn failure, runtime
+shutdown cancellation, and registry lifetime release.
+
 ### Task 6: URI Construction, Header Policy, and Upstream Peer Selection
 
 **Files:**
@@ -641,6 +653,12 @@ Use Pingora's public proxy service for TCP/TLS/UDS. Use `HttpPeer::new_uds` for 
 - [ ] **Step 4: Implement shutdown/PID/redirect behavior**
 
 Create the PID file atomically with `create_new`, remove it through an RAII guard, and wire Pingora shutdown watch into API and activity services. The redirect service returns 400 without Host and 301 to the configured HTTPS port otherwise.
+
+Shutdown must first stop accepting management requests, then invoke
+`RouteRegistry::drain_mutations` with a configured finite bound and report its
+structured timeout/failure/panic outcome before Tokio runtime termination. A
+timed-out drain must not cancel the remaining registry-owned tasks; runtime
+termination is the final fallback after the timeout has been surfaced.
 
 - [ ] **Step 5: Verify GREEN**
 

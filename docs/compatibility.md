@@ -11,6 +11,22 @@ The configuration contract is exercised by `tests/config_contract.rs`. Runtime
 features are only claimed here at the CLI/configuration boundary until their
 service-level contract tests land.
 
+## Route mutation lifecycle
+
+Accepted `add`, `put`, activity-update, and delete operations are owned by the
+route registry, not by an individual HTTP request future. The registry tracks
+every mutation task and its active count. Cancelling a request drops only its
+result receiver; persistence and immutable-snapshot reconciliation continue.
+`RouteRegistry::drain_mutations(timeout)` provides the bounded shutdown
+boundary, returning whether it timed out, the remaining active count, and any
+detached backend failures or task panics accumulated since the previous drain.
+Panic diagnostics contain only the operation kind and fixed text, while debug
+formatting redacts detached backend error text.
+
+Task 8 shutdown must stop accepting management requests, call this bounded
+drain and surface its outcome, and only then allow the Tokio runtime to
+terminate. A timeout is reported but does not cancel the pending mutation.
+
 | CHP long option | Classification | Configuration behavior and contract test |
 |---|---|---|
 | `--ip` | Identical | Selects the public TCP address; omission and `*` mean all interfaces as in CHP; `listener_options_are_typed`, `star_ip_alias_matches_chp_all_interfaces_behavior`. |

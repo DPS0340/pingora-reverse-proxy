@@ -134,3 +134,63 @@ Final output:
     Checking pingora-reverse-proxy v0.2.0 (/Users/lee/programming/pingora-reverse-proxy/.worktrees/chp-compatibility)
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.33s
 ```
+
+## Task 5 supervised mutation lifecycle RED
+
+Command:
+
+```bash
+cargo test --test store_contract --no-run
+```
+
+Exit code: `101`
+
+The contract tests failed before production changes with the expected missing
+supervisor API diagnostics:
+
+```text
+error[E0432]: unresolved import `pingora_reverse_proxy::route_table::MutationOperation`
+error[E0599]: no method named `drain_mutations` found for struct `Arc<RouteRegistry>`
+error: could not compile `pingora-reverse-proxy` (test "store_contract") due to 8 previous errors
+```
+
+## Task 5 supervised mutation lifecycle focused GREEN
+
+Command:
+
+```bash
+cargo test --test store_contract -- --nocapture
+```
+
+Exit code: `0`
+
+```text
+running 29 tests
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+The intentional panic-backend test triggers Rust's process-wide panic hook,
+then verifies that the live caller receives a fixed `StoreError`, the detached
+caller produces a fixed payload-free tracker diagnostic, and active count
+returns to zero.
+
+## Task 5 supervised mutation lifecycle final verification
+
+Command:
+
+```bash
+PROPTEST_CASES=2048 cargo test --test api_contract --test config_contract --test route_properties --test store_contract -- --nocapture
+```
+
+Exit code: `0`. Results: API `33 passed`, config `26 passed`, route `11
+passed`, store `29 passed`; no failures, ignores, or filtered tests.
+
+Quality gates:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo check --all-targets --all-features
+```
+
+All three exited `0`. No dependency was added.

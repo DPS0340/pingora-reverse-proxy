@@ -1,12 +1,17 @@
 //! Immutable, segment-indexed route matching.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::future::Future;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex, Notify};
 use tokio::task::JoinHandle;
 
 use crate::route::{RouteData, RouteKey};
@@ -63,6 +68,215 @@ pub struct RouteMatch {
 pub struct RouteSnapshot {
     root: Node,
     routes: OrderedRoutes,
+}
+
+/// Registry mutation kind reported by lifecycle diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MutationOperation {
+    Add,
+    Put,
+    UpdateActivity,
+    Delete,
+}
+
+impl MutationOperation {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Put => "put",
+            Self::UpdateActivity => "activity update",
+            Self::Delete => "delete",
+        }
+    }
+
+    fn panic_message(self) -> String {
+        format!("route {} mutation task panicked", self.name())
+    }
+}
+
+/// A backend error whose caller stopped waiting before it completed.
+pub struct DetachedMutationFailure {
+    pub operation: MutationOperation,
+    pub error: StoreError,
+}
+
+impl std::fmt::Debug for DetachedMutationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DetachedMutationFailure")
+            .field("operation", &self.operation)
+            .field("error", &"[redacted StoreError]")
+            .finish()
+    }
+}
+
+/// A task panic whose caller stopped waiting before it completed.
+#[derive(Debug, Eq, PartialEq)]
+pub struct DetachedMutationPanic {
+    pub operation: MutationOperation,
+    /// Fixed text that deliberately excludes the panic payload and mutation data.
+    pub message: String,
+}
+
+/// Bounded mutation-drain result and diagnostics accumulated since the last drain.
+#[derive(Debug)]
+pub struct MutationDrainOutcome {
+    pub timed_out: bool,
+    pub active_mutations: usize,
+    pub detached_failures: Vec<DetachedMutationFailure>,
+    pub detached_panics: Vec<DetachedMutationPanic>,
+}
+
+#[derive(Default)]
+struct MutationTrackerState {
+    active: usize,
+    handles: Vec<TrackedMutation>,
+    detached_failures: Vec<DetachedMutationFailure>,
+    detached_panics: Vec<DetachedMutationPanic>,
+}
+
+struct TrackedMutation {
+    handle: JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct MutationTracker {
+    state: StdMutex<MutationTrackerState>,
+    changed: Notify,
+}
+
+impl MutationTracker {
+    fn state(&self) -> StdMutexGuard<'_, MutationTrackerState> {
+        match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn start(&self) {
+        let mut state = self.state();
+        state.active = state.active.saturating_add(1);
+    }
+
+    fn track(&self, handle: JoinHandle<()>) {
+        self.state().handles.push(TrackedMutation { handle });
+    }
+
+    fn finish(
+        &self,
+        failure: Option<DetachedMutationFailure>,
+        panic: Option<DetachedMutationPanic>,
+    ) {
+        {
+            let mut state = self.state();
+            state.active = state.active.saturating_sub(1);
+            if let Some(failure) = failure {
+                state.detached_failures.push(failure);
+            }
+            if let Some(panic) = panic {
+                state.detached_panics.push(panic);
+            }
+        }
+        self.changed.notify_waiters();
+    }
+
+    fn active(&self) -> usize {
+        self.state().active
+    }
+
+    async fn wait_until_inactive(&self) {
+        loop {
+            let changed = self.changed.notified();
+            if self.active() == 0 {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    fn outcome(&self, timed_out: bool) -> MutationDrainOutcome {
+        let mut state = self.state();
+        state
+            .handles
+            .retain(|tracked| !tracked.handle.is_finished());
+        MutationDrainOutcome {
+            timed_out,
+            active_mutations: state.active,
+            detached_failures: std::mem::take(&mut state.detached_failures),
+            detached_panics: std::mem::take(&mut state.detached_panics),
+        }
+    }
+}
+
+struct ActiveMutation {
+    tracker: Arc<MutationTracker>,
+    operation: MutationOperation,
+    finished: bool,
+}
+
+impl ActiveMutation {
+    fn new(tracker: Arc<MutationTracker>, operation: MutationOperation) -> Self {
+        Self {
+            tracker,
+            operation,
+            finished: false,
+        }
+    }
+
+    fn finish(
+        mut self,
+        failure: Option<DetachedMutationFailure>,
+        panic: Option<DetachedMutationPanic>,
+    ) {
+        self.finished = true;
+        self.tracker.finish(failure, panic);
+    }
+}
+
+impl Drop for ActiveMutation {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.tracker.finish(
+                None,
+                Some(DetachedMutationPanic {
+                    operation: self.operation,
+                    message: format!(
+                        "route {} mutation task terminated unexpectedly",
+                        self.operation.name()
+                    ),
+                }),
+            );
+        }
+    }
+}
+
+struct CatchUnwindFuture<F> {
+    future: Pin<Box<F>>,
+}
+
+struct MutationResponse<T> {
+    result: Result<T, StoreError>,
+    acknowledged: oneshot::Sender<()>,
+}
+
+impl<F> CatchUnwindFuture<F> {
+    fn new(future: F) -> Self {
+        Self {
+            future: Box::pin(future),
+        }
+    }
+}
+
+impl<F: Future> Future for CatchUnwindFuture<F> {
+    type Output = Result<F::Output, ()>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        match catch_unwind(AssertUnwindSafe(|| self.future.as_mut().poll(context))) {
+            Ok(Poll::Ready(output)) => Poll::Ready(Ok(output)),
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(_) => Poll::Ready(Err(())),
+        }
+    }
 }
 
 impl RouteSnapshot {
@@ -127,6 +341,7 @@ pub struct RouteRegistry {
     store: Arc<dyn Store>,
     snapshot: ArcSwap<RouteSnapshot>,
     mutation: Mutex<()>,
+    mutations: Arc<MutationTracker>,
 }
 
 impl RouteRegistry {
@@ -140,6 +355,7 @@ impl RouteRegistry {
             store,
             snapshot: ArcSwap::from_pointee(RouteSnapshot::from_routes(routes)),
             mutation: Mutex::new(()),
+            mutations: Arc::new(MutationTracker::default()),
         }))
     }
 
@@ -161,9 +377,9 @@ impl RouteRegistry {
     /// Persist a route replacement and publish it atomically on success.
     pub async fn put(self: &Arc<Self>, key: RouteKey, data: RouteData) -> Result<(), StoreError> {
         let registry = Arc::clone(self);
-        mutation_result(tokio::spawn(
-            async move { registry.put_owned(key, data).await },
-        ))
+        self.run_mutation(MutationOperation::Put, async move {
+            registry.put_owned(key, data).await
+        })
         .await
     }
 
@@ -184,9 +400,9 @@ impl RouteRegistry {
         extra: Map<String, Value>,
     ) -> Result<(), StoreError> {
         let registry = Arc::clone(self);
-        mutation_result(tokio::spawn(async move {
+        self.run_mutation(MutationOperation::Add, async move {
             registry.add_owned(key, target, extra).await
-        }))
+        })
         .await
     }
 
@@ -212,9 +428,9 @@ impl RouteRegistry {
     ) -> Result<(), StoreError> {
         let registry = Arc::clone(self);
         let key = key.clone();
-        mutation_result(tokio::spawn(async move {
+        self.run_mutation(MutationOperation::UpdateActivity, async move {
             registry.update_activity_owned(key, at).await
-        }))
+        })
         .await
     }
 
@@ -235,9 +451,9 @@ impl RouteRegistry {
     pub async fn delete(self: &Arc<Self>, key: &RouteKey) -> Result<Option<RouteData>, StoreError> {
         let registry = Arc::clone(self);
         let key = key.clone();
-        mutation_result(tokio::spawn(
-            async move { registry.delete_owned(key).await },
-        ))
+        self.run_mutation(MutationOperation::Delete, async move {
+            registry.delete_owned(key).await
+        })
         .await
     }
 
@@ -254,14 +470,86 @@ impl RouteRegistry {
         self.snapshot
             .store(Arc::new(RouteSnapshot::from_ordered_routes(routes)));
     }
-}
 
-async fn mutation_result<T>(task: JoinHandle<Result<T, StoreError>>) -> Result<T, StoreError> {
-    match task.await {
-        Ok(result) => result,
-        Err(error) => Err(StoreError::message(format!(
-            "route mutation task failed: {error}"
-        ))),
+    /// Wait at most `timeout` for all currently accepted mutations to finish.
+    ///
+    /// Detached diagnostics are returned once and consumed by this call. A
+    /// timeout does not cancel pending mutations; a later drain can finish them.
+    pub async fn drain_mutations(&self, timeout: Duration) -> MutationDrainOutcome {
+        let timed_out = tokio::time::timeout(timeout, async {
+            self.mutations.wait_until_inactive().await;
+            // Completion accounting is the task's final synchronous action.
+            // Yield once so completed handles can transition to `is_finished`
+            // before the tracker prunes them without detaching pending work.
+            tokio::task::yield_now().await;
+        })
+        .await
+        .is_err();
+
+        self.mutations.outcome(timed_out)
+    }
+
+    async fn run_mutation<T, F>(
+        &self,
+        operation: MutationOperation,
+        mutation: F,
+    ) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: Future<Output = Result<T, StoreError>> + Send + 'static,
+    {
+        let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+            StoreError::message(format!(
+                "route {} mutation could not start: Tokio runtime unavailable",
+                operation.name()
+            ))
+        })?;
+        let (response, receiver) = oneshot::channel();
+        self.mutations.start();
+        let active = ActiveMutation::new(Arc::clone(&self.mutations), operation);
+        let handle = runtime.spawn(async move {
+            match CatchUnwindFuture::new(mutation).await {
+                Ok(result) => {
+                    let detached_error = result.as_ref().err().cloned();
+                    let (acknowledged, acknowledgment) = oneshot::channel();
+                    let detached = match response.send(MutationResponse {
+                        result,
+                        acknowledged,
+                    }) {
+                        Ok(()) => acknowledgment.await.is_err(),
+                        Err(_) => true,
+                    };
+                    let detached_failure = detached_error
+                        .filter(|_| detached)
+                        .map(|error| DetachedMutationFailure { operation, error });
+                    active.finish(detached_failure, None);
+                }
+                Err(()) => {
+                    let message = operation.panic_message();
+                    let (acknowledged, acknowledgment) = oneshot::channel();
+                    let detached = match response.send(MutationResponse {
+                        result: Err(StoreError::message(message.clone())),
+                        acknowledged,
+                    }) {
+                        Ok(()) => acknowledgment.await.is_err(),
+                        Err(_) => true,
+                    };
+                    let detached_panic =
+                        detached.then_some(DetachedMutationPanic { operation, message });
+                    active.finish(None, detached_panic);
+                }
+            }
+        });
+        self.mutations.track(handle);
+
+        let response = receiver.await.map_err(|_| {
+            StoreError::message(format!(
+                "route {} mutation task terminated before returning a result",
+                operation.name()
+            ))
+        })?;
+        let _ = response.acknowledged.send(());
+        response.result
     }
 }
 

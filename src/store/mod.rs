@@ -12,7 +12,7 @@ use crate::route::{RouteData, RouteKey};
 pub mod memory;
 
 /// Error returned by a route persistence backend.
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Error)]
 pub enum StoreError {
     #[error("{0}")]
     Message(String),

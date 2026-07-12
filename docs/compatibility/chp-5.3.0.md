@@ -3,19 +3,28 @@
 ## Route mutation cancellation and lifetime
 
 Route registry mutations are cancellation-independent once invoked. `add`,
-`put`, activity updates, and deletes each run in a registry-owned Tokio task
-that serializes with the other mutations, awaits the backend result, and then
-publishes the reconciled immutable snapshot. Dropping an HTTP request future
-only abandons that request's result; it does not cancel the logical mutation.
+`put`, activity updates, and deletes all use one registry-owned supervisor that
+tracks their `JoinHandle`s and active count. Each task serializes with the other
+mutations, awaits the backend result, and then publishes the reconciled
+immutable snapshot. Dropping an HTTP request future only drops its oneshot
+result receiver; it does not cancel the logical mutation. The supervisor still
+observes completion, records a detached `StoreError` or redacted panic
+diagnostic, decrements the count, and notifies drain waiters. A live caller
+receives its exact backend result; a task panic becomes an operation-specific
+`StoreError` without retaining its payload.
 
 The task holds the registry alive until the backend operation finishes. Store
 implementations must use finite operation timeouts; an ordinary timeout returns
 an error, releases the mutation lock, and drops the task's registry reference.
-Graceful application shutdown should keep the Tokio runtime alive while
-accepted management requests drain. Runtime termination cancels remaining
-tasks, so every backend mutation must itself be one atomic persistence
-operation. A backend that remains pending forever can retain the registry
-forever and violates the store timeout requirement.
+`RouteRegistry::drain_mutations(timeout)` waits within a caller-supplied bound
+and returns a structured outcome containing timeout state, remaining active
+count, and accumulated detached failures and panics. Diagnostics are consumed
+by each drain; timeout never cancels pending work. Task 8 graceful shutdown must
+stop accepting management requests, invoke this bounded drain and surface its
+outcome, then terminate the Tokio runtime. Runtime termination can still cancel
+work left after a reported timeout, so every backend mutation must itself be
+one atomic persistence operation. A backend that remains pending forever
+violates the store timeout requirement.
 
 ## `requests_api` timing divergence
 

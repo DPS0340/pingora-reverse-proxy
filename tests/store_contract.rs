@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use pingora_reverse_proxy::route::{RouteData, RouteKey};
-use pingora_reverse_proxy::route_table::{RouteMatch, RouteRegistry};
+use pingora_reverse_proxy::route_table::{MutationOperation, RouteMatch, RouteRegistry};
 use pingora_reverse_proxy::store::memory::MemoryStore;
 use pingora_reverse_proxy::store::{Store, StoreError};
 use proptest::prelude::*;
@@ -329,7 +331,8 @@ async fn cancelling_add_before_commit_does_not_cancel_the_registry_owned_mutatio
     assert_eq!(registry.get(&route_key), Some(original));
 
     store.release.add_permits(1);
-    registry.delete(&key("/missing")).await.unwrap();
+    let drained = registry.drain_mutations(Duration::from_secs(1)).await;
+    assert!(!drained.timed_out);
 
     let committed = store.snapshot().await.unwrap().remove(&route_key).unwrap();
     assert_eq!(committed.target, "http://replacement.example");
@@ -426,7 +429,8 @@ async fn cancelling_put_does_not_cancel_the_registry_owned_mutation() {
     caller.abort();
     assert!(caller.await.unwrap_err().is_cancelled());
     store.release.add_permits(1);
-    registry.delete(&key("/missing")).await.unwrap();
+    let drained = registry.drain_mutations(Duration::from_secs(1)).await;
+    assert!(!drained.timed_out);
 
     assert_eq!(
         store.snapshot().await.unwrap().get(&route_key),
@@ -455,7 +459,8 @@ async fn cancelling_activity_update_does_not_cancel_the_registry_owned_mutation(
     caller.abort();
     assert!(caller.await.unwrap_err().is_cancelled());
     store.release.add_permits(1);
-    registry.delete(&key("/missing")).await.unwrap();
+    let drained = registry.drain_mutations(Duration::from_secs(1)).await;
+    assert!(!drained.timed_out);
 
     assert_eq!(
         store.snapshot().await.unwrap()[&route_key].last_activity,
@@ -482,10 +487,8 @@ async fn cancelling_delete_does_not_cancel_the_registry_owned_mutation() {
     caller.abort();
     assert!(caller.await.unwrap_err().is_cancelled());
     store.release.add_permits(1);
-    registry
-        .update_activity(&key("/missing"), Utc::now())
-        .await
-        .unwrap();
+    let drained = registry.drain_mutations(Duration::from_secs(1)).await;
+    assert!(!drained.timed_out);
 
     assert!(!store.snapshot().await.unwrap().contains_key(&route_key));
     assert!(registry.get(&route_key).is_none());
@@ -961,4 +964,312 @@ async fn concurrent_readers_observe_only_complete_snapshots() {
     }
 
     assert!(registry.resolve("\0/untrusted/runtime/path").is_none());
+}
+
+#[derive(Clone, Copy)]
+enum SupervisedPutOutcome {
+    Success,
+    Error,
+    Panic,
+}
+
+struct SupervisedPutStore {
+    routes: RwLock<BTreeMap<RouteKey, RouteData>>,
+    entered: Semaphore,
+    release: Semaphore,
+    outcome: SupervisedPutOutcome,
+}
+
+impl SupervisedPutStore {
+    fn new(outcome: SupervisedPutOutcome) -> Self {
+        Self {
+            routes: RwLock::new(BTreeMap::new()),
+            entered: Semaphore::new(0),
+            release: Semaphore::new(0),
+            outcome,
+        }
+    }
+}
+
+#[async_trait]
+impl Store for SupervisedPutStore {
+    async fn snapshot(&self) -> Result<BTreeMap<RouteKey, RouteData>, StoreError> {
+        Ok(self.routes.read().await.clone())
+    }
+
+    async fn add(
+        &self,
+        _key: RouteKey,
+        _target: String,
+        _extra: Map<String, serde_json::Value>,
+    ) -> Result<RouteData, StoreError> {
+        Err(StoreError::message("unused add"))
+    }
+
+    async fn put(&self, key: RouteKey, data: RouteData) -> Result<(), StoreError> {
+        self.entered.add_permits(1);
+        self.release.acquire().await.unwrap().forget();
+        match self.outcome {
+            SupervisedPutOutcome::Success => {
+                self.routes.write().await.insert(key, data);
+                Ok(())
+            }
+            SupervisedPutOutcome::Error => Err(StoreError::message("detached backend failure")),
+            SupervisedPutOutcome::Panic => panic!("sensitive panic payload must not escape"),
+        }
+    }
+
+    async fn update_activity(&self, _key: &RouteKey, _at: DateTime<Utc>) -> Result<(), StoreError> {
+        Err(StoreError::message("unused activity update"))
+    }
+
+    async fn delete(&self, _key: &RouteKey) -> Result<Option<RouteData>, StoreError> {
+        Err(StoreError::message("unused delete"))
+    }
+}
+
+async fn start_and_cancel_supervised_put(
+    registry: &Arc<RouteRegistry>,
+    store: &Arc<SupervisedPutStore>,
+    route_key: RouteKey,
+    route_data: RouteData,
+) {
+    let caller = {
+        let registry = Arc::clone(registry);
+        tokio::spawn(async move { registry.put(route_key, route_data).await })
+    };
+    store.entered.acquire().await.unwrap().forget();
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn cancelled_caller_later_success_converges_and_drain_succeeds() {
+    let route_key = key("/supervised-success");
+    let route_data = route("http://success.example");
+    let store = Arc::new(SupervisedPutStore::new(SupervisedPutOutcome::Success));
+    let registry = RouteRegistry::load(store.clone()).await.unwrap();
+
+    start_and_cancel_supervised_put(&registry, &store, route_key.clone(), route_data.clone()).await;
+    store.release.add_permits(1);
+
+    let drained = registry.drain_mutations(Duration::from_secs(1)).await;
+    assert!(!drained.timed_out);
+    assert_eq!(drained.active_mutations, 0);
+    assert!(drained.detached_failures.is_empty());
+    assert!(drained.detached_panics.is_empty());
+    assert_eq!(registry.get(&route_key), Some(route_data));
+}
+
+#[tokio::test]
+async fn cancelled_caller_later_store_error_is_surfaced_by_drain() {
+    let store = Arc::new(SupervisedPutStore::new(SupervisedPutOutcome::Error));
+    let registry = RouteRegistry::load(store.clone()).await.unwrap();
+
+    start_and_cancel_supervised_put(
+        &registry,
+        &store,
+        key("/supervised-error"),
+        route("http://error.example"),
+    )
+    .await;
+    store.release.add_permits(1);
+
+    let drained = registry.drain_mutations(Duration::from_secs(1)).await;
+    assert!(!drained.timed_out);
+    assert_eq!(drained.active_mutations, 0);
+    assert_eq!(drained.detached_failures.len(), 1);
+    assert_eq!(
+        drained.detached_failures[0].operation,
+        MutationOperation::Put
+    );
+    assert_eq!(
+        drained.detached_failures[0].error.to_string(),
+        "detached backend failure"
+    );
+    assert!(!format!("{drained:?}").contains("detached backend failure"));
+    assert!(drained.detached_panics.is_empty());
+}
+
+#[tokio::test]
+async fn backend_panic_reaches_live_and_detached_callers_without_stranding_active_count() {
+    let live_store = Arc::new(SupervisedPutStore::new(SupervisedPutOutcome::Panic));
+    let live_registry = RouteRegistry::load(live_store.clone()).await.unwrap();
+    let live = {
+        let registry = Arc::clone(&live_registry);
+        tokio::spawn(async move {
+            registry
+                .put(key("/live-panic"), route("http://live.example"))
+                .await
+        })
+    };
+    live_store.entered.acquire().await.unwrap().forget();
+    live_store.release.add_permits(1);
+    let error = live.await.unwrap().unwrap_err();
+    assert_eq!(error.to_string(), "route put mutation task panicked");
+    let live_drain = live_registry.drain_mutations(Duration::from_secs(1)).await;
+    assert!(!live_drain.timed_out);
+    assert_eq!(live_drain.active_mutations, 0);
+    assert!(live_drain.detached_panics.is_empty());
+
+    let detached_store = Arc::new(SupervisedPutStore::new(SupervisedPutOutcome::Panic));
+    let detached_registry = RouteRegistry::load(detached_store.clone()).await.unwrap();
+    start_and_cancel_supervised_put(
+        &detached_registry,
+        &detached_store,
+        key("/detached-panic"),
+        route("http://detached.example"),
+    )
+    .await;
+    detached_store.release.add_permits(1);
+    let detached_drain = detached_registry
+        .drain_mutations(Duration::from_secs(1))
+        .await;
+    assert!(!detached_drain.timed_out);
+    assert_eq!(detached_drain.active_mutations, 0);
+    assert_eq!(detached_drain.detached_panics.len(), 1);
+    assert_eq!(
+        detached_drain.detached_panics[0].operation,
+        MutationOperation::Put
+    );
+    assert_eq!(
+        detached_drain.detached_panics[0].message,
+        "route put mutation task panicked"
+    );
+    assert!(!detached_drain.detached_panics[0]
+        .message
+        .contains("sensitive panic payload"));
+}
+
+#[tokio::test]
+async fn drain_times_out_while_backend_pending_then_succeeds_after_release() {
+    let store = Arc::new(SupervisedPutStore::new(SupervisedPutOutcome::Success));
+    let registry = RouteRegistry::load(store.clone()).await.unwrap();
+    start_and_cancel_supervised_put(
+        &registry,
+        &store,
+        key("/pending"),
+        route("http://pending.example"),
+    )
+    .await;
+
+    let timed_out = registry.drain_mutations(Duration::from_millis(10)).await;
+    assert!(timed_out.timed_out);
+    assert_eq!(timed_out.active_mutations, 1);
+
+    store.release.add_permits(1);
+    let drained = registry.drain_mutations(Duration::from_secs(1)).await;
+    assert!(!drained.timed_out);
+    assert_eq!(drained.active_mutations, 0);
+}
+
+#[tokio::test]
+async fn multiple_concurrent_mutations_drain_and_registry_lifetime_is_released() {
+    let store = Arc::new(SupervisedPutStore::new(SupervisedPutOutcome::Success));
+    let registry = RouteRegistry::load(store.clone()).await.unwrap();
+    let lifetime = Arc::downgrade(&registry);
+    let callers: Vec<_> = (0..16)
+        .map(|index| {
+            let registry = Arc::clone(&registry);
+            tokio::spawn(async move {
+                registry
+                    .put(
+                        key(&format!("/concurrent/{index}")),
+                        route(&format!("http://concurrent-{index}.example")),
+                    )
+                    .await
+            })
+        })
+        .collect();
+
+    store.entered.acquire().await.unwrap().forget();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let probe = registry.drain_mutations(Duration::ZERO).await;
+            if probe.active_mutations == 16 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let draining = {
+        let registry = Arc::clone(&registry);
+        tokio::spawn(async move { registry.drain_mutations(Duration::from_secs(1)).await })
+    };
+    store.release.add_permits(16);
+    let drained = draining.await.unwrap();
+    assert!(!drained.timed_out);
+    for caller in callers {
+        caller.await.unwrap().unwrap();
+    }
+    assert_eq!(registry.all().len(), 16);
+
+    drop(registry);
+    assert!(lifetime.upgrade().is_none());
+}
+
+#[test]
+fn mutation_without_a_runtime_fails_without_incrementing_active_count() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let registry = runtime
+        .block_on(RouteRegistry::load(memory_store()))
+        .unwrap();
+    drop(runtime);
+
+    let mut mutation =
+        Box::pin(registry.put(key("/no-runtime"), route("http://no-runtime.example")));
+    let mut context = Context::from_waker(Waker::noop());
+    let Poll::Ready(result) = mutation.as_mut().poll(&mut context) else {
+        panic!("missing-runtime failure must be immediate");
+    };
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "route put mutation could not start: Tokio runtime unavailable"
+    );
+    drop(mutation);
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let drained = runtime.block_on(registry.drain_mutations(Duration::from_millis(10)));
+    assert!(!drained.timed_out);
+    assert_eq!(drained.active_mutations, 0);
+    assert!(drained.detached_failures.is_empty());
+    assert!(drained.detached_panics.is_empty());
+}
+
+#[test]
+fn runtime_shutdown_does_not_leak_active_count_or_registry_lifetime() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let store = Arc::new(SupervisedPutStore::new(SupervisedPutOutcome::Success));
+    let registry = runtime
+        .block_on(RouteRegistry::load(store.clone()))
+        .unwrap();
+    let lifetime = Arc::downgrade(&registry);
+    let caller = runtime.spawn({
+        let registry = Arc::clone(&registry);
+        async move {
+            registry
+                .put(key("/runtime-shutdown"), route("http://shutdown.example"))
+                .await
+        }
+    });
+    runtime.block_on(async { store.entered.acquire().await.unwrap().forget() });
+
+    drop(runtime);
+    drop(caller);
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let drained = runtime.block_on(registry.drain_mutations(Duration::from_secs(1)));
+    assert!(!drained.timed_out);
+    assert_eq!(drained.active_mutations, 0);
+    assert_eq!(drained.detached_panics.len(), 1);
+    assert_eq!(drained.detached_panics[0].operation, MutationOperation::Put);
+    assert_eq!(
+        drained.detached_panics[0].message,
+        "route put mutation task terminated unexpectedly"
+    );
+
+    drop(registry);
+    assert!(lifetime.upgrade().is_none());
 }
