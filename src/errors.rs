@@ -1,15 +1,21 @@
 //! CHP-compatible proxy error rendering.
 
 use std::fs::File;
+use std::future::Future;
+use std::io;
 use std::io::Read;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
 use http::header::{CONTENT_ENCODING, CONTENT_TYPE};
 use http::{HeaderValue, StatusCode};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
+use hyper_util::client::legacy::connect::dns::Name;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioIo;
 use pingora::http::ResponseHeader;
@@ -18,6 +24,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{mpsc, oneshot};
 use tower::Service as _;
 use url::Url;
 
@@ -30,6 +37,8 @@ const ERROR_TOTAL_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_ERROR_HEADER_BYTES: usize = 16 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 1024 * 1024;
 const MAX_UNIX_WIRE_BYTES: usize = MAX_ERROR_HEADER_BYTES + MAX_ERROR_BODY_BYTES + 64 * 1024;
+const MAX_RESOLVED_ADDRESSES: usize = 16;
+const RESOLVER_QUEUE_CAPACITY: usize = 8;
 
 /// Classification used to select the public HTTP status without exposing an
 /// internal error or target URL to clients and logs.
@@ -56,7 +65,142 @@ struct RenderedError {
     content_encoding: Option<HeaderValue>,
 }
 
-type BoundedErrorConnector = HttpsConnector<HttpConnector>;
+type LookupFuture = Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send>>;
+type Lookup = Arc<dyn Fn(String) -> LookupFuture + Send + Sync>;
+
+struct ResolveRequest {
+    response: oneshot::Sender<io::Result<Vec<SocketAddr>>>,
+}
+
+#[derive(Clone)]
+struct BoundedResolver {
+    host: Arc<str>,
+    cache: Arc<std::sync::Mutex<Option<Vec<SocketAddr>>>>,
+    requests: mpsc::Sender<ResolveRequest>,
+}
+
+impl std::fmt::Debug for BoundedResolver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("BoundedResolver").finish()
+    }
+}
+
+impl BoundedResolver {
+    fn start(host: &str) -> Self {
+        Self::start_with_lookup(
+            host,
+            Arc::new(|host| {
+                Box::pin(async move {
+                    tokio::net::lookup_host((host.as_str(), 0))
+                        .await
+                        .map(|addresses| addresses.collect())
+                })
+            }),
+        )
+    }
+
+    fn start_with_lookup(host: &str, lookup: Lookup) -> Self {
+        let host: Arc<str> = Arc::from(host);
+        let cache = Arc::new(std::sync::Mutex::new(None));
+        let (requests, mut receiver) = mpsc::channel::<ResolveRequest>(RESOLVER_QUEUE_CAPACITY);
+        let worker_host = Arc::clone(&host);
+        let worker_cache = Arc::clone(&cache);
+        tokio::spawn(async move {
+            while let Some(first) = receiver.recv().await {
+                let cached = worker_cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                let result = if let Some(addresses) = cached {
+                    Ok(addresses)
+                } else {
+                    lookup(worker_host.to_string()).await.and_then(|addresses| {
+                        let mut addresses: Vec<_> =
+                            addresses.into_iter().take(MAX_RESOLVED_ADDRESSES).collect();
+                        addresses.dedup();
+                        if addresses.is_empty() {
+                            Err(io::Error::new(
+                                io::ErrorKind::NotFound,
+                                "custom-error hostname resolved to no addresses",
+                            ))
+                        } else {
+                            *worker_cache
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                Some(addresses.clone());
+                            Ok(addresses)
+                        }
+                    })
+                };
+                let mut waiting = vec![first];
+                while let Ok(request) = receiver.try_recv() {
+                    waiting.push(request);
+                }
+                for request in waiting {
+                    let response = match &result {
+                        Ok(addresses) => Ok(addresses.clone()),
+                        Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
+                    };
+                    let _ = request.response.send(response);
+                }
+            }
+        });
+        Self {
+            host,
+            cache,
+            requests,
+        }
+    }
+}
+
+impl tower::Service<Name> for BoundedResolver {
+    type Response = std::vec::IntoIter<SocketAddr>;
+    type Error = io::Error;
+    type Future = Pin<Box<dyn Future<Output = io::Result<Self::Response>> + Send>>;
+
+    fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, name: Name) -> Self::Future {
+        if name.as_str() != self.host.as_ref() {
+            return Box::pin(std::future::ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "custom-error resolver received an unexpected hostname",
+            ))));
+        }
+        if let Some(addresses) = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            return Box::pin(std::future::ready(Ok(addresses.into_iter())));
+        }
+        let (response, received) = oneshot::channel();
+        if let Err(error) = self.requests.try_send(ResolveRequest { response }) {
+            let kind = match error {
+                mpsc::error::TrySendError::Full(_) => io::ErrorKind::WouldBlock,
+                mpsc::error::TrySendError::Closed(_) => io::ErrorKind::BrokenPipe,
+            };
+            return Box::pin(std::future::ready(Err(io::Error::new(
+                kind,
+                "custom-error resolver queue unavailable",
+            ))));
+        }
+        Box::pin(async move {
+            let addresses = received.await.map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "custom-error resolver worker unavailable",
+                )
+            })??;
+            Ok(addresses.into_iter())
+        })
+    }
+}
+
+type BoundedErrorConnector = HttpsConnector<HttpConnector<BoundedResolver>>;
 
 /// Renders custom-target, file, and reason-phrase proxy errors in CHP order.
 #[derive(Clone)]
@@ -200,7 +344,11 @@ impl ProxyErrorRenderer {
         } else {
             config_builder.with_no_client_auth()
         };
-        let mut connector = HttpConnector::new();
+        let resolver_host = error_target
+            .as_ref()
+            .and_then(Url::host_str)
+            .unwrap_or("localhost");
+        let mut connector = HttpConnector::new_with_resolver(BoundedResolver::start(resolver_host));
         connector.set_connect_timeout(Some(ERROR_CONNECT_TIMEOUT));
         connector.enforce_http(false);
         let connector = HttpsConnectorBuilder::new()
@@ -272,12 +420,17 @@ impl ProxyErrorRenderer {
         if !matches!(url.scheme(), "http" | "https") {
             return None;
         }
-        tokio::time::timeout(ERROR_TOTAL_TIMEOUT, self.bounded_request(url))
+        let deadline = tokio::time::Instant::now() + ERROR_TOTAL_TIMEOUT;
+        tokio::time::timeout_at(deadline, self.bounded_request(url, deadline))
             .await
             .ok()?
     }
 
-    async fn bounded_request(&self, url: Url) -> Option<RenderedError> {
+    async fn bounded_request(
+        &self,
+        url: Url,
+        deadline: tokio::time::Instant,
+    ) -> Option<RenderedError> {
         let uri = url.as_str().parse().ok()?;
         let mut connector = self.connector.clone();
         let stream = connector.call(uri).await.ok()?;
@@ -290,9 +443,8 @@ impl ProxyErrorRenderer {
         let request = format!(
             "GET {request_target} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
         );
-        tokio::time::timeout(ERROR_READ_TIMEOUT, stream.write_all(request.as_bytes()))
+        write_all_and_flush(&mut stream, request.as_bytes(), deadline)
             .await
-            .ok()?
             .ok()?;
 
         let mut response = Vec::new();
@@ -319,6 +471,19 @@ impl ProxyErrorRenderer {
             }
         }
     }
+}
+
+async fn write_all_and_flush<W: tokio::io::AsyncWrite + Unpin>(
+    stream: &mut W,
+    bytes: &[u8],
+    deadline: tokio::time::Instant,
+) -> io::Result<()> {
+    tokio::time::timeout_at(deadline, stream.write_all(bytes))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "custom-error write timed out"))??;
+    tokio::time::timeout_at(deadline, stream.flush())
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "custom-error flush timed out"))?
 }
 
 #[cfg(unix)]
@@ -624,16 +789,55 @@ fn reason_phrase(status: StatusCode) -> RenderedError {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+
+    use hyper_util::client::legacy::connect::dns::Name;
+    use tokio::io::AsyncWrite;
+    use tower::Service as _;
 
     use super::{
         encode_uri_component, parse_http_response, read_bounded_file_sync_with_hook,
-        ErrorRendererBuildError, ProxyErrorRenderer,
+        write_all_and_flush, BoundedResolver, ErrorRendererBuildError, ProxyErrorRenderer,
+        MAX_RESOLVED_ADDRESSES,
     };
     use crate::config::TlsConfig;
 
-    #[test]
-    fn uri_component_encoding_matches_javascript_encode_uri_component() {
+    struct FlushRequiredWriter {
+        flushed: bool,
+    }
+
+    impl AsyncWrite for FlushRequiredWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.flushed = true;
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn uri_encoding_tls_validation_and_error_io_are_bounded() {
         assert_eq!(
             encode_uri_component("/!~*()'% already%20한글"),
             "%2F!~*()'%25%20already%2520%ED%95%9C%EA%B8%80"
@@ -664,6 +868,101 @@ mod tests {
                 "invalid custom-error TLS CA certificate bundle"
             );
         }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let lookup: super::Lookup = {
+            let calls = Arc::clone(&calls);
+            let release = Arc::clone(&release);
+            Arc::new(move |_host: String| {
+                let calls = Arc::clone(&calls);
+                let release = Arc::clone(&release);
+                Box::pin(async move {
+                    let call = calls.fetch_add(1, Ordering::SeqCst);
+                    release.acquire().await.unwrap().forget();
+                    if call == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "injected DNS outage",
+                        ));
+                    }
+                    Ok((1..=MAX_RESOLVED_ADDRESSES + 8)
+                        .map(|octet| {
+                            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, octet as u8)), 0)
+                        })
+                        .collect())
+                })
+            })
+        };
+        let resolver = BoundedResolver::start_with_lookup("errors.invalid", lookup);
+        let name: Name = "errors.invalid".parse().unwrap();
+        let mut first_resolver = resolver.clone();
+        let first = tokio::spawn(async move { first_resolver.call(name).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while calls.load(Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first DNS lookup did not start");
+
+        for _ in 0..64 {
+            let mut resolver = resolver.clone();
+            let name: Name = "errors.invalid".parse().unwrap();
+            let _ = tokio::time::timeout(Duration::from_millis(1), resolver.call(name)).await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("404.html"),
+            "fallback remains available",
+        )
+        .unwrap();
+        let directory_path = directory.path().canonicalize().unwrap();
+        assert_eq!(
+            read_bounded_file_sync_with_hook(&directory_path, "404.html", || {}).unwrap(),
+            bytes::Bytes::from_static(b"fallback remains available")
+        );
+
+        release.add_permits(1);
+        assert!(first.await.unwrap().is_err());
+        let mut recovered_resolver = resolver.clone();
+        let recovered_name: Name = "errors.invalid".parse().unwrap();
+        let recovered = tokio::spawn(async move {
+            recovered_resolver
+                .call(recovered_name)
+                .await
+                .unwrap()
+                .count()
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while calls.load(Ordering::SeqCst) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("resolver did not recover after the DNS outage");
+        release.add_permits(1);
+        assert_eq!(recovered.await.unwrap(), MAX_RESOLVED_ADDRESSES);
+
+        let mut cached_resolver = resolver;
+        let cached_name: Name = "errors.invalid".parse().unwrap();
+        assert_eq!(
+            cached_resolver.call(cached_name).await.unwrap().count(),
+            MAX_RESOLVED_ADDRESSES
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        let mut writer = FlushRequiredWriter { flushed: false };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        write_all_and_flush(&mut writer, b"request", deadline)
+            .await
+            .unwrap();
+        assert!(
+            writer.flushed,
+            "TLS request bytes must be flushed explicitly"
+        );
     }
 
     #[test]

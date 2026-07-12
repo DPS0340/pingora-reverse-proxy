@@ -9,7 +9,7 @@ use tokio::sync::RwLock;
 
 use crate::route::{RouteData, RouteKey};
 
-use super::{Store, StoreError};
+use super::{ActivityFloor, Store, StoreError};
 
 /// Process-local route storage primarily used as the default ephemeral backend.
 #[derive(Debug, Default)]
@@ -34,11 +34,13 @@ impl Store for MemoryStore {
         key: RouteKey,
         target: String,
         extra: Map<String, Value>,
+        activity_floor: ActivityFloor,
     ) -> Result<RouteData, StoreError> {
         let mut routes = self.routes.write().await;
+        let now = Utc::now();
         let data = RouteData {
             target,
-            last_activity: Utc::now(),
+            last_activity: activity_floor.current().map_or(now, |floor| now.max(floor)),
             extra,
         };
         routes.insert(key, data.clone());
@@ -48,6 +50,20 @@ impl Store for MemoryStore {
     async fn put(&self, key: RouteKey, data: RouteData) -> Result<(), StoreError> {
         self.routes.write().await.insert(key, data);
         Ok(())
+    }
+
+    async fn put_preserving_activity(
+        &self,
+        key: RouteKey,
+        mut data: RouteData,
+        activity_floor: ActivityFloor,
+    ) -> Result<RouteData, StoreError> {
+        let mut routes = self.routes.write().await;
+        if let Some(floor) = activity_floor.current() {
+            data.last_activity = data.last_activity.max(floor);
+        }
+        routes.insert(key, data.clone());
+        Ok(data)
     }
 
     async fn update_activity(&self, key: &RouteKey, at: DateTime<Utc>) -> Result<(), StoreError> {

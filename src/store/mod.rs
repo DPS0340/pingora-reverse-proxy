@@ -1,6 +1,7 @@
 //! Backend-neutral route persistence.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -10,6 +11,34 @@ use thiserror::Error;
 use crate::route::{RouteData, RouteKey};
 
 pub mod memory;
+
+/// A monotonic activity source sampled inside an atomic route replacement.
+#[derive(Clone)]
+pub struct ActivityFloor {
+    current: Arc<dyn Fn() -> Option<DateTime<Utc>> + Send + Sync>,
+}
+
+impl ActivityFloor {
+    /// Construct a stable floor for direct backend operations and tests.
+    pub fn fixed(at: Option<DateTime<Utc>>) -> Self {
+        Self {
+            current: Arc::new(move || at),
+        }
+    }
+
+    pub(crate) fn dynamic(
+        current: impl Fn() -> Option<DateTime<Utc>> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            current: Arc::new(current),
+        }
+    }
+
+    /// Read the newest activity timestamp at the backend's commit boundary.
+    pub fn current(&self) -> Option<DateTime<Utc>> {
+        (self.current)()
+    }
+}
 
 /// Error returned by a route persistence backend.
 #[derive(Clone, Debug, Error)]
@@ -43,8 +72,26 @@ pub trait Store: Send + Sync {
         key: RouteKey,
         target: String,
         extra: Map<String, Value>,
+        activity_floor: ActivityFloor,
     ) -> Result<RouteData, StoreError>;
     async fn put(&self, key: RouteKey, data: RouteData) -> Result<(), StoreError>;
+    /// Atomically replace a complete route without a corrective second write.
+    ///
+    /// Backends that perform preparation before their atomic commit should
+    /// override this method and sample `activity_floor` immediately before the
+    /// transactional write, as `MemoryStore` does.
+    async fn put_preserving_activity(
+        &self,
+        key: RouteKey,
+        mut data: RouteData,
+        activity_floor: ActivityFloor,
+    ) -> Result<RouteData, StoreError> {
+        if let Some(floor) = activity_floor.current() {
+            data.last_activity = data.last_activity.max(floor);
+        }
+        self.put(key, data.clone()).await?;
+        Ok(data)
+    }
     async fn update_activity(&self, key: &RouteKey, at: DateTime<Utc>) -> Result<(), StoreError>;
     async fn delete(&self, key: &RouteKey) -> Result<Option<RouteData>, StoreError>;
 }

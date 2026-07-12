@@ -7,7 +7,7 @@ use std::task::{Context, Poll, Waker};
 
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
-use pingora_reverse_proxy::store::{Store, StoreError};
+use pingora_reverse_proxy::store::{ActivityFloor, Store, StoreError};
 use proptest::prelude::*;
 use serde_json::{json, Value};
 use tokio::sync::{RwLock, Semaphore};
@@ -517,12 +517,16 @@ impl Store for CommitThenReturnAddStore {
         key: RouteKey,
         target: String,
         extra: serde_json::Map<String, Value>,
+        activity_floor: ActivityFloor,
     ) -> Result<RouteData, StoreError> {
-        let data = RouteData {
+        let mut data = RouteData {
             target,
             last_activity: Utc::now(),
             extra,
         };
+        if let Some(floor) = activity_floor.current() {
+            data.last_activity = data.last_activity.max(floor);
+        }
         self.routes.write().await.insert(key, data.clone());
         self.committed.add_permits(1);
         self.return_response
@@ -575,6 +579,7 @@ impl Store for GatedAtomicAddStore {
         key: RouteKey,
         target: String,
         extra: serde_json::Map<String, Value>,
+        activity_floor: ActivityFloor,
     ) -> Result<RouteData, StoreError> {
         self.entered.add_permits(1);
         self.release
@@ -583,11 +588,14 @@ impl Store for GatedAtomicAddStore {
             .expect("test gate open")
             .forget();
         let mut routes = self.routes.write().await;
-        let data = RouteData {
+        let mut data = RouteData {
             target,
             last_activity: Utc::now(),
             extra,
         };
+        if let Some(floor) = activity_floor.current() {
+            data.last_activity = data.last_activity.max(floor);
+        }
         routes.insert(key, data.clone());
         Ok(data)
     }
@@ -722,6 +730,7 @@ impl Store for AtomicAddFailureStore {
         _key: RouteKey,
         _target: String,
         _extra: serde_json::Map<String, Value>,
+        _activity_floor: ActivityFloor,
     ) -> Result<RouteData, StoreError> {
         Err(StoreError::message("injected atomic add failure"))
     }
@@ -755,6 +764,7 @@ impl Store for FailingMutationStore {
         _key: RouteKey,
         _target: String,
         _extra: serde_json::Map<String, Value>,
+        _activity_floor: ActivityFloor,
     ) -> Result<RouteData, StoreError> {
         Err(StoreError::message("injected add failure"))
     }

@@ -47,7 +47,7 @@ use pingora_reverse_proxy::route::RouteData;
 use pingora_reverse_proxy::route::RouteKey;
 use pingora_reverse_proxy::route_table::{MutationSeal, RouteRegistry};
 use pingora_reverse_proxy::store::memory::MemoryStore;
-use pingora_reverse_proxy::store::{Store, StoreError};
+use pingora_reverse_proxy::store::{ActivityFloor, Store, StoreError};
 use pingora_reverse_proxy::upstream::{
     apply_forwarded_headers, apply_request_headers, build_upstream_uri, rewrite_location,
     ForwardedContext, Target, TargetError, TlsClientConfig, UpstreamRoute,
@@ -633,6 +633,13 @@ async fn stalled_request_upstream() -> (String, tokio::task::JoinHandle<()>) {
 }
 
 fn https_error_server(response: Vec<u8>) -> (String, JoinHandle<()>) {
+    https_error_server_with_read_delay(response, Duration::ZERO)
+}
+
+fn https_error_server_with_read_delay(
+    response: Vec<u8>,
+    read_delay: Duration,
+) -> (String, JoinHandle<()>) {
     let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
     let mut name = X509NameBuilder::new().unwrap();
     name.append_entry_by_text("CN", "localhost").unwrap();
@@ -687,8 +694,19 @@ fn https_error_server(response: Vec<u8>) -> (String, JoinHandle<()>) {
         let Ok(mut stream) = acceptor.accept(stream) else {
             return;
         };
-        let mut request = [0; 2048];
-        std::io::Read::read(&mut stream, &mut request).expect("HTTPS request read timed out");
+        std::thread::sleep(read_delay);
+        let mut request = Vec::new();
+        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let mut chunk = [0; 2048];
+            let count =
+                std::io::Read::read(&mut stream, &mut chunk).expect("HTTPS request read timed out");
+            assert!(count > 0, "HTTPS request ended before its headers");
+            request.extend_from_slice(&chunk[..count]);
+            assert!(
+                request.len() <= 16 * 1024,
+                "HTTPS request headers too large"
+            );
+        }
         if let Err(error) = std::io::Write::write_all(&mut stream, &response) {
             assert!(
                 matches!(
@@ -1949,6 +1967,19 @@ async fn network_https_custom_errors_support_insecure_success_and_verified_failu
     assert_eq!(response.text().await.unwrap(), "tls error");
     join_thread_with_timeout(server, "insecure HTTPS custom-error server did not join");
 
+    let (target, server) =
+        https_error_server_with_read_delay(success.clone(), Duration::from_millis(100));
+    let harness = ProxyHarness::start(
+        &["--insecure".to_owned(), "--error-target".to_owned(), target],
+        &[],
+    )
+    .await;
+    assert_eq!(
+        harness.get("/missing").await.text().await.unwrap(),
+        "tls error"
+    );
+    join_thread_with_timeout(server, "backpressured HTTPS server did not join");
+
     let (target, server) = https_error_server(success);
     let harness = ProxyHarness::start(&["--error-target".to_owned(), target], &[]).await;
     let response = harness.get("/missing").await;
@@ -2319,12 +2350,16 @@ impl Store for FailingActivityStore {
         key: RouteKey,
         target: String,
         extra: serde_json::Map<String, serde_json::Value>,
+        activity_floor: ActivityFloor,
     ) -> Result<RouteData, StoreError> {
-        let data = RouteData {
+        let mut data = RouteData {
             target,
             last_activity: chrono::Utc::now(),
             extra,
         };
+        if let Some(floor) = activity_floor.current() {
+            data.last_activity = data.last_activity.max(floor);
+        }
         self.routes.write().await.insert(key, data.clone());
         Ok(data)
     }
@@ -2440,6 +2475,7 @@ impl Store for StalledActivityStore {
         _key: RouteKey,
         _target: String,
         _extra: serde_json::Map<String, serde_json::Value>,
+        _activity_floor: ActivityFloor,
     ) -> Result<RouteData, StoreError> {
         unreachable!("activity test only persists timestamps")
     }
@@ -2503,18 +2539,27 @@ async fn activity_pending_keys_are_bounded_and_recover_with_newest_accepted_time
     let newest = initial + chrono::Duration::seconds(3);
     writer.record_at(&keys[1], newest);
     writer.record_at(&keys[2], initial + chrono::Duration::seconds(2));
+    let in_flight_newest = initial + chrono::Duration::seconds(5);
+    writer.record_at(&keys[0], in_flight_newest);
     writer.record_at(&keys[3], initial + chrono::Duration::seconds(4));
 
     assert_eq!(writer.pending_routes(), 2);
-    assert_eq!(writer.dropped_observations(), 1);
-    assert_eq!(metrics.snapshot().activity_dropped, 1);
+    assert_eq!(writer.dropped_observations(), 2);
+    assert_eq!(metrics.snapshot().activity_dropped, 2);
 
     store.release.add_permits(3);
     timed_activity_flush(&writer).await;
     let writes = store.writes.lock().unwrap().clone();
     assert_eq!(writes.len(), 3);
     assert!(writes.contains(&(keys[1].clone(), newest)));
-    assert!(writes.iter().all(|(key, _)| key != &keys[3]));
+    assert!(writes.contains(&(keys[0].clone(), in_flight_newest)));
+    assert!(writes
+        .iter()
+        .all(|(key, _)| key != &keys[2] && key != &keys[3]));
+    assert_eq!(
+        store.routes.read().await[&keys[0]].last_activity,
+        in_flight_newest
+    );
     assert_eq!(writer.pending_routes(), 0);
 }
 
@@ -2560,13 +2605,17 @@ impl Store for OrderedPersistenceStore {
         key: RouteKey,
         target: String,
         extra: serde_json::Map<String, serde_json::Value>,
+        activity_floor: ActivityFloor,
     ) -> Result<RouteData, StoreError> {
         self.gate(PersistenceOperation::Add).await;
-        let data = RouteData {
+        let mut data = RouteData {
             target,
             last_activity: self.replacement_activity,
             extra,
         };
+        if let Some(floor) = activity_floor.current() {
+            data.last_activity = data.last_activity.max(floor);
+        }
         self.routes.write().await.insert(key, data.clone());
         Ok(data)
     }
@@ -2718,6 +2767,18 @@ async fn assert_activity_and_management_are_persisted_in_order(
         reloaded.all(),
         persisted,
         "restart-equivalent load diverged"
+    );
+    let expected_operations = if activity_first {
+        vec![PersistenceOperation::Activity, management]
+    } else if management == PersistenceOperation::Delete {
+        vec![management]
+    } else {
+        vec![management, PersistenceOperation::Activity]
+    };
+    assert_eq!(
+        store.operations(),
+        expected_operations,
+        "add/put must not commit and then issue a corrective activity write"
     );
     match management {
         PersistenceOperation::Add | PersistenceOperation::Put => {

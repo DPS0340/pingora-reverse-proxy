@@ -16,7 +16,7 @@ use serde_json::{Map, Value};
 use tokio::sync::{oneshot, Mutex, Notify};
 
 use crate::route::{RouteData, RouteKey};
-use crate::store::{Store, StoreError};
+use crate::store::{ActivityFloor, Store, StoreError};
 
 static INSTALL_ROUTE_MUTATION_PANIC_HOOK: Once = Once::new();
 
@@ -634,9 +634,12 @@ impl RouteRegistry {
         .await
     }
 
-    async fn put_owned(&self, key: RouteKey, mut data: RouteData) -> Result<(), StoreError> {
-        self.store.put(key.clone(), data.clone()).await?;
-        self.persist_newer_observation(&key, &mut data).await?;
+    async fn put_owned(self: &Arc<Self>, key: RouteKey, data: RouteData) -> Result<(), StoreError> {
+        let activity_floor = self.activity_floor(key.clone());
+        let data = self
+            .store
+            .put_preserving_activity(key.clone(), data, activity_floor)
+            .await?;
         self.merge_and_publish(|routes| {
             routes.replace_preserving_activity(key.clone(), data.clone())
         });
@@ -658,34 +661,30 @@ impl RouteRegistry {
     }
 
     async fn add_owned(
-        &self,
+        self: &Arc<Self>,
         key: RouteKey,
         target: String,
         extra: Map<String, Value>,
     ) -> Result<(), StoreError> {
-        let mut data = self.store.add(key.clone(), target, extra).await?;
-        self.persist_newer_observation(&key, &mut data).await?;
+        let activity_floor = self.activity_floor(key.clone());
+        let data = self
+            .store
+            .add(key.clone(), target, extra, activity_floor)
+            .await?;
         self.merge_and_publish(|routes| {
             routes.replace_preserving_activity(key.clone(), data.clone())
         });
         Ok(())
     }
 
-    async fn persist_newer_observation(
-        &self,
-        key: &RouteKey,
-        replacement: &mut RouteData,
-    ) -> Result<(), StoreError> {
-        let Some(observed) = self.get(key) else {
-            return Ok(());
-        };
-        if observed.last_activity > replacement.last_activity {
-            self.store
-                .update_activity(key, observed.last_activity)
-                .await?;
-            replacement.last_activity = observed.last_activity;
-        }
-        Ok(())
+    fn activity_floor(self: &Arc<Self>, key: RouteKey) -> ActivityFloor {
+        let registry = Arc::downgrade(self);
+        ActivityFloor::dynamic(move || {
+            registry
+                .upgrade()
+                .and_then(|registry| registry.get(&key))
+                .map(|route| route.last_activity)
+        })
     }
 
     /// Persist an activity timestamp while retaining all other route fields.

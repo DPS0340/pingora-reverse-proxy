@@ -15,7 +15,7 @@ use pingora_reverse_proxy::route_table::{
     MUTATION_PANIC_SEALED_ERROR,
 };
 use pingora_reverse_proxy::store::memory::MemoryStore;
-use pingora_reverse_proxy::store::{Store, StoreError};
+use pingora_reverse_proxy::store::{ActivityFloor, Store, StoreError};
 use proptest::prelude::*;
 use serde_json::{json, Map};
 use tokio::sync::{Barrier, RwLock, Semaphore};
@@ -44,6 +44,7 @@ async fn assert_store_contract(store: Arc<dyn Store>) {
             route_key.clone(),
             "http://127.0.0.1:8999/added".to_owned(),
             Map::from_iter([("owner".to_owned(), json!("added"))]),
+            ActivityFloor::fixed(None),
         )
         .await
         .unwrap();
@@ -54,9 +55,12 @@ async fn assert_store_contract(store: Arc<dyn Store>) {
         "add must return the exact atomically committed record"
     );
 
-    let original = route("http://127.0.0.1:9000/base");
-    store
-        .put(route_key.clone(), original.clone())
+    let original = store
+        .put_preserving_activity(
+            route_key.clone(),
+            route("http://127.0.0.1:9000/base"),
+            ActivityFloor::fixed(None),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -64,11 +68,16 @@ async fn assert_store_contract(store: Arc<dyn Store>) {
         Some(&original)
     );
 
-    let replacement = route("http://127.0.0.1:9001/replaced");
-    store
-        .put(route_key.clone(), replacement.clone())
+    let activity_floor = Utc.timestamp_opt(7, 0).unwrap();
+    let replacement = store
+        .put_preserving_activity(
+            route_key.clone(),
+            route("http://127.0.0.1:9001/replaced"),
+            ActivityFloor::fixed(Some(activity_floor)),
+        )
         .await
         .unwrap();
+    assert_eq!(replacement.last_activity, activity_floor);
     assert_eq!(store.snapshot().await.unwrap().len(), 1);
     assert_eq!(
         store.snapshot().await.unwrap().get(&route_key),
@@ -128,7 +137,14 @@ proptest! {
                     Operation::Put(id, route_id) => {
                         let route_key = key(&format!("/route/{id}"));
                         let route_data = route(&format!("http://127.0.0.1:{}/", 10_000 + u16::from(route_id)));
-                        store.put(route_key.clone(), route_data.clone()).await.unwrap();
+                        let route_data = store
+                            .put_preserving_activity(
+                                route_key.clone(),
+                                route_data,
+                                ActivityFloor::fixed(None),
+                            )
+                            .await
+                            .unwrap();
                         reference.insert(route_key, route_data);
                     }
                     Operation::Activity(id, seconds) => {
@@ -179,6 +195,7 @@ impl Store for FailingStore {
         _key: RouteKey,
         _target: String,
         _extra: Map<String, serde_json::Value>,
+        _activity_floor: ActivityFloor,
     ) -> Result<RouteData, StoreError> {
         Err(StoreError::message("injected add failure"))
     }
@@ -236,6 +253,7 @@ impl Store for GatedAtomicAddStore {
         key: RouteKey,
         target: String,
         extra: Map<String, serde_json::Value>,
+        activity_floor: ActivityFloor,
     ) -> Result<RouteData, StoreError> {
         self.entered.add_permits(1);
         self.release.acquire().await.unwrap().forget();
@@ -244,11 +262,14 @@ impl Store for GatedAtomicAddStore {
         }
 
         let mut routes = self.routes.write().await;
-        let data = RouteData {
+        let mut data = RouteData {
             target,
             last_activity: Utc::now(),
             extra,
         };
+        if let Some(floor) = activity_floor.current() {
+            data.last_activity = data.last_activity.max(floor);
+        }
         routes.insert(key, data.clone());
         Ok(data)
     }
@@ -388,12 +409,16 @@ impl Store for GatedMutationStore {
         key: RouteKey,
         target: String,
         extra: Map<String, serde_json::Value>,
+        activity_floor: ActivityFloor,
     ) -> Result<RouteData, StoreError> {
-        let data = RouteData {
+        let mut data = RouteData {
             target,
             last_activity: Utc::now(),
             extra,
         };
+        if let Some(floor) = activity_floor.current() {
+            data.last_activity = data.last_activity.max(floor);
+        }
         self.routes.write().await.insert(key, data.clone());
         Ok(data)
     }
@@ -518,6 +543,7 @@ impl Store for TimingOutPutStore {
         _key: RouteKey,
         _target: String,
         _extra: Map<String, serde_json::Value>,
+        _activity_floor: ActivityFloor,
     ) -> Result<RouteData, StoreError> {
         Err(StoreError::message("unused add"))
     }
@@ -854,14 +880,18 @@ impl Store for GatedManagementStore {
         key: RouteKey,
         target: String,
         extra: Map<String, serde_json::Value>,
+        activity_floor: ActivityFloor,
     ) -> Result<RouteData, StoreError> {
         assert!(matches!(self.operation, GatedManagementOperation::Add));
         self.gate().await;
-        let data = RouteData {
+        let mut data = RouteData {
             target,
             last_activity: Utc.timestamp_opt(20, 0).unwrap(),
             extra,
         };
+        if let Some(floor) = activity_floor.current() {
+            data.last_activity = data.last_activity.max(floor);
+        }
         self.routes.write().await.insert(key, data.clone());
         Ok(data)
     }
@@ -871,6 +901,21 @@ impl Store for GatedManagementStore {
         self.gate().await;
         self.routes.write().await.insert(key, data);
         Ok(())
+    }
+
+    async fn put_preserving_activity(
+        &self,
+        key: RouteKey,
+        mut data: RouteData,
+        activity_floor: ActivityFloor,
+    ) -> Result<RouteData, StoreError> {
+        assert!(matches!(self.operation, GatedManagementOperation::Put));
+        self.gate().await;
+        if let Some(floor) = activity_floor.current() {
+            data.last_activity = data.last_activity.max(floor);
+        }
+        self.routes.write().await.insert(key, data.clone());
+        Ok(data)
     }
 
     async fn update_activity(&self, key: &RouteKey, at: DateTime<Utc>) -> Result<(), StoreError> {
@@ -921,12 +966,13 @@ async fn assert_blocked_management_preserves_other_route_activity(
     };
     store.entered.acquire().await.unwrap().forget();
 
-    let observed_at = Utc.timestamp_opt(10, 0).unwrap();
+    let observed_at = Utc.timestamp_opt(30, 0).unwrap();
     assert!(registry.observe_activity(&activity_key, observed_at));
     assert_eq!(
         registry.get(&activity_key).unwrap().last_activity,
         observed_at
     );
+    assert!(registry.observe_activity(&mutation_key, observed_at));
 
     store.release.add_permits(1);
     mutation.await.unwrap().unwrap();
@@ -935,6 +981,18 @@ async fn assert_blocked_management_preserves_other_route_activity(
         observed_at,
         "a persistence-first management publication must merge with the latest activity snapshot"
     );
+    let persisted = store.snapshot().await.unwrap();
+    let reloaded = RouteRegistry::load(store.clone()).await.unwrap();
+    assert_eq!(reloaded.all(), persisted);
+    if matches!(operation, GatedManagementOperation::Delete) {
+        assert!(!persisted.contains_key(&mutation_key));
+    } else {
+        assert_eq!(persisted[&mutation_key].last_activity, observed_at);
+        assert_eq!(
+            registry.get(&mutation_key),
+            Some(persisted[&mutation_key].clone())
+        );
+    }
 }
 
 #[tokio::test]
@@ -993,6 +1051,7 @@ impl Store for GatedPutStore {
         _key: RouteKey,
         _target: String,
         _extra: Map<String, serde_json::Value>,
+        _activity_floor: ActivityFloor,
     ) -> Result<RouteData, StoreError> {
         unreachable!("the writer-serialization test only exercises put")
     }
@@ -1162,6 +1221,7 @@ impl Store for SupervisedPutStore {
         _key: RouteKey,
         _target: String,
         _extra: Map<String, serde_json::Value>,
+        _activity_floor: ActivityFloor,
     ) -> Result<RouteData, StoreError> {
         Err(StoreError::message("unused add"))
     }
@@ -1318,6 +1378,7 @@ impl Store for SnapshotFailureStore {
         _key: RouteKey,
         _target: String,
         _extra: Map<String, serde_json::Value>,
+        _activity_floor: ActivityFloor,
     ) -> Result<RouteData, StoreError> {
         unreachable!()
     }
@@ -1441,6 +1502,7 @@ impl Store for AdmissionCountingStore {
         _key: RouteKey,
         _target: String,
         _extra: Map<String, serde_json::Value>,
+        _activity_floor: ActivityFloor,
     ) -> Result<RouteData, StoreError> {
         self.mutation_calls.fetch_add(1, Ordering::SeqCst);
         Ok(route("http://unexpected-add.example"))
@@ -1493,13 +1555,18 @@ impl Store for FirstMutationPanicStore {
         _key: RouteKey,
         target: String,
         extra: Map<String, serde_json::Value>,
+        activity_floor: ActivityFloor,
     ) -> Result<RouteData, StoreError> {
         assert!(!self.enter(), "the first store mutation must be put");
-        Ok(RouteData {
+        let mut data = RouteData {
             target,
             last_activity: Utc::now(),
             extra,
-        })
+        };
+        if let Some(floor) = activity_floor.current() {
+            data.last_activity = data.last_activity.max(floor);
+        }
+        Ok(data)
     }
 
     async fn put(&self, _key: RouteKey, _data: RouteData) -> Result<(), StoreError> {

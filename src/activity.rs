@@ -1,7 +1,7 @@
 //! Bounded, coalesced persistence for proxy activity observations.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
@@ -12,13 +12,18 @@ use crate::route::RouteKey;
 use crate::route_table::RouteRegistry;
 
 struct ActivityState {
-    pending: Mutex<BTreeMap<RouteKey, DateTime<Utc>>>,
-    in_flight: AtomicUsize,
+    pending: Mutex<BTreeMap<RouteKey, PendingActivity>>,
     persistence_errors: AtomicU64,
     dropped_observations: AtomicU64,
     pending_capacity: usize,
     metrics: Arc<Metrics>,
     idle: Notify,
+}
+
+#[derive(Clone, Copy)]
+struct PendingActivity {
+    latest: DateTime<Utc>,
+    in_flight: Option<DateTime<Utc>>,
 }
 
 /// Non-blocking activity recorder backed by one bounded wake-up channel.
@@ -48,7 +53,6 @@ impl ActivityWriter {
         let pending_capacity = pending_capacity.max(1);
         let state = Arc::new(ActivityState {
             pending: Mutex::new(BTreeMap::new()),
-            in_flight: AtomicUsize::new(0),
             persistence_errors: AtomicU64::new(0),
             dropped_observations: AtomicU64::new(0),
             pending_capacity,
@@ -66,35 +70,43 @@ impl ActivityWriter {
                             .pending
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let pending = std::mem::take(&mut *guard);
-                        worker_state
-                            .in_flight
-                            .fetch_add(pending.len(), Ordering::AcqRel);
-                        pending
+                        guard.iter_mut().find_map(|(key, pending)| {
+                            pending.in_flight.is_none().then(|| {
+                                pending.in_flight = Some(pending.latest);
+                                (key.clone(), pending.latest)
+                            })
+                        })
                     };
-                    if pending.is_empty() {
+                    let Some((key, pending_at)) = pending else {
                         worker_state.idle.notify_waiters();
                         break;
-                    }
-                    for (key, pending_at) in pending {
-                        if worker_registry
-                            .persist_observed_activity(&key, pending_at)
-                            .await
-                            .is_err()
-                        {
-                            let previous = worker_state
-                                .persistence_errors
-                                .fetch_add(1, Ordering::Relaxed);
-                            worker_state.metrics.record_activity_persistence_failure();
-                            if (previous + 1).is_power_of_two() {
-                                tracing::warn!(
-                                    failures = previous + 1,
-                                    "activity persistence failed"
-                                );
-                            }
+                    };
+                    if worker_registry
+                        .persist_observed_activity(&key, pending_at)
+                        .await
+                        .is_err()
+                    {
+                        let previous = worker_state
+                            .persistence_errors
+                            .fetch_add(1, Ordering::Relaxed);
+                        worker_state.metrics.record_activity_persistence_failure();
+                        if (previous + 1).is_power_of_two() {
+                            tracing::warn!(failures = previous + 1, "activity persistence failed");
                         }
-                        worker_state.in_flight.fetch_sub(1, Ordering::AcqRel);
                     }
+                    let mut guard = worker_state
+                        .pending
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if guard
+                        .get(&key)
+                        .is_some_and(|pending| pending.latest <= pending_at)
+                    {
+                        guard.remove(&key);
+                    } else if let Some(pending) = guard.get_mut(&key) {
+                        pending.in_flight = None;
+                    }
+                    drop(guard);
                     worker_state.idle.notify_waiters();
                 }
             }
@@ -122,9 +134,15 @@ impl ActivityWriter {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(existing) = pending.get_mut(key) {
-            *existing = (*existing).max(at);
+            existing.latest = existing.latest.max(at);
         } else if pending.len() < self.state.pending_capacity {
-            pending.insert(key.clone(), at);
+            pending.insert(
+                key.clone(),
+                PendingActivity {
+                    latest: at,
+                    in_flight: None,
+                },
+            );
         } else {
             let previous = self
                 .state
@@ -187,7 +205,7 @@ impl ActivityWriter {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .is_empty();
-            if pending_is_empty && self.state.in_flight.load(Ordering::Acquire) == 0 {
+            if pending_is_empty {
                 return;
             }
             notified.await;
