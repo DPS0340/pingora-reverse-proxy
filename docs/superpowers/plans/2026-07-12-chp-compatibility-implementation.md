@@ -489,12 +489,17 @@ unwind, runtime cancellation, and future drop. Caller cancellation drops only
 the response receiver. The shared supervisor observes every terminal backend
 result or panic, retains at most 256 detached diagnostics with surfaced
 per-kind overflow counts, decrements active count, and wakes bounded
-`drain_mutations(timeout)` waiters. The once-only process panic hook redacts
-payloads before `catch_unwind` while retaining safe source location. Live
+`drain_mutations(timeout)` waiters. The terminal drain seals admission under the
+same tracker lock, so admitted work finishes and all later work receives a fixed
+shutdown `StoreError`. The explicit application-owned startup hook captures and
+delegates to the previous process hook for non-mutation panics; a thread-local
+poll scope redacts mutation payloads before `catch_unwind` while retaining safe
+source location. `RouteRegistry::load` never changes the process hook. Live
 callers retain exact backend `Result` behavior, with a fixed operation-specific
 `StoreError` for a task panic. Contract tests cover cancelled success and
-failure, panic-hook stderr redaction, zero-duration and deadline races,
-diagnostic overflow and one-shot consumption, concurrent drain,
+failure, panic-hook delegation and stderr redaction, load failure hook ownership,
+both admission/seal race orders, zero-duration and deadline races, diagnostic
+overflow and one-shot consumption while remaining sealed, concurrent drain,
 unavailable-runtime spawn failure, runtime shutdown cancellation, and registry
 lifetime release.
 
@@ -659,11 +664,16 @@ Use Pingora's public proxy service for TCP/TLS/UDS. Use `HttpPeer::new_uds` for 
 
 Create the PID file atomically with `create_new`, remove it through an RAII guard, and wire Pingora shutdown watch into API and activity services. The redirect service returns 400 without Host and 301 to the configured HTTPS port otherwise.
 
-Shutdown must first stop accepting management requests, then invoke
-`RouteRegistry::drain_mutations` with a configured finite bound and report its
-structured timeout/failure/panic outcome before Tokio runtime termination. A
-timed-out drain must not cancel the remaining registry-owned tasks; runtime
-termination is the final fallback after the timeout has been surfaced.
+Binary startup must finish all other crash-reporting setup, then call
+`install_route_mutation_panic_hook_at_startup()` exactly once and own that hook
+unchanged for the process lifetime. Shutdown must first stop accepting
+management requests, then invoke terminal `RouteRegistry::drain_mutations` with
+a configured finite bound. The drain atomically seals any accepted-but-not-yet-
+begun handler out of mutation admission while allowing admitted tasks to finish.
+Report its structured timeout, failure, panic, and per-kind diagnostic overflow
+before Tokio runtime termination. A timed-out drain must not cancel the
+remaining registry-owned tasks; runtime termination is the final fallback after
+the timeout and overflow state have been surfaced.
 
 - [ ] **Step 5: Verify GREEN**
 

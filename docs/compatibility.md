@@ -13,13 +13,21 @@ service-level contract tests land.
 
 ## Route mutation lifecycle
 
-Accepted `add`, `put`, activity-update, and delete operations are owned by the
-route registry, not by an individual HTTP request future. A task-owned RAII
-guard tracks only the active count; the registry deliberately retains no Tokio
-task handles. Cancelling a request drops only its result receiver; persistence
-and immutable-snapshot reconciliation continue.
-`RouteRegistry::drain_mutations(timeout)` provides the bounded shutdown
-boundary, returning whether it timed out, the remaining active count, and any
+Admitted `add`, `put`, activity-update, and delete operations are owned by the
+route registry, not by an individual HTTP request future. One synchronized
+tracker state contains the terminal admission seal, active count, bounded
+diagnostics, and overflow counts. Admission increments under that state lock
+and transfers an RAII guard to the registry-owned task; the registry deliberately
+retains no Tokio task handles. Cancelling a request drops only its result
+receiver; persistence and immutable-snapshot reconciliation continue.
+`RouteRegistry::drain_mutations(timeout)` atomically seals admission and provides
+the bounded shutdown boundary. The seal is permanent, so every mutation that
+begins admission afterward returns the same shutdown `StoreError` without
+reaching storage or publication. A mutation already admitted is allowed to
+finish. `RouteRegistry::mutation_status()` is the non-consuming, non-sealing
+active-count probe.
+
+The drain returns whether it timed out, the remaining active count, and any
 detached backend failures or task panics accumulated since the previous drain.
 Detached diagnostics use one 256-entry oldest-first eviction ring. Each drain
 consumes the entries and per-kind dropped counts present at that instant exactly
@@ -27,17 +35,26 @@ once; still-active tasks report later outcomes to the next drain. Panic
 diagnostics contain only the operation kind and fixed text, while debug
 formatting redacts detached backend error text.
 
-Creating the first route registry installs a once-only process-wide panic hook.
-This is a deliberate security policy: it replaces any prior hook and emits only
-fixed redaction text plus the panic's compile-time source file, line, and column,
-never the payload or its `Debug` representation. The hook is never temporarily
-swapped, so concurrent mutation panics cannot race with hook restoration.
+`RouteRegistry::load` never installs or replaces a process panic hook. The
+application must explicitly call
+`install_route_mutation_panic_hook_at_startup()` once, after its other
+crash-reporting setup. This captures the prior hook and delegates every panic
+outside a thread-local scope active only while polling a supervised mutation.
+For a scoped mutation panic it writes fixed redacted text plus source file,
+line, and column through `std::io::Write`, ignoring output errors and never
+formatting the payload. The application owns the installed hook for the process
+lifetime and must not replace it later. Without this startup call, mutation
+panics are still converted to fixed `StoreError`s, but payload redaction from
+the existing process hook is not guaranteed.
 
-Task 8 shutdown must stop accepting management requests, call this bounded
-drain and surface its outcome, and only then allow the Tokio runtime to
-terminate. A timeout is reported but does not cancel the pending mutation.
+Task 8 startup must install and permanently own that hook after all other crash
+reporting is configured. Shutdown must stop accepting management requests,
+call the terminal drain, surface timeout plus diagnostic overflow in its
+outcome, and only then allow the Tokio runtime to terminate. A timeout is
+reported but does not cancel pending admitted work.
 An already-inactive zero-duration drain succeeds; an active zero-duration drain
 reports timeout only while its final locked active observation remains nonzero.
+Consequently `timed_out == false` always implies `active_mutations == 0`.
 
 | CHP long option | Classification | Configuration behavior and contract test |
 |---|---|---|

@@ -1,7 +1,9 @@
 //! Immutable, segment-indexed route matching.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
+use std::io::Write;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, Once};
@@ -16,23 +18,65 @@ use tokio::sync::{oneshot, Mutex, Notify};
 use crate::route::{RouteData, RouteKey};
 use crate::store::{Store, StoreError};
 
-static INSTALL_REDACTED_PANIC_HOOK: Once = Once::new();
+static INSTALL_ROUTE_MUTATION_PANIC_HOOK: Once = Once::new();
 
-fn install_redacted_panic_hook() {
-    INSTALL_REDACTED_PANIC_HOOK.call_once(|| {
-        std::panic::set_hook(Box::new(|panic_info| {
+thread_local! {
+    static POLLING_SUPERVISED_MUTATION: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Install the process hook used to redact supervised mutation panics at startup.
+///
+/// The application must call this once, after installing crash reporting and
+/// before polling any route mutation. The installed hook captures and delegates
+/// unrelated panics to the prior hook. It must remain the process hook for the
+/// rest of the process lifetime and must not be replaced later.
+///
+/// If the application does not call this function, supervised mutations are
+/// still caught and converted to fixed `StoreError`s, but the existing process
+/// panic hook may expose their payload before `catch_unwind` returns.
+pub fn install_route_mutation_panic_hook_at_startup() {
+    INSTALL_ROUTE_MUTATION_PANIC_HOOK.call_once(|| {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panic_info| {
+            if !POLLING_SUPERVISED_MUTATION.get() {
+                previous_hook(panic_info);
+                return;
+            }
+
+            let mut stderr = std::io::stderr().lock();
             if let Some(location) = panic_info.location() {
-                eprintln!(
-                    "process panic redacted at {}:{}:{}",
+                let _ = writeln!(
+                    stderr,
+                    "route mutation panic redacted at {}:{}:{}",
                     location.file(),
                     location.line(),
                     location.column()
                 );
             } else {
-                eprintln!("process panic redacted at unknown source location");
+                let _ = writeln!(
+                    stderr,
+                    "route mutation panic redacted at unknown source location"
+                );
             }
         }));
     });
+}
+
+struct SupervisedMutationPollScope {
+    previous: bool,
+}
+
+impl SupervisedMutationPollScope {
+    fn enter() -> Self {
+        let previous = POLLING_SUPERVISED_MUTATION.replace(true);
+        Self { previous }
+    }
+}
+
+impl Drop for SupervisedMutationPollScope {
+    fn drop(&mut self) {
+        POLLING_SUPERVISED_MUTATION.set(self.previous);
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -149,6 +193,17 @@ pub struct MutationDrainOutcome {
     pub dropped_detached_panics: usize,
 }
 
+/// Non-consuming mutation admission state for readiness and tests.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MutationStatus {
+    pub sealed: bool,
+    pub active_mutations: usize,
+}
+
+/// Fixed error returned by every mutation attempted after shutdown sealing.
+pub const MUTATION_ADMISSION_SEALED_ERROR: &str =
+    "route registry is shutting down; mutation admission is sealed";
+
 /// Maximum detached mutation diagnostics retained between drains.
 ///
 /// The single shared ring bounds total diagnostic retention across failures and
@@ -162,6 +217,7 @@ enum DetachedMutationDiagnostic {
 }
 
 struct MutationTrackerState {
+    sealed: bool,
     active: usize,
     diagnostics: VecDeque<DetachedMutationDiagnostic>,
     dropped_detached_failures: usize,
@@ -171,6 +227,7 @@ struct MutationTrackerState {
 impl Default for MutationTrackerState {
     fn default() -> Self {
         Self {
+            sealed: false,
             active: 0,
             diagnostics: VecDeque::with_capacity(DETACHED_MUTATION_DIAGNOSTIC_CAPACITY),
             dropped_detached_failures: 0,
@@ -193,9 +250,18 @@ impl MutationTracker {
         }
     }
 
-    fn start(&self) {
+    fn begin(self: &Arc<Self>, operation: MutationOperation) -> Result<ActiveMutation, StoreError> {
         let mut state = self.state();
+        if state.sealed {
+            return Err(StoreError::message(MUTATION_ADMISSION_SEALED_ERROR));
+        }
         state.active = state.active.saturating_add(1);
+        drop(state);
+        Ok(ActiveMutation {
+            tracker: Arc::clone(self),
+            operation,
+            finished: false,
+        })
     }
 
     fn finish(
@@ -216,35 +282,52 @@ impl MutationTracker {
         self.changed.notify_waiters();
     }
 
-    fn active(&self) -> usize {
-        self.state().active
+    fn status(&self) -> MutationStatus {
+        let state = self.state();
+        MutationStatus {
+            sealed: state.sealed,
+            active_mutations: state.active,
+        }
     }
 
-    async fn wait_until_inactive(&self, timeout: Duration) -> bool {
-        if self.active() == 0 {
-            return false;
+    async fn seal_and_drain(&self, timeout: Duration) -> MutationDrainOutcome {
+        {
+            let mut state = self.state();
+            state.sealed = true;
+            if state.active == 0 {
+                return state.take_outcome(false);
+            }
         }
+
         let deadline = tokio::time::sleep(timeout);
         tokio::pin!(deadline);
         loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            if self.active() == 0 {
-                return false;
+            {
+                let mut state = self.state();
+                if state.active == 0 {
+                    return state.take_outcome(false);
+                }
             }
             tokio::select! {
-                _ = &mut deadline => return true,
+                _ = &mut deadline => {
+                    let mut state = self.state();
+                    let timed_out = state.active != 0;
+                    return state.take_outcome(timed_out);
+                }
                 _ = &mut changed => {}
             }
         }
     }
+}
 
-    fn outcome(&self, deadline_elapsed: bool) -> MutationDrainOutcome {
-        let mut state = self.state();
+impl MutationTrackerState {
+    fn take_outcome(&mut self, timed_out: bool) -> MutationDrainOutcome {
         let mut detached_failures = Vec::new();
         let mut detached_panics = Vec::new();
-        for diagnostic in state.diagnostics.drain(..) {
+        for diagnostic in self.diagnostics.drain(..) {
             match diagnostic {
                 DetachedMutationDiagnostic::Failure(failure) => {
                     detached_failures.push(failure);
@@ -252,20 +335,18 @@ impl MutationTracker {
                 DetachedMutationDiagnostic::Panic(panic) => detached_panics.push(panic),
             }
         }
-        let dropped_detached_failures = std::mem::take(&mut state.dropped_detached_failures);
-        let dropped_detached_panics = std::mem::take(&mut state.dropped_detached_panics);
+        let dropped_detached_failures = std::mem::take(&mut self.dropped_detached_failures);
+        let dropped_detached_panics = std::mem::take(&mut self.dropped_detached_panics);
         MutationDrainOutcome {
-            timed_out: deadline_elapsed && state.active != 0,
-            active_mutations: state.active,
+            timed_out,
+            active_mutations: self.active,
             detached_failures,
             detached_panics,
             dropped_detached_failures,
             dropped_detached_panics,
         }
     }
-}
 
-impl MutationTrackerState {
     fn push_diagnostic(&mut self, diagnostic: DetachedMutationDiagnostic) {
         if self.diagnostics.len() == DETACHED_MUTATION_DIAGNOSTIC_CAPACITY {
             if let Some(dropped) = self.diagnostics.pop_front() {
@@ -292,15 +373,6 @@ struct ActiveMutation {
 }
 
 impl ActiveMutation {
-    fn new(tracker: Arc<MutationTracker>, operation: MutationOperation) -> Self {
-        tracker.start();
-        Self {
-            tracker,
-            operation,
-            finished: false,
-        }
-    }
-
     fn finish(
         mut self,
         failure: Option<DetachedMutationFailure>,
@@ -349,10 +421,21 @@ impl<F: Future> Future for CatchUnwindFuture<F> {
     type Output = Result<F::Output, ()>;
 
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        match catch_unwind(AssertUnwindSafe(|| self.future.as_mut().poll(context))) {
+        match catch_unwind(AssertUnwindSafe(|| {
+            let _panic_scope = SupervisedMutationPollScope::enter();
+            self.future.as_mut().poll(context)
+        })) {
             Ok(Poll::Ready(output)) => Poll::Ready(Ok(output)),
             Ok(Poll::Pending) => Poll::Pending,
-            Err(_) => Poll::Ready(Err(())),
+            Err(payload) => {
+                // A panic payload is arbitrary user/backend code. Dropping it can
+                // panic again after the supervised poll scope has unwound, which
+                // would bypass mutation redaction and may abort on a double panic.
+                // Quarantine it instead; backend panics are terminal contract
+                // violations and must never expose or execute an untrusted Drop.
+                std::mem::forget(payload);
+                Poll::Ready(Err(()))
+            }
         }
     }
 }
@@ -428,7 +511,6 @@ impl RouteRegistry {
     /// Because persisted snapshots do not contain runtime mutation history,
     /// initial matcher precedence is deterministic ascending `RouteKey` order.
     pub async fn load(store: Arc<dyn Store>) -> Result<Arc<Self>, StoreError> {
-        install_redacted_panic_hook();
         let routes = store.snapshot().await?;
         Ok(Arc::new(Self {
             store,
@@ -550,13 +632,19 @@ impl RouteRegistry {
             .store(Arc::new(RouteSnapshot::from_ordered_routes(routes)));
     }
 
-    /// Wait at most `timeout` for all currently accepted mutations to finish.
+    /// Seal mutation admission and wait at most `timeout` for accepted work.
     ///
-    /// Detached diagnostics are returned once and consumed by this call. A
-    /// timeout does not cancel pending mutations; a later drain can finish them.
+    /// Sealing is terminal: this registry rejects every later mutation with
+    /// [`MUTATION_ADMISSION_SEALED_ERROR`]. Detached diagnostics are returned
+    /// once and consumed by this call. A timeout does not cancel pending work;
+    /// a later drain remains sealed and can finish observing it.
     pub async fn drain_mutations(&self, timeout: Duration) -> MutationDrainOutcome {
-        let deadline_elapsed = self.mutations.wait_until_inactive(timeout).await;
-        self.mutations.outcome(deadline_elapsed)
+        self.mutations.seal_and_drain(timeout).await
+    }
+
+    /// Observe mutation admission without sealing or consuming diagnostics.
+    pub fn mutation_status(&self) -> MutationStatus {
+        self.mutations.status()
     }
 
     async fn run_mutation<T, F>(
@@ -568,14 +656,18 @@ impl RouteRegistry {
         T: Send + 'static,
         F: Future<Output = Result<T, StoreError>> + Send + 'static,
     {
-        let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
-            StoreError::message(format!(
-                "route {} mutation could not start: Tokio runtime unavailable",
-                operation.name()
-            ))
-        })?;
+        let active = self.mutations.begin(operation)?;
+        let runtime = match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => runtime,
+            Err(_) => {
+                active.finish(None, None);
+                return Err(StoreError::message(format!(
+                    "route {} mutation could not start: Tokio runtime unavailable",
+                    operation.name()
+                )));
+            }
+        };
         let (response, receiver) = oneshot::channel();
-        let active = ActiveMutation::new(Arc::clone(&self.mutations), operation);
         let spawned = catch_unwind(AssertUnwindSafe(|| {
             runtime.spawn(async move {
                 match CatchUnwindFuture::new(mutation).await {

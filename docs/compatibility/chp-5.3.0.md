@@ -2,11 +2,13 @@
 
 ## Route mutation cancellation and lifetime
 
-Route registry mutations are cancellation-independent once invoked. `add`,
-`put`, activity updates, and deletes all use one registry-owned supervisor that
-tracks their active count without retaining `JoinHandle`s. An RAII guard is
-incremented before spawn and owned by the task, so completion, panic unwind,
-runtime cancellation, and future drop all decrement and notify. Each task
+Route registry mutations are cancellation-independent once admitted. `add`,
+`put`, activity updates, and deletes all use one registry-owned supervisor
+without retaining `JoinHandle`s. Its single synchronized state contains the
+terminal admission seal, active count, diagnostics, and overflow counters.
+Admission checks the seal and increments under that lock before an RAII guard
+is transferred to the task, so completion, panic unwind, runtime cancellation,
+and future drop all decrement under the same lock and notify. Each task
 serializes with the other mutations, awaits the backend result, and then
 publishes the reconciled immutable snapshot. Dropping an HTTP request future
 only drops its oneshot result receiver; it does not cancel the logical mutation.
@@ -21,24 +23,32 @@ by the next drain. A drain consumes exactly the diagnostics and counters present
 while it holds the tracker lock; an active task that reports afterward is
 visible to the next drain.
 
-The first `RouteRegistry::load` installs a once-only process-wide redacted panic
-hook. This deliberate security policy replaces any earlier process hook and
-prints only fixed text plus compile-time source file, line, and column. It never
-formats the panic payload. The hook is permanent rather than temporarily
-swapped, avoiding races between live and detached mutation panics.
+`RouteRegistry::load` does not install or replace a process panic hook. The
+application-owned startup path must call
+`install_route_mutation_panic_hook_at_startup()` once after other crash-reporting
+setup and leave it installed for the process lifetime. It captures the prior
+hook and delegates all panics except those marked by a thread-local scope used
+only while polling a supervised mutation. Marked panics write fixed redacted
+text plus compile-time source file, line, and column through `std::io::Write`,
+with output errors ignored and without formatting the payload or `Debug` data.
+Without explicit installation, the registry does not claim process-hook payload
+redaction.
 
 The task holds the registry alive until the backend operation finishes. Store
 implementations must use finite operation timeouts; an ordinary timeout returns
 an error, releases the mutation lock, and drops the task's registry reference.
-`RouteRegistry::drain_mutations(timeout)` waits within a caller-supplied bound
-and returns a structured outcome containing timeout state, remaining active
-count, accumulated detached failures and panics, and overflow counts. The drain
-uses active-check, armed-notification, active-recheck synchronization and no
-unconditional yield. An inactive zero-duration drain succeeds. At a deadline,
-timeout is reported only when the active count remains nonzero in the same
-locked outcome observation. Timeout never cancels pending work. Task 8 graceful
-shutdown must stop accepting management requests, invoke this bounded drain and
-surface its outcome, then terminate the Tokio runtime. Runtime termination can
+`RouteRegistry::drain_mutations(timeout)` atomically and permanently seals new
+mutation admission, then waits within a caller-supplied bound. Work admitted
+before the seal drains; later work receives a fixed shutdown `StoreError`
+without persistence or publication. The structured outcome contains timeout
+state, remaining active count, accumulated detached failures and panics, and
+overflow counts. Repeated drains consume newly available diagnostics but remain
+sealed. The drain uses armed-notification, locked active recheck, and one final
+locked outcome observation. An inactive zero-duration drain succeeds, and
+`timed_out == false` implies no active mutations. Timeout never cancels pending
+work. Task 8 startup must install and own the hook after crash reporting;
+graceful shutdown must stop accepting management requests, invoke this terminal
+drain, and surface timeout and overflow before terminating Tokio. Runtime termination can
 still cancel work left after a reported timeout, so every backend mutation must
 itself be one atomic persistence operation. A backend that remains pending
 forever violates the store timeout requirement.
