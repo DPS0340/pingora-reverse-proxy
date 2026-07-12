@@ -66,6 +66,71 @@ fn api_port_defaults_to_public_port_plus_one() {
 }
 
 #[test]
+fn falsy_listener_and_redirect_ports_match_chp() {
+    let cases = [
+        (
+            vec!["proxy", "--port", "0"],
+            ListenerConfig::Tcp(":8000".into()),
+            ListenerConfig::Tcp("localhost:8001".into()),
+        ),
+        (
+            vec!["proxy", "--port", "9100", "--api-port", "0"],
+            ListenerConfig::Tcp(":9100".into()),
+            ListenerConfig::Tcp("localhost:9101".into()),
+        ),
+        (
+            vec!["proxy", "--socket", "/tmp/proxy.sock", "--api-port", "0"],
+            ListenerConfig::Unix(PathBuf::from("/tmp/proxy.sock")),
+            ListenerConfig::Tcp("localhost:8001".into()),
+        ),
+    ];
+
+    for (args, public, api) in cases {
+        let cli = Cli::try_parse_from(args).unwrap();
+        let cfg = AppConfig::try_from(cli).unwrap();
+        assert_eq!(cfg.public_listener, public);
+        assert_eq!(cfg.api_listener, api);
+    }
+
+    let metrics = parse_ok(["proxy", "--metrics-port", "0"]);
+    assert_eq!(metrics.metrics_listener, None);
+
+    let redirect = parse_ok(["proxy", "--redirect-port", "0"]);
+    assert_eq!(redirect.redirect_port, None);
+
+    let redirect_to = parse_ok([
+        "proxy",
+        "--ssl-key",
+        "public.key",
+        "--ssl-cert",
+        "public.crt",
+        "--redirect-port",
+        "8080",
+        "--redirect-to",
+        "0",
+    ]);
+    assert_eq!(redirect_to.redirect_port, Some(8080));
+    assert_eq!(redirect_to.redirect_to, None);
+}
+
+#[test]
+fn timeout_zero_semantics_match_chp() {
+    let cfg = parse_ok([
+        "proxy",
+        "--timeout",
+        "0",
+        "--proxy-timeout",
+        "0",
+        "--keep-alive-timeout",
+        "0",
+    ]);
+
+    assert_eq!(cfg.proxy.timeout_ms, Some(0));
+    assert_eq!(cfg.proxy.proxy_timeout_ms, Some(0));
+    assert_eq!(cfg.proxy.keep_alive_timeout_ms, Some(5000));
+}
+
+#[test]
 fn explicit_api_port_avoids_public_port_overflow() {
     let cfg = parse_ok(["proxy", "--port", "65535", "--api-port", "8001"]);
     assert_eq!(
@@ -381,37 +446,46 @@ fn error_path_is_supported() {
 
 #[test]
 fn default_and_error_targets_accept_valid_unix_http_urls() {
-    let cfg = parse_ok([
-        "proxy",
-        "--default-target",
-        "http+unix://%2Ftmp%2Fdefault.sock/base",
-        "--error-target",
-        "unix+http://%2Ftmp%2Ferrors.sock/errors",
-    ]);
-
-    assert_eq!(
-        cfg.default_target.unwrap().as_str(),
-        "http+unix://%2Ftmp%2Fdefault.sock/base"
-    );
-    assert_eq!(
-        cfg.error_target.unwrap().as_str(),
-        "unix+http://%2Ftmp%2Ferrors.sock/errors"
-    );
+    for option in ["--default-target", "--error-target"] {
+        for target in [
+            "http+unix://%2Ftmp%2Fproxy.sock/base",
+            "unix+http://%2Fvar%2Frun%2Fproxy.sock/errors",
+            "http+unix://%2Ftmp%2F%E2%98%83.sock/unicode",
+            "unix+http://%2ftmp%2flowercase.sock/lowercase",
+        ] {
+            let cli = Cli::try_parse_from(["proxy", option, target]).unwrap();
+            let cfg = AppConfig::try_from(cli).unwrap();
+            let parsed = if option == "--default-target" {
+                cfg.default_target
+            } else {
+                cfg.error_target
+            };
+            assert_eq!(parsed.unwrap().as_str(), target);
+        }
+    }
 }
 
 #[test]
-fn unix_http_targets_require_a_nonempty_percent_encoded_socket_host() {
+fn unix_http_targets_reject_invalid_or_unusable_socket_hosts() {
     for option in ["--default-target", "--error-target"] {
         for target in [
+            "http+unix://",
             "http+unix:///tmp/proxy.sock",
             "unix+http:///tmp/proxy.sock",
             "http+unix://tmp/proxy.sock",
             "unix+http://tmp/proxy.sock",
+            "http+unix://tmp%2Fproxy.sock/base",
+            "http+unix://%00/base",
+            "unix+http://%2Ftmp%2Fproxy%00.sock/base",
+            "unix+http://%2Ftmp%2Fproxy.sock%/base",
+            "http+unix://%2Ftmp%2Fproxy.sock%2/base",
+            "unix+http://%2Ftmp%2Fproxy.sock%GG/base",
+            "http+unix://%FF/base",
         ] {
             let cli = Cli::try_parse_from(["proxy", option, target]).unwrap();
             let error = AppConfig::try_from(cli).unwrap_err().to_string();
             assert!(
-                error.contains("percent-encoded socket host"),
+                error.contains("percent-encoded absolute socket path"),
                 "expected malformed {option} {target:?} to fail clearly, got {error:?}"
             );
         }

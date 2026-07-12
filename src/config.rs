@@ -9,6 +9,7 @@ use clap::{ArgAction, Parser};
 use thiserror::Error;
 use url::Url;
 
+const CHP_DEFAULT_KEEP_ALIVE_TIMEOUT_MS: u64 = 5000;
 const CHP_5_3_0_DEFAULT_TLS_CIPHERS: &str = "ECDHE-RSA-AES128-GCM-SHA256:\
 ECDHE-ECDSA-AES128-GCM-SHA256:\
 ECDHE-RSA-AES256-GCM-SHA384:\
@@ -316,7 +317,7 @@ pub enum ConfigError {
     #[error("invalid log level {0:?}; expected debug, info, warn, or error")]
     InvalidLogLevel(String),
     #[error(
-        "invalid {kind} {value:?}; expected an HTTP(S) URL with a host or a Unix HTTP URL with a non-empty percent-encoded socket host"
+        "invalid {kind} {value:?}; expected an HTTP(S) URL with a host or a Unix HTTP URL with a valid UTF-8 percent-encoded absolute socket path"
     )]
     InvalidTarget { kind: &'static str, value: String },
     #[error(
@@ -354,11 +355,13 @@ impl TryFrom<Cli> for AppConfig {
             "--client-ssl-key and --client-ssl-cert",
         )?;
 
-        if cli.redirect_port.is_some() && (cli.ssl_key.is_none() || cli.ssl_cert.is_none()) {
+        let redirect_port = nonzero_port(cli.redirect_port);
+        let redirect_to = nonzero_port(cli.redirect_to);
+        if redirect_port.is_some() && (cli.ssl_key.is_none() || cli.ssl_cert.is_none()) {
             return Err(ConfigError::RedirectWithoutTls);
         }
 
-        let public_port = cli.port.unwrap_or(8000);
+        let public_port = nonzero_port(cli.port).unwrap_or(8000);
         let public_uses_socket = cli.socket.is_some();
         let public_listener = match cli.socket {
             Some(path) => ListenerConfig::Unix(path),
@@ -368,7 +371,7 @@ impl TryFrom<Cli> for AppConfig {
         let api_listener = match cli.api_socket {
             Some(path) => ListenerConfig::Unix(path),
             None => {
-                let api_port = if let Some(api_port) = cli.api_port {
+                let api_port = if let Some(api_port) = nonzero_port(cli.api_port) {
                     api_port
                 } else if public_uses_socket {
                     8001
@@ -384,7 +387,7 @@ impl TryFrom<Cli> for AppConfig {
             }
         };
 
-        let metrics_listener = match (cli.metrics_socket, cli.metrics_port) {
+        let metrics_listener = match (cli.metrics_socket, nonzero_port(cli.metrics_port)) {
             (Some(path), _) => Some(ListenerConfig::Unix(path)),
             (None, Some(port)) => Some(ListenerConfig::Tcp(tcp_address(
                 cli.metrics_ip.as_deref().unwrap_or(""),
@@ -448,8 +451,8 @@ impl TryFrom<Cli> for AppConfig {
             default_target,
             error_target,
             error_path: cli.error_path,
-            redirect_port: cli.redirect_port,
-            redirect_to: cli.redirect_to,
+            redirect_port,
+            redirect_to,
             pid_file: cli.pid_file,
             auth_token: env_nonempty("CONFIGPROXY_AUTH_TOKEN"),
             log_level,
@@ -466,7 +469,13 @@ impl TryFrom<Cli> for AppConfig {
                 host_routing: cli.host_routing,
                 timeout_ms: cli.timeout,
                 proxy_timeout_ms: cli.proxy_timeout,
-                keep_alive_timeout_ms: cli.keep_alive_timeout,
+                keep_alive_timeout_ms: cli.keep_alive_timeout.map(|timeout| {
+                    if timeout == 0 {
+                        CHP_DEFAULT_KEEP_ALIVE_TIMEOUT_MS
+                    } else {
+                        timeout
+                    }
+                }),
             },
         })
     }
@@ -482,6 +491,10 @@ fn validate_pair<T>(
     } else {
         Ok(())
     }
+}
+
+fn nonzero_port(value: Option<u16>) -> Option<u16> {
+    value.filter(|port| *port != 0)
 }
 
 fn tcp_address(host: &str, port: u16) -> String {
@@ -549,6 +562,7 @@ fn is_percent_encoded_socket_host(host: &str) -> bool {
     let bytes = host.as_bytes();
     let mut index = 0;
     let mut has_percent_encoding = false;
+    let mut decoded = Vec::with_capacity(bytes.len());
     while index < bytes.len() {
         if bytes[index] == b'%' {
             if index + 2 >= bytes.len()
@@ -557,13 +571,32 @@ fn is_percent_encoded_socket_host(host: &str) -> bool {
             {
                 return false;
             }
+            let high = hex_value(bytes[index + 1]);
+            let low = hex_value(bytes[index + 2]);
+            decoded.push((high << 4) | low);
             has_percent_encoding = true;
             index += 3;
         } else {
+            decoded.push(bytes[index]);
             index += 1;
         }
     }
+    let Ok(decoded) = String::from_utf8(decoded) else {
+        return false;
+    };
     has_percent_encoding
+        && !decoded.is_empty()
+        && !decoded.contains('\0')
+        && decoded.starts_with('/')
+}
+
+fn hex_value(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        _ => 0,
+    }
 }
 
 fn parse_log_level(value: String) -> Result<LogLevel, ConfigError> {

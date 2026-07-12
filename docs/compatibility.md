@@ -14,7 +14,7 @@ service-level contract tests land.
 | CHP long option | Classification | Configuration behavior and contract test |
 |---|---|---|
 | `--ip` | Identical | Selects the public TCP address; omission and `*` mean all interfaces as in CHP; `listener_options_are_typed`, `star_ip_alias_matches_chp_all_interfaces_behavior`. |
-| `--port` | Identical | Public port defaults to 8000; `listener_defaults_match_chp`, `api_port_defaults_to_public_port_plus_one`. |
+| `--port` | Identical | Public port defaults to 8000; explicit zero is falsy and also normalizes to 8000; `listener_defaults_match_chp`, `api_port_defaults_to_public_port_plus_one`, `falsy_listener_and_redirect_ports_match_chp`. |
 | `--socket` | Identical | Selects a public Unix socket and conflicts with explicitly supplied IP/port; `listener_options_are_typed`, `socket_options_conflict_with_tcp_options`. |
 | `--ssl-key` | Identical | Public TLS private key; a key/certificate identity must be complete; `all_tls_options_are_preserved`, `validation_errors_are_explicit_and_non_panicking`. |
 | `--ssl-cert` | Identical | Public TLS certificate; `all_tls_options_are_preserved`. |
@@ -26,7 +26,7 @@ service-level contract tests land.
 | `--ssl-allow-rc4` | **Intentional difference** | Always fails startup clearly. Modern OpenSSL security policy cannot safely re-enable removed RC4 support; `validation_errors_are_explicit_and_non_panicking`. |
 | `--ssl-dhparam` | Identical | Preserves the DH parameters path for TLS setup; `all_tls_options_are_preserved`. |
 | `--api-ip` | Identical | API host defaults to `localhost`; `listener_defaults_match_chp`, `listener_options_are_typed`. |
-| `--api-port` | Identical | Defaults to public port plus one, or 8001 for a public Unix socket; `api_port_defaults_to_public_port_plus_one`, `listener_options_are_typed`. |
+| `--api-port` | Identical | Defaults to public port plus one, or 8001 for a public Unix socket; explicit zero follows the same derived-default path; `api_port_defaults_to_public_port_plus_one`, `listener_options_are_typed`, `falsy_listener_and_redirect_ports_match_chp`. |
 | `--api-socket` | Identical | Selects an API Unix socket and conflicts with explicitly supplied API IP/port; `listener_options_are_typed`, `socket_options_conflict_with_tcp_options`. |
 | `--api-ssl-key` | Identical | API TLS private key; requires its certificate; `all_tls_options_are_preserved`, `validation_errors_are_explicit_and_non_panicking`. |
 | `--api-ssl-cert` | Identical | API TLS certificate; `all_tls_options_are_preserved`. |
@@ -38,11 +38,11 @@ service-level contract tests land.
 | `--client-ssl-ca` | Identical | Target trust CA, including CA-only configuration; `all_tls_options_are_preserved`, `client_ca_can_configure_target_trust_without_a_client_identity`. |
 | `--client-ssl-request-cert` | Identical | Preserved target-facing TLS request-cert setting; `all_tls_options_are_preserved`. |
 | `--client-ssl-reject-unauthorized` | Identical | Preserved target-facing TLS rejection setting; `all_tls_options_are_preserved`. |
-| `--default-target` | Identical | Accepts validated HTTP(S), `http+unix`, and `unix+http` targets. Unix HTTP requires a non-empty percent-encoded socket host; `proxy_and_process_options_match_chp_surface`, `default_and_error_targets_accept_valid_unix_http_urls`, `unix_http_targets_require_a_nonempty_percent_encoded_socket_host`. |
-| `--error-target` | Identical | Accepts the same valid TCP or Unix HTTP targets as the default target and conflicts with error path; `proxy_and_process_options_match_chp_surface`, `default_and_error_targets_accept_valid_unix_http_urls`, `unix_http_targets_require_a_nonempty_percent_encoded_socket_host`. |
+| `--default-target` | Identical | Accepts validated HTTP(S), `http+unix`, and `unix+http` targets. Unix HTTP strictly validates every escape, decodes the complete host as UTF-8 like `decodeURIComponent`, and requires a non-empty, NUL-free absolute socket path; `proxy_and_process_options_match_chp_surface`, `default_and_error_targets_accept_valid_unix_http_urls`, `unix_http_targets_reject_invalid_or_unusable_socket_hosts`. |
+| `--error-target` | Identical | Applies the same strict TCP or Unix HTTP target validation as the default target and conflicts with error path; `proxy_and_process_options_match_chp_surface`, `default_and_error_targets_accept_valid_unix_http_urls`, `unix_http_targets_reject_invalid_or_unusable_socket_hosts`. |
 | `--error-path` | Identical | Selects filesystem error pages and conflicts with error target; `error_path_is_supported`, `validation_errors_are_explicit_and_non_panicking`. |
-| `--redirect-port` | Identical | Configures the HTTP redirect listener and requires public TLS material; `proxy_and_process_options_match_chp_surface`, `validation_errors_are_explicit_and_non_panicking`. |
-| `--redirect-to` | Identical | Selects the HTTPS port emitted by redirects; `proxy_and_process_options_match_chp_surface`. |
+| `--redirect-port` | Identical | Configures the HTTP redirect listener and requires public TLS material; explicit zero is falsy and disables redirect without requiring TLS; `proxy_and_process_options_match_chp_surface`, `validation_errors_are_explicit_and_non_panicking`, `falsy_listener_and_redirect_ports_match_chp`. |
+| `--redirect-to` | Identical | Selects the HTTPS port emitted by redirects; explicit zero is falsy and follows the omitted/default destination path; `proxy_and_process_options_match_chp_surface`, `falsy_listener_and_redirect_ports_match_chp`. |
 | `--pid-file` | Identical | Preserves the PID-file path for lifecycle setup; `proxy_and_process_options_match_chp_surface`. |
 | `--no-x-forward` | Identical | Changes the positive `x_forward` default from true to false; `negative_boolean_flags_default_to_enabled`, `proxy_and_process_options_match_chp_surface`. |
 | `--no-prepend-path` | Identical | Changes the positive `prepend_path` default from true to false; `negative_boolean_flags_default_to_enabled`, `proxy_and_process_options_match_chp_surface`. |
@@ -54,13 +54,13 @@ service-level contract tests land.
 | `--insecure` | Identical | Disables upstream certificate verification; `proxy_and_process_options_match_chp_surface`. |
 | `--host-routing` | Identical | Enables host-as-first-route-component behavior; `proxy_and_process_options_match_chp_surface`. |
 | `--metrics-ip` | Identical | Selects the metrics TCP host when metrics port is enabled; `listener_options_are_typed`. |
-| `--metrics-port` | Identical | Enables the metrics TCP listener; omission disables metrics; `listener_defaults_match_chp`, `listener_options_are_typed`. |
+| `--metrics-port` | Identical | Enables the metrics TCP listener; omission or explicit zero disables metrics; `listener_defaults_match_chp`, `listener_options_are_typed`, `falsy_listener_and_redirect_ports_match_chp`. |
 | `--metrics-socket` | Identical | Enables metrics on a Unix socket and conflicts with metrics IP/port; `listener_options_are_typed`, `socket_options_conflict_with_tcp_options`. |
 | `--log-level` | Identical | Case-insensitive debug/info/warn/error, default info; invalid levels return errors; `proxy_and_process_options_match_chp_surface`, `validation_errors_are_explicit_and_non_panicking`. |
-| `--timeout` | Identical | Typed request timeout in milliseconds; `proxy_and_process_options_match_chp_surface`. |
-| `--proxy-timeout` | Identical | Typed target response timeout in milliseconds; `proxy_and_process_options_match_chp_surface`. |
+| `--timeout` | Identical | Typed request timeout in milliseconds. Zero is deliberately preserved because CHP passes it directly to the proxy library instead of applying a falsy default; `proxy_and_process_options_match_chp_surface`, `timeout_zero_semantics_match_chp`. |
+| `--proxy-timeout` | Identical | Typed target response timeout in milliseconds. Zero is deliberately preserved because CHP passes it directly to the proxy library instead of applying a falsy default; `proxy_and_process_options_match_chp_surface`, `timeout_zero_semantics_match_chp`. |
 | `--storage-backend` | **Semantic equivalent with intentional Node-module difference** | `memory`, `redis`, and `sidecar` are typed configuration selections. Arbitrary Node module names/paths fail startup because Rust cannot `require()` Node classes. The sidecar selection reserves the planned integration boundary; this task does not claim that protocol or runtime adapter is implemented; `supported_storage_backends_are_typed`, `validation_errors_are_explicit_and_non_panicking`. |
-| `--keep-alive-timeout` | Identical | Typed keep-alive timeout in milliseconds; `proxy_and_process_options_match_chp_surface`. |
+| `--keep-alive-timeout` | Identical | Typed keep-alive timeout in milliseconds; explicit zero is falsy and normalizes to CHP's 5000 ms runtime default; `proxy_and_process_options_match_chp_surface`, `timeout_zero_semantics_match_chp`. |
 
 ## Environment variables
 
