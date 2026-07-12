@@ -17,13 +17,21 @@ use crate::api_server::{wait_for_shutdown, ManagementLifecycle, TrafficLifecycle
 use crate::path_ownership::OwnedPath;
 use crate::route_table::RouteRegistry;
 
-pub const TERMINAL_MUTATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+pub const TERMINAL_MUTATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 pub const ACCEPT_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 pub const ACTIVITY_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 pub const TRAFFIC_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Shutdown phases run in this order. Management and public accept-stop
+/// acknowledgements share one concurrent deadline in the first phase.
+pub const ORDERED_SHUTDOWN_PHASE_DEADLINES: [(&str, Duration); 4] = [
+    ("management and public accept-stop", ACCEPT_STOP_TIMEOUT),
+    ("terminal mutation drain", TERMINAL_MUTATION_DRAIN_TIMEOUT),
+    ("activity watermark flush", ACTIVITY_FLUSH_TIMEOUT),
+    ("admitted traffic drain", TRAFFIC_DRAIN_TIMEOUT),
+];
 /// Pingora's timer strictly contains every ordered lifecycle phase plus one safety second.
-pub const SHUTDOWN_GRACE_PERIOD_SECONDS: u64 = TERMINAL_MUTATION_DRAIN_TIMEOUT.as_secs()
-    + ACCEPT_STOP_TIMEOUT.as_secs()
+pub const SHUTDOWN_GRACE_PERIOD_SECONDS: u64 = ACCEPT_STOP_TIMEOUT.as_secs()
+    + TERMINAL_MUTATION_DRAIN_TIMEOUT.as_secs()
     + ACTIVITY_FLUSH_TIMEOUT.as_secs()
     + TRAFFIC_DRAIN_TIMEOUT.as_secs()
     + 1;
@@ -57,13 +65,19 @@ impl PidFileGuard {
 
 impl PidFileGuard {
     #[cfg(test)]
-    fn cleanup_for_test<B, R>(&mut self, before_quarantine: B, before_restore: R) -> Option<PathBuf>
+    fn cleanup_for_test<B, V, R>(
+        &mut self,
+        before_quarantine: B,
+        after_verify: V,
+        before_restore: R,
+    ) -> Option<PathBuf>
     where
         B: FnOnce(),
+        V: FnOnce(),
         R: FnOnce(),
     {
         self._owned
-            .cleanup_with_hooks(before_quarantine, before_restore)
+            .cleanup_with_hooks(before_quarantine, after_verify, before_restore)
     }
 }
 
@@ -168,8 +182,34 @@ impl BackgroundService for ShutdownCoordinator {
 
 #[cfg(test)]
 mod tests {
-    use super::PidFileGuard;
+    use super::{
+        PidFileGuard, ACCEPT_STOP_TIMEOUT, ORDERED_SHUTDOWN_PHASE_DEADLINES,
+        SHUTDOWN_GRACE_PERIOD_SECONDS, TERMINAL_MUTATION_DRAIN_TIMEOUT,
+    };
     use std::fs;
+    use std::time::Duration;
+
+    #[test]
+    fn ordered_shutdown_deadlines_restore_the_five_second_terminal_bound() {
+        assert_eq!(TERMINAL_MUTATION_DRAIN_TIMEOUT, Duration::from_secs(5));
+        assert_eq!(
+            ORDERED_SHUTDOWN_PHASE_DEADLINES,
+            [
+                ("management and public accept-stop", ACCEPT_STOP_TIMEOUT),
+                ("terminal mutation drain", Duration::from_secs(5)),
+                ("activity watermark flush", Duration::from_secs(1)),
+                ("admitted traffic drain", Duration::from_secs(2)),
+            ]
+        );
+        let sequential_bound: Duration = ORDERED_SHUTDOWN_PHASE_DEADLINES
+            .iter()
+            .map(|(_, deadline)| *deadline)
+            .sum();
+        assert!(
+            Duration::from_secs(SHUTDOWN_GRACE_PERIOD_SECONDS) > sequential_bound,
+            "Pingora grace must strictly contain every sequential phase deadline"
+        );
+    }
 
     #[test]
     fn pid_cleanup_never_deletes_a_boundary_replacement() {
@@ -182,6 +222,7 @@ mod tests {
                 fs::remove_file(&path).expect("replace owned PID");
                 fs::write(&path, b"replacement\n").expect("write replacement PID");
             },
+            || {},
             || {},
         );
 
@@ -208,6 +249,7 @@ mod tests {
                 fs::remove_file(&path).expect("replace owned PID");
                 fs::write(&path, b"replacement\n").expect("write replacement PID");
             },
+            || {},
             || fs::write(&path, b"restore-collision\n").expect("install restore collision"),
         );
 

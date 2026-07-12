@@ -60,6 +60,22 @@ still cancel work left after a reported timeout, so every backend mutation must
 itself be one atomic persistence operation. A backend that remains pending
 forever violates the store timeout requirement.
 
+Task 8 fixes the production terminal mutation-drain timeout at exactly five
+seconds. Its ten-second Pingora grace period strictly contains all sequential
+phase bounds: one second for management/public accept-stop acknowledgement,
+five seconds for terminal mutations, one second for the activity watermark,
+and two seconds for admitted HTTP/WebSocket traffic. Final runtime teardown is
+bounded separately at one second.
+
+Unix PID/UDS publication and cleanup remain anchored to the originally opened
+parent directory. Cleanup places the candidate inside an unpredictable 0700
+directory and verifies/unlinks it through that private dirfd, eliminating the
+public-parent verify/unlink window for separate-UID attackers under ordinary
+Unix permissions. Replacement and restoration collisions are preserved, and
+ordinary cleanup removes its private directory. Processes sharing the service
+UID are not isolated by Unix file permissions; same-UID namespace attackers
+are outside this enforceable trust boundary.
+
 ## `requests_api` timing divergence
 
 Task 5 does not provide exact CHP parity for the timing of

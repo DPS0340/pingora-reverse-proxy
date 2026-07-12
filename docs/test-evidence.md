@@ -501,3 +501,51 @@ run. The non-Unix startup rejection has mutually exclusive cfg implementations
 and a target-cfg unit contract; Windows PID identity/quarantine code remains
 source-covered. Pingora stayed pinned at 0.8.1 and CHP at 5.3.0. No Task 9 work
 was added.
+
+### Task 8 final atomic-ownership and shutdown-bound wave (2026-07-13)
+
+The interrupted worktree based on `c34ddd4` was preserved and audited. Focused
+unit verification passed `25/25`. The Task 8 integration command passed `27/27`
+(`23` TLS/Unix/listener/lifecycle and `4` WebSocket), including a real Pingora
+listener-build failure produced by adopting `/dev/null` as a non-listener FD.
+
+The final-wave stress axes each passed 20 consecutive runs:
+
+- exact five-second terminal bound and strict grace containment: `20/20`;
+- 0700 private quarantine after verification/namespace replacement: `20/20`
+  for each adversarial branch (`40` test invocations);
+- dirfd-relative UDS publication across parent-alias replacement: `20/20`;
+- cancellation while the Pingora FD table is locked: `20/20`;
+- `RequestContext` callback panic/cancellation/drop single release: `20/20`.
+
+The real Pingora non-listener FD build-failure integration contract was also
+rerun separately and passed `20/20`. Earlier evidence above already records the
+five operational cleanup/TLS/HTTP/WebSocket stress axes; the current focused
+integration run reconfirmed each once after this wave.
+
+Default-parallel regression verification passed:
+
+```bash
+PROPTEST_CASES=256 cargo test --all-targets --all-features -- --nocapture
+```
+
+Exit code `0`: `237 passed`, zero failed or ignored (library `25`, binary `0`,
+API `33`, config `27`, proxy `69`, routes `11`, store `45`, TLS/Unix `23`,
+WebSocket `4`). `PROPTEST_CASES=512 cargo test --test route_properties --
+--nocapture` passed `11/11`.
+
+The Unix cleanup guarantee is intentionally bounded: the unpredictable 0700
+dirfd-owned namespace removes the public-parent verify/unlink race for
+separate-UID attackers under normal Unix permissions. Same-UID namespace
+attackers are outside the enforceable boundary and no mathematical absolute is
+claimed against them. Ordinary cleanup leaves no private debris; foreign
+replacement and restoration collisions remain preserved.
+
+Final quality gates all exited `0`:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo check --all-targets --all-features
+git diff --check
+```

@@ -57,11 +57,17 @@ impl Default for RequestContext {
     }
 }
 
-impl Drop for RequestContext {
-    fn drop(&mut self) {
+impl RequestContext {
+    fn release_traffic_admission(&mut self) {
         if let Some(traffic) = self.traffic_admission.take() {
             traffic.finish();
         }
+    }
+}
+
+impl Drop for RequestContext {
+    fn drop(&mut self) {
+        self.release_traffic_admission();
     }
 }
 
@@ -483,9 +489,7 @@ impl ProxyHttp for ChpProxy {
         if successful {
             self.publish_activity_if_eligible(ctx);
         }
-        if let Some(traffic) = ctx.traffic_admission.take() {
-            traffic.finish();
-        }
+        ctx.release_traffic_admission();
     }
 
     fn request_summary(&self, session: &Session, _ctx: &Self::CTX) -> String {
@@ -537,5 +541,54 @@ fn hex(byte: u8) -> Option<u8> {
         b'a'..=b'f' => Some(byte - b'a' + 10),
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RequestContext;
+    use crate::api_server::TrafficLifecycle;
+    use futures_util::FutureExt;
+    use std::sync::Arc;
+
+    fn admitted_context(traffic: &Arc<TrafficLifecycle>) -> RequestContext {
+        assert!(traffic.try_admit());
+        let mut context = RequestContext::default();
+        context.traffic_admission = Some(Arc::clone(traffic));
+        context
+    }
+
+    #[tokio::test]
+    async fn production_completion_callback_panic_cancel_and_drop_release_exactly_once() {
+        let callback_traffic = Arc::new(TrafficLifecycle::new());
+        let mut callback_context = admitted_context(&callback_traffic);
+        let panic = std::panic::AssertUnwindSafe(async {
+            callback_context.release_traffic_admission();
+            panic!("panic after production completion release");
+        })
+        .catch_unwind()
+        .await;
+        assert!(panic.is_err());
+        drop(callback_context);
+        assert_eq!(callback_traffic.release_count_for_test(), 1);
+        assert_eq!(callback_traffic.over_release_count_for_test(), 0);
+
+        let cancelled_traffic = Arc::new(TrafficLifecycle::new());
+        let cancelled_context = admitted_context(&cancelled_traffic);
+        let cancelled = tokio::spawn(async move {
+            let mut context = cancelled_context;
+            std::future::pending::<()>().await;
+            context.release_traffic_admission();
+        });
+        tokio::task::yield_now().await;
+        cancelled.abort();
+        let _ = cancelled.await;
+        assert_eq!(cancelled_traffic.release_count_for_test(), 1);
+        assert_eq!(cancelled_traffic.over_release_count_for_test(), 0);
+
+        let dropped_traffic = Arc::new(TrafficLifecycle::new());
+        drop(admitted_context(&dropped_traffic));
+        assert_eq!(dropped_traffic.release_count_for_test(), 1);
+        assert_eq!(dropped_traffic.over_release_count_for_test(), 0);
     }
 }

@@ -26,11 +26,6 @@ impl FileIdentity {
         Self::from_metadata(&file.metadata()?)
     }
 
-    #[cfg(unix)]
-    pub(crate) fn from_path(path: &Path) -> io::Result<Self> {
-        Self::from_metadata(&fs::symlink_metadata(path)?)
-    }
-
     fn from_metadata(metadata: &fs::Metadata) -> io::Result<Self> {
         #[cfg(unix)]
         {
@@ -64,8 +59,11 @@ impl FileIdentity {
             .is_some_and(|other| self.matches(other))
     }
 
-    #[cfg(not(unix))]
     fn matches(self, other: Self) -> bool {
+        #[cfg(unix)]
+        {
+            self.device == other.device && self.inode == other.inode
+        }
         #[cfg(windows)]
         {
             self.volume_serial_number.is_some()
@@ -106,7 +104,7 @@ impl OwnedPath {
                 .to_owned();
             let parent = path.parent().unwrap_or_else(|| Path::new("."));
             let directory_path = fs::canonicalize(parent)?;
-            let directory = File::open(&directory_path)?;
+            let directory = open_directory(&directory_path)?;
             let descriptor = rustix::fs::openat(
                 &directory,
                 &public_name,
@@ -143,8 +141,32 @@ impl OwnedPath {
 
     #[cfg(unix)]
     pub(crate) fn from_path(path: PathBuf) -> io::Result<Self> {
-        let identity = FileIdentity::from_path(&path)?;
-        Self::new(path, identity)
+        let public_name = path
+            .file_name()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "owned path has no file name")
+            })?
+            .to_owned();
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let directory_path = fs::canonicalize(parent)?;
+        let directory = open_directory(&directory_path)?;
+        let stat = rustix::fs::statat(
+            &directory,
+            &public_name,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+        Ok(Self {
+            public_path: path,
+            identity: FileIdentity {
+                device: stat.st_dev as u64,
+                inode: stat.st_ino,
+            },
+            active: true,
+            directory,
+            directory_path,
+            public_name,
+        })
     }
 
     #[cfg(not(unix))]
@@ -152,35 +174,13 @@ impl OwnedPath {
         Self::new(path, FileIdentity::from_file(file)?)
     }
 
+    #[cfg(not(unix))]
     fn new(path: PathBuf, identity: FileIdentity) -> io::Result<Self> {
-        #[cfg(unix)]
-        {
-            let public_name = path
-                .file_name()
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "owned path has no file name")
-                })?
-                .to_owned();
-            let parent = path.parent().unwrap_or_else(|| Path::new("."));
-            let canonical_parent = fs::canonicalize(parent)?;
-            let directory = File::open(&canonical_parent)?;
-            Ok(Self {
-                public_path: path,
-                identity,
-                active: true,
-                directory,
-                directory_path: canonical_parent,
-                public_name,
-            })
-        }
-        #[cfg(not(unix))]
-        {
-            Ok(Self {
-                public_path: path,
-                identity,
-                active: true,
-            })
-        }
+        Ok(Self {
+            public_path: path,
+            identity,
+            active: true,
+        })
     }
 
     #[cfg(unix)]
@@ -189,24 +189,37 @@ impl OwnedPath {
     }
 
     #[cfg(unix)]
-    pub(crate) fn set_path(&mut self, path: PathBuf) {
-        if let Some(name) = path.file_name() {
-            self.public_name = name.to_owned();
-            self.public_path = path;
-        }
+    pub(crate) fn publish_as(&mut self, path: PathBuf) -> io::Result<()> {
+        let destination_name = path
+            .file_name()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "owned path has no file name")
+            })?
+            .to_owned();
+        rename_relative_noreplace(
+            &self.directory,
+            &self.public_name,
+            &self.directory,
+            &destination_name,
+        )?;
+        self.public_name = destination_name;
+        self.public_path = path;
+        Ok(())
     }
 
     pub(crate) fn cleanup(&mut self) -> Option<PathBuf> {
-        self.cleanup_with_hooks(|| {}, || {})
+        self.cleanup_with_hooks(|| {}, || {}, || {})
     }
 
-    pub(crate) fn cleanup_with_hooks<B, R>(
+    pub(crate) fn cleanup_with_hooks<B, V, R>(
         &mut self,
         before_quarantine: B,
+        after_verify: V,
         before_restore: R,
     ) -> Option<PathBuf>
     where
         B: FnOnce(),
+        V: FnOnce(),
         R: FnOnce(),
     {
         if !self.active {
@@ -215,7 +228,7 @@ impl OwnedPath {
         self.active = false;
         before_quarantine();
 
-        let quarantine_name = match self.quarantine_entry() {
+        let quarantine = match self.quarantine_entry() {
             Ok(Some(name)) => name,
             Ok(None) => return None,
             Err(error) => {
@@ -224,16 +237,20 @@ impl OwnedPath {
             }
         };
         #[cfg(unix)]
-        let quarantine_path = self.directory_path.join(&quarantine_name);
+        let quarantine_path = self
+            .directory_path
+            .join(&quarantine.name)
+            .join(PRIVATE_CANDIDATE_NAME);
         #[cfg(not(unix))]
         let quarantine_path = self
             .public_path
             .parent()
             .unwrap_or_else(|| Path::new("."))
-            .join(&quarantine_name);
+            .join(&quarantine);
 
-        if self.quarantine_matches(&quarantine_name, &quarantine_path) {
-            if let Err(error) = self.remove_quarantine(&quarantine_name, &quarantine_path) {
+        if self.quarantine_matches(&quarantine, &quarantine_path) {
+            after_verify();
+            if let Err(error) = self.remove_quarantine(&quarantine, &quarantine_path) {
                 tracing::error!(path = %quarantine_path.display(), %error, "verified quarantine removal failed");
                 return Some(quarantine_path);
             }
@@ -241,7 +258,7 @@ impl OwnedPath {
         }
 
         before_restore();
-        match self.restore_quarantine(&quarantine_name, &quarantine_path) {
+        match self.restore_quarantine(&quarantine, &quarantine_path) {
             Ok(()) => None,
             Err(error) => {
                 tracing::error!(
@@ -255,17 +272,66 @@ impl OwnedPath {
         }
     }
 
-    fn quarantine_entry(&self) -> io::Result<Option<OsString>> {
+    #[cfg(unix)]
+    fn quarantine_entry(&self) -> io::Result<Option<UnixQuarantine>> {
         for _ in 0..QUARANTINE_ATTEMPTS {
             let private_name = random_private_name()?;
-            #[cfg(unix)]
+            match rustix::fs::mkdirat(
+                &self.directory,
+                &private_name,
+                rustix::fs::Mode::from_raw_mode(0o700),
+            ) {
+                Ok(()) => {}
+                Err(error) if error == rustix::io::Errno::EXIST => continue,
+                Err(error) => return Err(io::Error::from_raw_os_error(error.raw_os_error())),
+            }
+            let private_directory = match rustix::fs::openat(
+                &self.directory,
+                &private_name,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::CLOEXEC
+                    | rustix::fs::OFlags::NOFOLLOW,
+                rustix::fs::Mode::empty(),
+            ) {
+                Ok(descriptor) => File::from(descriptor),
+                Err(error) => {
+                    return Err(io::Error::from_raw_os_error(error.raw_os_error()));
+                }
+            };
+            rustix::fs::fchmod(&private_directory, rustix::fs::Mode::from_raw_mode(0o700))
+                .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+            let directory_identity = FileIdentity::from_file(&private_directory)?;
+            let quarantine = UnixQuarantine {
+                name: private_name,
+                directory: private_directory,
+                identity: directory_identity,
+            };
             let result = rename_relative_noreplace(
                 &self.directory,
                 &self.public_name,
-                &self.directory,
-                &private_name,
+                &quarantine.directory,
+                OsStr::new(PRIVATE_CANDIDATE_NAME),
             );
-            #[cfg(not(unix))]
+            match result {
+                Ok(()) => return Ok(Some(quarantine)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    self.remove_private_directory(&quarantine)?;
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not reserve a private cleanup quarantine",
+        ))
+    }
+
+    #[cfg(not(unix))]
+    fn quarantine_entry(&self) -> io::Result<Option<OsString>> {
+        for _ in 0..QUARANTINE_ATTEMPTS {
+            let private_name = random_private_name()?;
             let result = rename_noreplace(
                 &self.public_path,
                 &self
@@ -287,43 +353,110 @@ impl OwnedPath {
         ))
     }
 
-    fn quarantine_matches(&self, name: &OsStr, _path: &Path) -> bool {
-        #[cfg(unix)]
-        {
-            rustix::fs::statat(&self.directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
-                .ok()
-                .is_some_and(|stat| {
-                    self.identity.device == stat.st_dev as u64 && self.identity.inode == stat.st_ino
-                })
-        }
-        #[cfg(not(unix))]
-        {
-            self.identity.matches_path(_path)
-        }
+    #[cfg(unix)]
+    fn quarantine_matches(&self, quarantine: &UnixQuarantine, _path: &Path) -> bool {
+        rustix::fs::statat(
+            &quarantine.directory,
+            PRIVATE_CANDIDATE_NAME,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .ok()
+        .is_some_and(|stat| {
+            self.identity.device == stat.st_dev as u64 && self.identity.inode == stat.st_ino
+        })
     }
 
-    fn remove_quarantine(&self, name: &OsStr, _path: &Path) -> io::Result<()> {
-        #[cfg(unix)]
-        {
-            rustix::fs::unlinkat(&self.directory, name, rustix::fs::AtFlags::empty())
-                .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))
-        }
-        #[cfg(not(unix))]
-        {
-            fs::remove_file(_path)
-        }
+    #[cfg(not(unix))]
+    fn quarantine_matches(&self, _name: &OsStr, path: &Path) -> bool {
+        self.identity.matches_path(path)
     }
 
-    fn restore_quarantine(&self, name: &OsStr, _path: &Path) -> io::Result<()> {
-        #[cfg(unix)]
-        {
-            rename_relative_noreplace(&self.directory, name, &self.directory, &self.public_name)
-        }
-        #[cfg(not(unix))]
-        {
-            rename_noreplace(_path, &self.public_path)
-        }
+    #[cfg(unix)]
+    fn remove_quarantine(&self, quarantine: &UnixQuarantine, _path: &Path) -> io::Result<()> {
+        rustix::fs::unlinkat(
+            &quarantine.directory,
+            PRIVATE_CANDIDATE_NAME,
+            rustix::fs::AtFlags::empty(),
+        )
+        .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+        self.remove_private_directory(quarantine)
     }
+
+    #[cfg(not(unix))]
+    fn remove_quarantine(&self, _name: &OsStr, path: &Path) -> io::Result<()> {
+        fs::remove_file(path)
+    }
+
+    #[cfg(unix)]
+    fn restore_quarantine(&self, quarantine: &UnixQuarantine, _path: &Path) -> io::Result<()> {
+        rename_relative_noreplace(
+            &quarantine.directory,
+            OsStr::new(PRIVATE_CANDIDATE_NAME),
+            &self.directory,
+            &self.public_name,
+        )?;
+        self.remove_private_directory(quarantine)
+    }
+
+    #[cfg(not(unix))]
+    fn restore_quarantine(&self, name: &OsStr, path: &Path) -> io::Result<()> {
+        let _ = name;
+        rename_noreplace(path, &self.public_path)
+    }
+
+    #[cfg(unix)]
+    fn remove_private_directory(&self, quarantine: &UnixQuarantine) -> io::Result<()> {
+        let parent_identity = rustix::fs::statat(
+            &self.directory,
+            &quarantine.name,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map(|stat| FileIdentity {
+            device: stat.st_dev as u64,
+            inode: stat.st_ino,
+        })
+        .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+        if !quarantine.identity.matches(parent_identity) {
+            return Err(io::Error::other(
+                "private cleanup namespace was replaced; preserving replacement",
+            ));
+        }
+        // POSIX has no identity-conditional rmdir-by-handle. The candidate is
+        // protected from other users by the unpredictable 0700 directory and
+        // every operation above is descriptor-relative. A same-UID actor with
+        // write access to the parent remains inside the process trust boundary
+        // and can race this final checked unlinkat after discovering the name.
+        rustix::fs::unlinkat(
+            &self.directory,
+            &quarantine.name,
+            rustix::fs::AtFlags::REMOVEDIR,
+        )
+        .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))
+    }
+}
+
+#[cfg(unix)]
+const PRIVATE_CANDIDATE_NAME: &str = "candidate";
+
+#[cfg(unix)]
+struct UnixQuarantine {
+    name: OsString,
+    directory: File,
+    identity: FileIdentity,
+}
+
+#[cfg(unix)]
+fn open_directory(path: &Path) -> io::Result<File> {
+    rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))
 }
 
 impl Drop for OwnedPath {
@@ -421,6 +554,7 @@ mod tests {
                 fs::write(&public, b"replacement").expect("write foreign public entry");
             },
             || {},
+            || {},
         );
 
         assert_eq!(
@@ -433,6 +567,111 @@ mod tests {
                 .expect("list original parent")
                 .count(),
             0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_after_private_verification_cannot_redirect_candidate_unlink() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("temporary private cleanup root");
+        let public_parent = root.path().join("live");
+        let moved_parent = root.path().join("moved");
+        fs::create_dir(&public_parent).expect("create public parent");
+        let public = public_parent.join("proxy.sock");
+        fs::write(&public, b"owned").expect("write owned entry");
+        let mut owner = OwnedPath::from_path(public.clone()).expect("capture owned path");
+
+        owner.cleanup_with_hooks(
+            || {},
+            || {
+                let private_namespace = fs::read_dir(&public_parent)
+                    .expect("list private cleanup namespace")
+                    .next()
+                    .expect("private cleanup namespace exists")
+                    .expect("read private cleanup namespace");
+                let metadata = private_namespace
+                    .metadata()
+                    .expect("private cleanup namespace metadata");
+                assert!(metadata.is_dir());
+                assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+                fs::rename(&public_parent, &moved_parent).expect("move captured parent");
+                fs::create_dir(&public_parent).expect("replace public parent");
+                fs::write(&public, b"foreign public entry").expect("write foreign entry");
+            },
+            || {},
+        );
+
+        assert_eq!(
+            fs::read(&public).expect("foreign public entry remains"),
+            b"foreign public entry"
+        );
+        assert_eq!(
+            fs::read_dir(&moved_parent)
+                .expect("list original captured parent")
+                .count(),
+            0,
+            "ordinary private cleanup namespace leaked"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_namespace_replacement_is_preserved_instead_of_removed() {
+        let root = tempfile::tempdir().expect("temporary private replacement root");
+        let public = root.path().join("proxy.sock");
+        let displaced = root.path().join("displaced-private");
+        fs::write(&public, b"owned").expect("write owned entry");
+        let mut owner = OwnedPath::from_path(public.clone()).expect("capture owned path");
+
+        let debris = owner.cleanup_with_hooks(
+            || {},
+            || {
+                let private_namespace = fs::read_dir(root.path())
+                    .expect("list cleanup root")
+                    .find_map(|entry| {
+                        let entry = entry.expect("read cleanup entry");
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(".chp-cleanup-")
+                            .then_some(entry.path())
+                    })
+                    .expect("private namespace exists");
+                fs::rename(&private_namespace, &displaced).expect("displace private namespace");
+                fs::create_dir(&private_namespace).expect("install replacement namespace");
+                fs::write(private_namespace.join("foreign"), b"replacement")
+                    .expect("populate replacement namespace");
+            },
+            || {},
+        );
+
+        assert!(
+            debris.is_some(),
+            "replacement must be reported as preserved"
+        );
+        let replacement = fs::read_dir(root.path())
+            .expect("list cleanup root after replacement")
+            .find_map(|entry| {
+                let entry = entry.expect("read replacement entry");
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".chp-cleanup-")
+                    .then_some(entry.path())
+            })
+            .expect("replacement namespace remains");
+        assert_eq!(
+            fs::read(replacement.join("foreign")).expect("foreign replacement remains"),
+            b"replacement"
+        );
+        assert_eq!(
+            fs::read_dir(&displaced)
+                .expect("list displaced owned namespace")
+                .count(),
+            0,
+            "verified candidate was not unlinked through its private dirfd"
         );
     }
 }

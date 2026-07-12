@@ -65,6 +65,36 @@ An already-inactive zero-duration drain succeeds; an active zero-duration drain
 reports timeout only while its final locked active observation remains nonzero.
 Consequently `timed_out == false` always implies `active_mutations == 0`.
 
+## Task 8 listener ownership and shutdown bounds
+
+The production terminal mutation-drain bound is exactly five seconds. Ordered
+shutdown spends at most one second stopping management and public accepts,
+then five seconds draining terminal mutations, one second flushing the activity
+watermark, and two seconds draining admitted HTTP/WebSocket traffic. Pingora's
+ten-second grace period strictly contains that nine-second sequential bound;
+final Tokio runtime teardown has its own one-second bound.
+
+On supported Unix targets, PID and UDS owners retain an open descriptor for the
+original canonical parent. UDS publication and cleanup are dirfd-relative.
+Cleanup atomically moves the public entry into an unpredictable mode-0700
+private directory, verifies and unlinks the candidate through that directory's
+descriptor, and removes the empty private directory during ordinary cleanup.
+A foreign replacement is restored with no-replace semantics; a restoration
+collision preserves both entries for diagnosis. This closes the public-parent
+verify/unlink race against separate-UID namespace attackers under normal Unix
+permission enforcement. Unix does not isolate processes sharing the service
+UID: a same-UID actor able to mutate the parent namespace is explicitly outside
+the enforceable trust boundary, so this is not claimed as a mathematical
+absolute against same-UID interference.
+
+Public-listener exit/readiness and descriptor ownership guards exist before
+the first await or FD handoff. Cancellation while Pingora's shared FD table is
+locked therefore closes the retained descriptor, removes owned files, withholds
+readiness, and acknowledges exit. A real non-listener descriptor contract
+exercises Pingora's listener-build failure path. Each `RequestContext` owns its
+traffic-admission token and releases it through one take-once path used by the
+completion callback and `Drop`, including panic and cancellation unwinding.
+
 | CHP long option | Classification | Configuration behavior and contract test |
 |---|---|---|
 | `--ip` | Identical | Selects the public TCP address; omission and `*` mean all interfaces as in CHP; `listener_options_are_typed`, `star_ip_alias_matches_chp_all_interfaces_behavior`. |

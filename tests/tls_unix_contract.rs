@@ -22,7 +22,7 @@ use openssl::x509::{X509NameBuilder, X509};
 use serial_test::serial;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(3);
-const PROCESS_EXIT_TIMEOUT: Duration = Duration::from_secs(12);
+const PROCESS_EXIT_TIMEOUT: Duration = Duration::from_secs(15);
 const ACTIVE_DRAIN_HOLD: Duration = Duration::from_millis(1_500);
 
 fn reserve_port() -> u16 {
@@ -246,10 +246,15 @@ fn injected_public_build_failure_exits_nonzero_without_ready_api_or_owned_files(
         "injected public build failure exited successfully"
     );
     assert!(
+        binary.stderr_text().contains("Failed to build listeners"),
+        "missing real Pingora listener-build diagnostic: {}",
+        binary.stderr_text()
+    );
+    assert!(
         binary
             .stderr_text()
-            .contains("injected public listener endpoint build failure"),
-        "missing injected build diagnostic: {}",
+            .contains("Socket operation on non-socket"),
+        "injection did not exercise Pingora adoption/build with a real non-listener FD: {}",
         binary.stderr_text()
     );
     assert!(

@@ -138,6 +138,10 @@ pub struct TrafficLifecycle {
     active: std::sync::atomic::AtomicUsize,
     accepts_stopped: AtomicBool,
     changed: Notify,
+    #[cfg(test)]
+    releases: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    over_releases: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(unix)]
@@ -161,6 +165,10 @@ impl FailClosedReadyNotifier {
         if let Some(notifier) = self.0.take() {
             notifier.notify_ready();
         }
+    }
+
+    fn take(&mut self) -> ServiceReadyNotifier {
+        self.0.take().expect("readiness notifier is taken once")
     }
 }
 
@@ -261,13 +269,21 @@ impl TrafficLifecycle {
                 Ordering::Acquire,
             ) {
                 Ok(1) => {
+                    #[cfg(test)]
+                    self.releases.fetch_add(1, Ordering::Relaxed);
                     self.changed.notify_waiters();
                     return;
                 }
-                Ok(_) => return,
+                Ok(_) => {
+                    #[cfg(test)]
+                    self.releases.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
                 Err(observed) => active = observed,
             }
         }
+        #[cfg(test)]
+        self.over_releases.fetch_add(1, Ordering::Relaxed);
         tracing::error!("public traffic lifecycle admission released more than once");
     }
 
@@ -300,6 +316,16 @@ impl TrafficLifecycle {
     pub fn active(&self) -> usize {
         self.active.load(Ordering::Acquire)
     }
+
+    #[cfg(test)]
+    pub(crate) fn release_count_for_test(&self) -> usize {
+        self.releases.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn over_release_count_for_test(&self) -> usize {
+        self.over_releases.load(Ordering::Relaxed)
+    }
 }
 
 impl Default for TrafficLifecycle {
@@ -309,6 +335,10 @@ impl Default for TrafficLifecycle {
             active: std::sync::atomic::AtomicUsize::new(0),
             accepts_stopped: AtomicBool::new(false),
             changed: Notify::new(),
+            #[cfg(test)]
+            releases: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            over_releases: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -648,18 +678,24 @@ impl SocketOwner {
         self.owned.path()
     }
 
-    fn set_path(&mut self, path: PathBuf) {
-        self.owned.set_path(path);
+    fn publish_as(&mut self, path: PathBuf) -> io::Result<()> {
+        self.owned.publish_as(path)
     }
 
     #[cfg(test)]
-    fn cleanup_for_test<B, R>(&mut self, before_quarantine: B, before_restore: R) -> Option<PathBuf>
+    fn cleanup_for_test<B, V, R>(
+        &mut self,
+        before_quarantine: B,
+        after_verify: V,
+        before_restore: R,
+    ) -> Option<PathBuf>
     where
         B: FnOnce(),
+        V: FnOnce(),
         R: FnOnce(),
     {
         self.owned
-            .cleanup_with_hooks(before_quarantine, before_restore)
+            .cleanup_with_hooks(before_quarantine, after_verify, before_restore)
     }
 }
 
@@ -670,6 +706,8 @@ pub struct PreboundPublicService<A> {
     reservation: Option<PublicListenerReservation>,
     traffic: Arc<TrafficLifecycle>,
     startup_failed: Arc<AtomicBool>,
+    #[cfg(test)]
+    before_fd_table_lock: Option<Box<dyn FnOnce(std::os::fd::RawFd) + Send + Sync>>,
 }
 
 #[cfg(unix)]
@@ -732,23 +770,31 @@ impl PublicListenerReservation {
         }
     }
 
-    fn transfer(self) -> (String, std::os::fd::RawFd, Option<SocketOwner>) {
-        use std::os::fd::IntoRawFd;
-
+    fn into_parts(self) -> (String, socket2::Socket, Option<SocketOwner>) {
         match self {
-            Self::Tcp { socket, key } => (key, socket.into_raw_fd(), None),
-            Self::Unix { socket, owner } => (
-                owner.path().display().to_string(),
-                socket.into_raw_fd(),
-                Some(owner),
-            ),
+            Self::Tcp { socket, key } => (key, socket, None),
+            Self::Unix { socket, owner } => {
+                (owner.path().display().to_string(), socket, Some(owner))
+            }
         }
     }
 }
 
 #[cfg(unix)]
 fn bind_unix_socket(path: PathBuf) -> Result<(socket2::Socket, SocketOwner), ListenerError> {
+    bind_unix_socket_with_hook(path, || {})
+}
+
+#[cfg(unix)]
+fn bind_unix_socket_with_hook<F>(
+    path: PathBuf,
+    after_bind_before_publish: F,
+) -> Result<(socket2::Socket, SocketOwner), ListenerError>
+where
+    F: FnOnce(),
+{
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut after_bind_before_publish = Some(after_bind_before_publish);
     for _ in 0..4 {
         let mut random = [0_u8; 16];
         openssl::rand::rand_bytes(&mut random).map_err(|_| {
@@ -771,17 +817,10 @@ fn bind_unix_socket(path: PathBuf) -> Result<(socket2::Socket, SocketOwner), Lis
         socket
             .set_nonblocking(true)
             .map_err(ListenerError::UnixBind)?;
-        rustix::fs::renameat_with(
-            rustix::fs::CWD,
-            owner.path(),
-            rustix::fs::CWD,
-            &path,
-            rustix::fs::RenameFlags::NOREPLACE,
-        )
-        .map_err(|error| {
-            ListenerError::UnixBind(io::Error::from_raw_os_error(error.raw_os_error()))
-        })?;
-        owner.set_path(path);
+        after_bind_before_publish
+            .take()
+            .expect("publication hook is called once")();
+        owner.publish_as(path).map_err(ListenerError::UnixBind)?;
         return Ok((socket, owner));
     }
     Err(ListenerError::UnixBind(io::Error::new(
@@ -803,7 +842,17 @@ impl<A> PreboundPublicService<A> {
             reservation: Some(PublicListenerReservation::bind(listener)?),
             traffic,
             startup_failed,
+            #[cfg(test)]
+            before_fd_table_lock: None,
         })
+    }
+
+    #[cfg(test)]
+    fn set_before_fd_table_lock_hook<F>(&mut self, hook: F)
+    where
+        F: FnOnce(std::os::fd::RawFd) + Send + Sync + 'static,
+    {
+        self.before_fd_table_lock = Some(Box::new(hook));
     }
 }
 
@@ -820,60 +869,68 @@ where
         listeners_per_fd: usize,
         ready_notifier: ServiceReadyNotifier,
     ) {
+        use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
+
+        // These guards precede every ownership transfer and every await in
+        // this method, including contention on Pingora's shared FD table.
+        let _exit = PublicExitGuard {
+            traffic: Arc::clone(&self.traffic),
+        };
+        let mut ready_notifier = FailClosedReadyNotifier(Some(ready_notifier));
         let service = self.service.take();
         let reservation = self.reservation.take();
         let Some(fds) = fds else {
             tracing::error!("pre-bound public listener could not be adopted");
-            let _exit = PublicExitGuard {
-                traffic: Arc::clone(&self.traffic),
-            };
-            let _ready = FailClosedReadyNotifier(Some(ready_notifier));
             signal_public_startup_failure(&self.startup_failed);
             return;
         };
         let (Some(mut service), Some(reservation)) = (service, reservation) else {
             tracing::error!("pre-bound public listener could not be adopted");
-            let _exit = PublicExitGuard {
-                traffic: Arc::clone(&self.traffic),
-            };
-            let _ready = FailClosedReadyNotifier(Some(ready_notifier));
             signal_public_startup_failure(&self.startup_failed);
             return;
         };
-        let (key, fd, owner) = reservation.transfer();
-        tracing::debug!(bind = key, fd, "registering pre-bound public listener");
-        {
-            let mut table = fds.lock().await;
-            table.add(key, fd);
-        }
-        tracing::debug!(listeners_per_fd, "starting Pingora public listener service");
-        let shutdown_observer = shutdown.clone();
+        let (key, socket, owner) = reservation.into_parts();
         #[cfg(debug_assertions)]
         let inject_build_failure = std::env::var_os("CHP_TASK8_INJECT_PUBLIC_BUILD_FAILURE")
             .is_some_and(|value| value == "1");
         #[cfg(not(debug_assertions))]
         let inject_build_failure = false;
-        let outcome = if inject_build_failure {
-            tracing::error!("injected public listener endpoint build failure");
-            run_public_service_future(
-                async { panic!("injected public listener endpoint build failure") },
-                ready_notifier,
-                Arc::clone(&self.traffic),
-            )
-            .await
+        let descriptor: OwnedFd = if inject_build_failure {
+            tracing::error!(
+                "injected public listener endpoint build failure with real non-listener descriptor"
+            );
+            drop(socket);
+            std::fs::File::open("/dev/null")
+                .expect("/dev/null is available on supported Unix targets")
+                .into()
         } else {
-            run_public_service_future(
-                <Service<A> as pingora::services::Service>::start_service(
-                    &mut service,
-                    Some(fds),
-                    shutdown,
-                    listeners_per_fd,
-                ),
-                ready_notifier,
-                Arc::clone(&self.traffic),
-            )
-            .await
+            socket.into()
         };
+        let fd = descriptor.as_raw_fd();
+        tracing::debug!(bind = key, fd, "registering pre-bound public listener");
+        #[cfg(test)]
+        if let Some(hook) = self.before_fd_table_lock.take() {
+            hook(fd);
+        }
+        {
+            let mut table = fds.lock().await;
+            table.add(key, fd);
+            let transferred_fd = descriptor.into_raw_fd();
+            debug_assert_eq!(fd, transferred_fd);
+        }
+        tracing::debug!(listeners_per_fd, "starting Pingora public listener service");
+        let shutdown_observer = shutdown.clone();
+        let outcome = run_public_service_future(
+            <Service<A> as pingora::services::Service>::start_service(
+                &mut service,
+                Some(fds),
+                shutdown,
+                listeners_per_fd,
+            ),
+            ready_notifier.take(),
+            Arc::clone(&self.traffic),
+        )
+        .await;
         if outcome != PublicServiceOutcome::Exited || !*shutdown_observer.borrow() {
             signal_public_startup_failure(&self.startup_failed);
         }
@@ -1144,8 +1201,25 @@ mod tests {
     use pingora::services::ServiceReadyNotifier;
     #[cfg(unix)]
     use std::fs;
+    #[cfg(unix)]
+    use std::io;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[cfg(unix)]
+    struct TestServerApp;
+
+    #[cfg(unix)]
+    #[async_trait::async_trait]
+    impl pingora::apps::ServerApp for TestServerApp {
+        async fn process_new(
+            self: &Arc<Self>,
+            _session: pingora::protocols::Stream,
+            _shutdown: &pingora::server::ShutdownWatch,
+        ) -> Option<pingora::protocols::Stream> {
+            None
+        }
+    }
 
     #[test]
     fn public_startup_support_is_decided_synchronously_by_target() {
@@ -1227,6 +1301,98 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_while_fd_table_is_locked_closes_and_unwinds_before_ready() {
+        use pingora::server::{Fds, ListenFds};
+        use pingora::services::ServiceWithDependents;
+        use std::os::fd::RawFd;
+        use std::sync::atomic::{AtomicI32, Ordering};
+
+        let directory = tempfile::tempdir_in("/tmp").expect("temporary handoff directory");
+        let socket_path = directory.path().join("public.sock");
+        let pid_path = directory.path().join("proxy.pid");
+        let pid_guard = PidFileGuard::acquire(&pid_path).expect("own PID entry");
+        let traffic = Arc::new(TrafficLifecycle::new());
+        let startup_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut service =
+            pingora::services::listening::Service::new("test public".to_string(), TestServerApp);
+        service.add_uds(socket_path.to_str().expect("UTF-8 socket path"), None);
+        let mut public = super::PreboundPublicService::new(
+            service,
+            &crate::config::ListenerConfig::Unix(socket_path.clone()),
+            Arc::clone(&traffic),
+            startup_failed,
+        )
+        .expect("prebind public UDS");
+        let reached_lock = Arc::new(tokio::sync::Notify::new());
+        let observed_fd = Arc::new(AtomicI32::new(-1));
+        let observed_identity = Arc::new(std::sync::Mutex::new(None));
+        public.set_before_fd_table_lock_hook({
+            let reached_lock = Arc::clone(&reached_lock);
+            let observed_fd = Arc::clone(&observed_fd);
+            let observed_identity = Arc::clone(&observed_identity);
+            move |fd: RawFd| {
+                let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+                assert_eq!(unsafe { libc::fstat(fd, &mut stat) }, 0);
+                *observed_identity
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some((stat.st_dev, stat.st_ino));
+                observed_fd.store(fd, Ordering::Release);
+                reached_lock.notify_one();
+            }
+        });
+
+        let fds: ListenFds = Arc::new(tokio::sync::Mutex::new(Fds::new()));
+        let table_guard = fds.lock().await;
+        let (_shutdown_sender, shutdown) = tokio::sync::watch::channel(false);
+        let (ready_sender, ready_watch) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn({
+            let fds = Arc::clone(&fds);
+            async move {
+                let _pid_guard = pid_guard;
+                public
+                    .start_service(
+                        Some(fds),
+                        shutdown,
+                        1,
+                        ServiceReadyNotifier::new(ready_sender),
+                    )
+                    .await;
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), reached_lock.notified())
+            .await
+            .expect("public handoff did not reach the held FD-table lock");
+        task.abort();
+        let _ = task.await;
+        drop(table_guard);
+
+        assert!(!*ready_watch.borrow(), "cancelled handoff announced ready");
+        tokio::time::timeout(Duration::from_secs(1), traffic.wait_for_accepts_stopped())
+            .await
+            .expect("cancelled pre-wrapper handoff did not acknowledge exit");
+        assert!(!socket_path.exists(), "cancelled public UDS owner leaked");
+        assert!(!pid_path.exists(), "cancelled PID owner leaked");
+        let fd = observed_fd.load(Ordering::Acquire);
+        assert!(fd >= 0, "handoff hook did not observe the descriptor");
+        let original_identity = observed_identity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("handoff hook did not capture descriptor identity");
+        let mut current: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut current) } == 0 {
+            assert_ne!(
+                (current.st_dev, current.st_ino),
+                original_identity,
+                "cancelled handoff left the original file description open"
+            );
+        } else {
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn socket_cleanup_never_deletes_a_boundary_replacement() {
         let directory = tempfile::tempdir().expect("temporary socket ownership directory");
@@ -1239,6 +1405,7 @@ mod tests {
                 fs::remove_file(&path).expect("replace owned entry");
                 fs::write(&path, b"replacement").expect("write replacement");
             },
+            || {},
             || {},
         );
 
@@ -1267,6 +1434,7 @@ mod tests {
                 fs::remove_file(&path).expect("replace owned entry");
                 fs::write(&path, b"replacement").expect("write replacement");
             },
+            || {},
             || fs::write(&path, b"restore-collision").expect("install restore collision"),
         );
 
@@ -1297,6 +1465,48 @@ mod tests {
                 .expect("list ownership directory")
                 .count(),
             0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uds_publication_uses_the_captured_parent_after_alias_replacement() {
+        use std::os::unix::net::UnixStream;
+
+        let root = tempfile::tempdir_in("/tmp").expect("temporary publication root");
+        let public_parent = root.path().join("live");
+        let captured_parent = root.path().join("captured");
+        fs::create_dir(&public_parent).expect("create publication parent");
+        let configured = public_parent.join("public.sock");
+
+        let (socket, owner) = super::bind_unix_socket_with_hook(configured.clone(), || {
+            fs::rename(&public_parent, &captured_parent).expect("rename captured parent");
+            fs::create_dir(&public_parent).expect("replace configured parent alias");
+            fs::write(&configured, b"foreign destination").expect("install foreign destination");
+            fs::write(public_parent.join("foreign-temp.sock"), b"foreign temp")
+                .expect("install foreign temporary path");
+        })
+        .expect("publish through captured parent descriptor");
+
+        assert!(
+            UnixStream::connect(captured_parent.join("public.sock")).is_ok(),
+            "real socket was not published in the captured directory"
+        );
+        assert_eq!(
+            fs::read(&configured).expect("foreign configured path remains"),
+            b"foreign destination"
+        );
+        assert_eq!(
+            fs::read(public_parent.join("foreign-temp.sock")).expect("foreign temp remains"),
+            b"foreign temp"
+        );
+        drop((socket, owner));
+        assert_eq!(
+            fs::read_dir(&captured_parent)
+                .expect("list captured publication parent")
+                .count(),
+            0,
+            "captured publication directory leaked entries"
         );
     }
 
