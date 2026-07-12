@@ -1,15 +1,17 @@
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use pingora_reverse_proxy::route::{RouteData, RouteKey};
-use pingora_reverse_proxy::route_table::RouteRegistry;
+use pingora_reverse_proxy::route_table::{RouteMatch, RouteRegistry};
 use pingora_reverse_proxy::store::memory::MemoryStore;
 use pingora_reverse_proxy::store::{Store, StoreError};
 use proptest::prelude::*;
 use serde_json::{json, Map};
-use tokio::sync::Barrier;
+use tokio::sync::{Barrier, RwLock, Semaphore};
 use url::Url;
 
 fn key(path: &str) -> RouteKey {
@@ -136,9 +138,11 @@ struct FailingStore {
 
 impl FailingStore {
     fn on_put() -> Self {
-        Self {
-            routes: BTreeMap::new(),
-        }
+        Self::with_routes(BTreeMap::new())
+    }
+
+    fn with_routes(routes: BTreeMap<RouteKey, RouteData>) -> Self {
+        Self { routes }
     }
 }
 
@@ -170,6 +174,64 @@ async fn failed_persistence_never_publishes_route() {
         .await;
     assert!(result.is_err());
     assert!(registry.resolve("/user/a/tree").is_none());
+}
+
+fn registry_views(
+    registry: &RouteRegistry,
+    route_key: &RouteKey,
+    request_path: &str,
+) -> (
+    Option<RouteData>,
+    BTreeMap<RouteKey, RouteData>,
+    Option<RouteMatch>,
+) {
+    (
+        registry.get(route_key),
+        registry.all(),
+        registry.resolve(request_path),
+    )
+}
+
+#[tokio::test]
+async fn failed_activity_update_leaves_every_registry_view_unchanged() {
+    let route_key = key("/service");
+    let route_data = route("http://127.0.0.1:9000/original");
+    let store = Arc::new(FailingStore::with_routes(BTreeMap::from([(
+        route_key.clone(),
+        route_data,
+    )])));
+    let registry = RouteRegistry::load(store).await.unwrap();
+    let before = registry_views(&registry, &route_key, "/service/request");
+
+    let result = registry
+        .update_activity(&route_key, Utc.timestamp_opt(999, 0).unwrap())
+        .await;
+
+    assert!(result.is_err());
+    assert_eq!(
+        registry_views(&registry, &route_key, "/service/request"),
+        before
+    );
+}
+
+#[tokio::test]
+async fn failed_delete_leaves_every_registry_view_unchanged() {
+    let route_key = key("/service");
+    let route_data = route("http://127.0.0.1:9000/original");
+    let store = Arc::new(FailingStore::with_routes(BTreeMap::from([(
+        route_key.clone(),
+        route_data,
+    )])));
+    let registry = RouteRegistry::load(store).await.unwrap();
+    let before = registry_views(&registry, &route_key, "/service/request");
+
+    let result = registry.delete(&route_key).await;
+
+    assert!(result.is_err());
+    assert_eq!(
+        registry_views(&registry, &route_key, "/service/request"),
+        before
+    );
 }
 
 #[tokio::test]
@@ -235,45 +297,147 @@ async fn registry_delete_missing_is_a_noop_and_delete_returns_prior_route() {
     assert!(registry.resolve("/service/tree").is_none());
 }
 
+struct GatedPutStore {
+    routes: RwLock<BTreeMap<RouteKey, RouteData>>,
+    gates: BTreeMap<RouteKey, Arc<Semaphore>>,
+    entries: std::sync::Mutex<Vec<RouteKey>>,
+}
+
+impl GatedPutStore {
+    fn new(route_keys: impl IntoIterator<Item = RouteKey>) -> Self {
+        Self {
+            routes: RwLock::new(BTreeMap::new()),
+            gates: route_keys
+                .into_iter()
+                .map(|route_key| (route_key, Arc::new(Semaphore::new(0))))
+                .collect(),
+            entries: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn release(&self, route_key: &RouteKey) {
+        self.gates[route_key].add_permits(1);
+    }
+
+    fn entries(&self) -> Vec<RouteKey> {
+        self.entries.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl Store for GatedPutStore {
+    async fn snapshot(&self) -> Result<BTreeMap<RouteKey, RouteData>, StoreError> {
+        Ok(self.routes.read().await.clone())
+    }
+
+    async fn put(&self, key: RouteKey, data: RouteData) -> Result<(), StoreError> {
+        self.entries.lock().unwrap().push(key.clone());
+        self.gates[&key].acquire().await.unwrap().forget();
+        self.routes.write().await.insert(key, data);
+        Ok(())
+    }
+
+    async fn update_activity(&self, _key: &RouteKey, _at: DateTime<Utc>) -> Result<(), StoreError> {
+        unreachable!("the writer-serialization test only exercises put")
+    }
+
+    async fn delete(&self, _key: &RouteKey) -> Result<Option<RouteData>, StoreError> {
+        unreachable!("the writer-serialization test only exercises put")
+    }
+}
+
+fn poll_once<F: Future>(future: std::pin::Pin<&mut F>) -> Poll<F::Output> {
+    let mut context = Context::from_waker(Waker::noop());
+    future.poll(&mut context)
+}
+
+#[tokio::test]
+async fn concurrent_writers_are_serialized_without_losing_mutations() {
+    let first_key = key("/first");
+    let second_key = key("/second");
+    let store = Arc::new(GatedPutStore::new([first_key.clone(), second_key.clone()]));
+    let registry = RouteRegistry::load(store.clone()).await.unwrap();
+    let first_data = route("http://127.0.0.1:9001/first");
+    let second_data = route("http://127.0.0.1:9002/second");
+
+    let mut first = Box::pin(registry.put(first_key.clone(), first_data.clone()));
+    let mut second = Box::pin(registry.put(second_key.clone(), second_data.clone()));
+
+    assert!(poll_once(first.as_mut()).is_pending());
+    assert_eq!(store.entries(), vec![first_key.clone()]);
+    assert!(poll_once(second.as_mut()).is_pending());
+    assert_eq!(
+        store.entries(),
+        vec![first_key.clone()],
+        "the second writer must not clone a stale snapshot or enter persistence"
+    );
+
+    store.release(&first_key);
+    assert!(matches!(poll_once(first.as_mut()), Poll::Ready(Ok(()))));
+    assert!(poll_once(second.as_mut()).is_pending());
+    assert_eq!(store.entries(), vec![first_key.clone(), second_key.clone()]);
+    store.release(&second_key);
+    assert!(matches!(poll_once(second.as_mut()), Poll::Ready(Ok(()))));
+
+    let expected = BTreeMap::from([
+        (first_key.clone(), first_data.clone()),
+        (second_key.clone(), second_data.clone()),
+    ]);
+    assert_eq!(registry.all(), expected);
+    assert_eq!(registry.get(&first_key), Some(first_data));
+    assert_eq!(registry.get(&second_key), Some(second_data));
+    assert_eq!(registry.resolve("/first/request").unwrap().key, first_key);
+    assert_eq!(registry.resolve("/second/request").unwrap().key, second_key);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_readers_observe_only_complete_snapshots() {
     let registry = Arc::new(RouteRegistry::load(memory_store()).await.unwrap());
     let route_key = key("/service");
-    registry
-        .put(route_key.clone(), route("http://old.example/generation-0"))
-        .await
-        .unwrap();
-    let barrier = Arc::new(Barrier::new(5));
+    let old = route("http://old.example/generation-0");
+    registry.put(route_key.clone(), old.clone()).await.unwrap();
+    let start = Arc::new(Barrier::new(5));
+    let old_observed = Arc::new(Barrier::new(5));
+    let new_published = Arc::new(Barrier::new(5));
 
     let readers: Vec<_> = (0..4)
         .map(|_| {
             let registry = Arc::clone(&registry);
-            let barrier = Arc::clone(&barrier);
+            let start = Arc::clone(&start);
+            let old_observed = Arc::clone(&old_observed);
+            let new_published = Arc::clone(&new_published);
             tokio::spawn(async move {
-                barrier.wait().await;
-                for _ in 0..2_000 {
-                    let matched = registry.resolve("/service/request").unwrap();
-                    let pair = (
-                        matched.data.target.as_str(),
-                        matched.data.last_activity.timestamp(),
-                    );
-                    assert!(matches!(
-                        pair,
-                        ("http://old.example/generation-0", 1)
-                            | ("http://new.example/generation-1", 2)
-                    ));
-                }
+                start.wait().await;
+                tokio::task::yield_now().await;
+                let before = (*registry.resolve("/service/request").unwrap().data).clone();
+                old_observed.wait().await;
+                new_published.wait().await;
+                tokio::task::yield_now().await;
+                let after = (*registry.resolve("/service/request").unwrap().data).clone();
+                (before, after)
             })
         })
         .collect();
 
-    barrier.wait().await;
+    start.wait().await;
+    old_observed.wait().await;
+    tokio::task::yield_now().await;
     let mut replacement = route("http://new.example/generation-1");
     replacement.last_activity = Utc.timestamp_opt(2, 0).unwrap();
-    registry.put(route_key, replacement).await.unwrap();
+    registry.put(route_key, replacement.clone()).await.unwrap();
+    tokio::task::yield_now().await;
+    new_published.wait().await;
 
     for reader in readers {
-        reader.await.unwrap();
+        let (before, after) = reader.await.unwrap();
+        assert_eq!(
+            before, old,
+            "reader did not observe the complete old snapshot"
+        );
+        assert_eq!(
+            after, replacement,
+            "reader did not observe the complete new snapshot"
+        );
     }
 
     assert!(registry.resolve("\0/untrusted/runtime/path").is_none());
