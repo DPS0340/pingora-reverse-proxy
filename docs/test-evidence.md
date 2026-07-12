@@ -372,3 +372,32 @@ git diff --check
 All four exited `0`. Docker was unavailable and was not used. Runtime
 `openssl`/`tokio-openssl` support Axum TLS listeners; `futures-util` is test-only
 for WebSocket frame assertions.
+
+### Task 8 active-shutdown follow-up (2026-07-13)
+
+The original one-run shutdown evidence was superseded after a clean-HEAD
+`74efd70` parent run failed the active-response contract at the HTTP response
+delimiter (`11/12` passed). The repaired contract now waits for exact management
+and public readiness, retains the public client stream, waits until the upstream
+has received the proxied request and written response headers plus a body
+prefix, and only then sends SIGTERM. The upstream withholds the remaining body
+behind an explicit channel while a bounded 1.5-second hold proves the process
+does not terminate admitted traffic; explicit release must produce the exact
+`drained` response and a successful process exit.
+
+The deterministic test was RED against the old production shutdown phases:
+Pingora had a zero-second grace period and began runtime teardown after one
+second, disconnecting the active response. A longer final runtime timeout alone
+still truncated the response to `dra`, proving that timeout was the wrong
+phase. Production now uses a six-second Pingora grace phase, derived from the
+five-second terminal mutation drain plus one second, followed by a separate
+one-second final runtime timeout.
+
+The focused active-response test passed 20 consecutive runs (`20/20`). Both
+Task 8 executables then passed (`12` TLS/Unix/lifecycle and `2` WebSocket). The
+full `PROPTEST_CASES=256 cargo test --all-targets --all-features -- --nocapture`
+run passed `206` tests: library `8`, binary `0`, API `33`, config `26`, proxy
+`69`, route `11`, store `45`, TLS/Unix `12`, and WebSocket `2`, with zero
+failures or ignores. The dedicated `PROPTEST_CASES=512` route suite passed all
+`11` tests. Clippy with `-D warnings` and the all-target/all-feature check both
+exited `0`; final formatting and diff checks were rerun after documentation.

@@ -16,6 +16,10 @@ use crate::api_server::{wait_for_shutdown, ManagementLifecycle};
 use crate::route_table::RouteRegistry;
 
 pub const TERMINAL_MUTATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Pingora's grace phase keeps admitted work alive while the terminal mutation drain completes.
+pub const SHUTDOWN_GRACE_PERIOD_SECONDS: u64 = TERMINAL_MUTATION_DRAIN_TIMEOUT.as_secs() + 1;
+/// Once the grace phase finishes, bound final Tokio runtime teardown separately.
+pub const RUNTIME_SHUTDOWN_TIMEOUT_SECONDS: u64 = 1;
 
 /// Atomic PID-file acquisition failures.
 #[derive(Debug, Error)]

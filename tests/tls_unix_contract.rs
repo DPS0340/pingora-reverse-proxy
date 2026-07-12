@@ -21,6 +21,8 @@ use openssl::x509::{X509NameBuilder, X509};
 use serial_test::serial;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(3);
+const PROCESS_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
+const ACTIVE_DRAIN_HOLD: Duration = Duration::from_millis(1_500);
 
 fn reserve_port() -> u16 {
     StdTcpListener::bind(("127.0.0.1", 0))
@@ -61,7 +63,15 @@ impl Binary {
     }
 
     fn wait_for_exit(&mut self) -> ExitStatus {
-        let deadline = Instant::now() + IO_TIMEOUT;
+        self.wait_for_exit_within(IO_TIMEOUT)
+    }
+
+    fn wait_for_graceful_exit(&mut self) -> ExitStatus {
+        self.wait_for_exit_within(PROCESS_EXIT_TIMEOUT)
+    }
+
+    fn wait_for_exit_within(&mut self, timeout: Duration) -> ExitStatus {
+        let deadline = Instant::now() + timeout;
         loop {
             if let Some(status) = self.child.try_wait().expect("poll proxy exit") {
                 return status;
@@ -846,7 +856,7 @@ fn sigterm_allows_an_active_proxy_response_to_finish_before_runtime_termination(
 
     let upstream = StdTcpListener::bind(("127.0.0.1", 0)).expect("bind draining upstream");
     let upstream_address = upstream.local_addr().expect("draining upstream address");
-    let (request_seen_tx, request_seen_rx) = mpsc::channel();
+    let (response_started_tx, response_started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let upstream_thread = std::thread::spawn(move || {
         let (mut stream, _) = upstream.accept().expect("draining upstream accept");
@@ -861,13 +871,18 @@ fn sigterm_allows_an_active_proxy_response_to_finish_before_runtime_termination(
             .read(&mut request)
             .expect("draining upstream request");
         assert!(count > 0, "draining upstream request was empty");
-        request_seen_tx.send(()).expect("signal active request");
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\ndra")
+            .expect("start draining upstream response");
+        response_started_tx
+            .send(())
+            .expect("signal started upstream response");
         release_rx
             .recv_timeout(IO_TIMEOUT)
             .expect("active request was not released");
         stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\ndrained")
-            .expect("draining upstream response");
+            .write_all(b"ined")
+            .expect("finish draining upstream response");
     });
 
     let public = reserve_port();
@@ -898,23 +913,43 @@ fn sigterm_allows_an_active_proxy_response_to_finish_before_runtime_termination(
     let routes: serde_json::Value =
         serde_json::from_slice(&routes[delimiter + 4..]).expect("route readiness JSON");
     assert_eq!(routes["/"]["target"], format!("http://{upstream_address}/"));
-    let client = std::thread::spawn(move || {
-        tcp_http(
+    assert_http(
+        &tcp_http(
             public,
-            b"GET /drain HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-        )
-    });
-    request_seen_rx
+            b"GET /_chp_healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        ),
+        "200 OK",
+        br#"{"status":"OK"}"#,
+    );
+    let mut client = TcpStream::connect(("127.0.0.1", public)).expect("connect draining client");
+    client
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .expect("set draining client read timeout");
+    client
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .expect("set draining client write timeout");
+    client
+        .write_all(b"GET /drain HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("write draining client request");
+    response_started_rx
         .recv_timeout(IO_TIMEOUT)
-        .expect("proxy request never reached draining upstream");
+        .expect("upstream response never started");
     unsafe {
         libc::kill(binary.child.id() as libc::pid_t, libc::SIGTERM);
     }
+    let hold_deadline = Instant::now() + ACTIVE_DRAIN_HOLD;
+    while Instant::now() < hold_deadline {
+        binary.assert_running("proxy terminated an admitted active response");
+        std::thread::yield_now();
+    }
     release_tx.send(()).expect("release draining upstream");
-    let response = client.join().expect("draining client panicked");
+    let mut response = Vec::new();
+    client
+        .read_to_end(&mut response)
+        .expect("read completed draining response");
     assert_http(&response, "200 OK", b"drained");
     assert!(
-        binary.wait_for_exit().success(),
+        binary.wait_for_graceful_exit().success(),
         "SIGTERM drain did not exit cleanly"
     );
     upstream_thread
@@ -999,7 +1034,10 @@ fn public_api_and_metrics_unix_sockets_serve_and_are_cleaned_up() {
     unsafe {
         libc::kill(binary.child.id() as libc::pid_t, libc::SIGTERM);
     }
-    assert!(binary.wait_for_exit().success(), "SIGTERM was not graceful");
+    assert!(
+        binary.wait_for_graceful_exit().success(),
+        "SIGTERM was not graceful"
+    );
     assert!(!public.exists(), "public Unix socket was not cleaned up");
     assert!(!api.exists(), "API Unix socket was not cleaned up");
     assert!(!metrics.exists(), "metrics Unix socket was not cleaned up");
@@ -1039,7 +1077,10 @@ fn sigterm_drains_and_removes_the_atomic_pid_guard() {
     unsafe {
         libc::kill(binary.child.id() as libc::pid_t, libc::SIGTERM);
     }
-    assert!(binary.wait_for_exit().success(), "SIGTERM was not graceful");
+    assert!(
+        binary.wait_for_graceful_exit().success(),
+        "SIGTERM was not graceful"
+    );
     assert!(
         !pid_file.exists(),
         "PID file remained after graceful shutdown"

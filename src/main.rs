@@ -22,7 +22,8 @@ use pingora_reverse_proxy::route_table::{
     install_route_mutation_panic_hook_at_startup, RouteRegistry,
 };
 use pingora_reverse_proxy::shutdown::{
-    PidFileError, PidFileGuard, ShutdownCoordinator, TERMINAL_MUTATION_DRAIN_TIMEOUT,
+    PidFileError, PidFileGuard, ShutdownCoordinator, RUNTIME_SHUTDOWN_TIMEOUT_SECONDS,
+    SHUTDOWN_GRACE_PERIOD_SECONDS, TERMINAL_MUTATION_DRAIN_TIMEOUT,
 };
 use pingora_reverse_proxy::store::memory::MemoryStore;
 use pingora_reverse_proxy::store::{Store, StoreError};
@@ -146,8 +147,8 @@ fn run() -> Result<(), StartupError> {
 
     let mut server = Server::new(None).map_err(|error| StartupError::Pingora(error.to_string()))?;
     if let Some(configuration) = Arc::get_mut(&mut server.configuration) {
-        configuration.grace_period_seconds = Some(0);
-        configuration.graceful_shutdown_timeout_seconds = Some(1);
+        configuration.grace_period_seconds = Some(SHUTDOWN_GRACE_PERIOD_SECONDS);
+        configuration.graceful_shutdown_timeout_seconds = Some(RUNTIME_SHUTDOWN_TIMEOUT_SECONDS);
     }
     server.bootstrap();
 
