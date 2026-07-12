@@ -240,7 +240,7 @@ fn socket_options_conflict_with_tcp_options() {
 }
 
 #[test]
-fn all_tls_options_are_preserved() {
+fn all_supported_tls_options_are_preserved() {
     let cfg = parse_ok([
         "proxy",
         "--ssl-key",
@@ -271,8 +271,6 @@ fn all_tls_options_are_preserved() {
         "client.crt",
         "--client-ssl-ca",
         "client.ca",
-        "--client-ssl-request-cert",
-        "--client-ssl-reject-unauthorized",
     ]);
 
     let public = cfg.public_tls.unwrap();
@@ -294,7 +292,22 @@ fn all_tls_options_are_preserved() {
     assert_eq!(client.key, Some(PathBuf::from("client.key")));
     assert_eq!(client.cert, Some(PathBuf::from("client.crt")));
     assert_eq!(client.ca, Some(PathBuf::from("client.ca")));
-    assert!(client.request_cert && client.reject_unauthorized);
+    assert!(!client.request_cert && !client.reject_unauthorized);
+}
+
+#[test]
+fn client_certificate_request_flags_are_rejected_instead_of_ignored() {
+    for flag in [
+        "--client-ssl-request-cert",
+        "--client-ssl-reject-unauthorized",
+    ] {
+        let cli = Cli::try_parse_from(["proxy", flag]).expect("client TLS flag parses");
+        let error = AppConfig::try_from(cli).expect_err("ignored client TLS flag was accepted");
+        assert!(
+            error.to_string().contains(flag),
+            "error did not identify {flag}: {error}"
+        );
+    }
 }
 
 #[test]

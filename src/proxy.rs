@@ -14,6 +14,7 @@ use thiserror::Error as ThisError;
 use url::Url;
 
 use crate::activity::ActivityWriter;
+use crate::api_server::TrafficLifecycle;
 use crate::config::{AppConfig, ProxyOptions};
 use crate::errors::{ErrorRendererBuildError, ProxyErrorClass, ProxyErrorRenderer};
 use crate::route::RouteKey;
@@ -37,6 +38,7 @@ pub struct RequestContext {
     upstream_route: Option<UpstreamRoute>,
     stream_data_seen: bool,
     activity_published: bool,
+    traffic_admission: Option<Arc<TrafficLifecycle>>,
 }
 
 impl Default for RequestContext {
@@ -50,6 +52,15 @@ impl Default for RequestContext {
             upstream_route: None,
             stream_data_seen: false,
             activity_published: false,
+            traffic_admission: None,
+        }
+    }
+}
+
+impl Drop for RequestContext {
+    fn drop(&mut self) {
+        if let Some(traffic) = self.traffic_admission.take() {
+            traffic.finish();
         }
     }
 }
@@ -71,6 +82,7 @@ pub struct ChpProxy {
     errors: ProxyErrorRenderer,
     activity: ActivityWriter,
     downstream_protocol: &'static str,
+    traffic: Arc<TrafficLifecycle>,
 }
 
 impl ChpProxy {
@@ -125,7 +137,12 @@ impl ChpProxy {
             } else {
                 "http"
             },
+            traffic: Arc::new(TrafficLifecycle::new()),
         })
+    }
+
+    pub fn traffic_lifecycle(&self) -> Arc<TrafficLifecycle> {
+        Arc::clone(&self.traffic)
     }
 
     fn internal_error(ctx: &mut RequestContext) -> Box<Error> {
@@ -207,6 +224,11 @@ impl ProxyHttp for ChpProxy {
         session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> pingora::Result<bool> {
+        if !self.traffic.try_admit() {
+            Self::send_empty(session, StatusCode::SERVICE_UNAVAILABLE).await?;
+            return Ok(true);
+        }
+        ctx.traffic_admission = Some(Arc::clone(&self.traffic));
         ctx.original_uri = session.req_header().uri.clone();
         ctx.original_host = session.req_header().headers.get(HOST).cloned();
         let original = ctx
@@ -460,6 +482,9 @@ impl ProxyHttp for ChpProxy {
         ctx.activity_eligible |= successful;
         if successful {
             self.publish_activity_if_eligible(ctx);
+        }
+        if let Some(traffic) = ctx.traffic_admission.take() {
+            traffic.finish();
         }
     }
 

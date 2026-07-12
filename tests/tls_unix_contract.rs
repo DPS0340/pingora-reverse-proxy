@@ -3,6 +3,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener as StdTcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -21,7 +22,7 @@ use openssl::x509::{X509NameBuilder, X509};
 use serial_test::serial;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(3);
-const PROCESS_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
+const PROCESS_EXIT_TIMEOUT: Duration = Duration::from_secs(12);
 const ACTIVE_DRAIN_HOLD: Duration = Duration::from_millis(1_500);
 
 fn reserve_port() -> u16 {
@@ -34,6 +35,8 @@ fn reserve_port() -> u16 {
 
 struct Binary {
     child: Child,
+    stderr: Arc<Mutex<Vec<u8>>>,
+    stderr_thread: Option<JoinHandle<()>>,
 }
 
 impl Binary {
@@ -51,8 +54,22 @@ impl Binary {
         for (name, value) in environment {
             command.env(name, value);
         }
-        let child = command.spawn().expect("spawn proxy binary");
-        Self { child }
+        let mut child = command.spawn().expect("spawn proxy binary");
+        let mut stderr_pipe = child.stderr.take().expect("proxy stderr pipe");
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&stderr);
+        let stderr_thread = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stderr_pipe.read_to_end(&mut bytes);
+            *captured
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = bytes;
+        });
+        Self {
+            child,
+            stderr,
+            stderr_thread: Some(stderr_thread),
+        }
     }
 
     fn assert_running(&mut self, diagnostic: &str) {
@@ -74,10 +91,27 @@ impl Binary {
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(status) = self.child.try_wait().expect("poll proxy exit") {
+                self.join_stderr();
                 return status;
             }
             assert!(Instant::now() < deadline, "proxy exit timed out");
             std::thread::yield_now();
+        }
+    }
+
+    fn stderr_text(&self) -> String {
+        String::from_utf8_lossy(
+            &self
+                .stderr
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+        .into_owned()
+    }
+
+    fn join_stderr(&mut self) {
+        if let Some(thread) = self.stderr_thread.take() {
+            let _ = thread.join();
         }
     }
 }
@@ -88,6 +122,100 @@ impl Drop for Binary {
             let _ = self.child.kill();
         }
         let _ = self.child.wait();
+        self.join_stderr();
+    }
+}
+
+#[test]
+#[serial]
+fn occupied_public_tcp_fails_closed_without_leaving_the_api_alive() {
+    let occupied = StdTcpListener::bind(("127.0.0.1", 0)).expect("occupy public port");
+    let public = occupied.local_addr().expect("occupied address").port();
+    let api = reserve_port();
+    let mut binary = Binary::spawn(&[
+        "--ip".into(),
+        "127.0.0.1".into(),
+        "--port".into(),
+        public.to_string(),
+        "--api-ip".into(),
+        "127.0.0.1".into(),
+        "--api-port".into(),
+        api.to_string(),
+    ]);
+
+    assert!(
+        !binary.wait_for_exit().success(),
+        "occupied public port started"
+    );
+    assert!(
+        binary
+            .stderr_text()
+            .contains("TCP listener could not be bound"),
+        "missing synchronous public bind diagnostic: {}",
+        binary.stderr_text()
+    );
+    assert!(
+        TcpStream::connect(("127.0.0.1", api)).is_err(),
+        "API remained alive after public bind failure"
+    );
+}
+
+#[test]
+#[serial]
+fn identical_public_and_api_tcp_addresses_fail_before_startup() {
+    let shared = reserve_port();
+    let mut binary = Binary::spawn(&[
+        "--ip".into(),
+        "127.0.0.1".into(),
+        "--port".into(),
+        shared.to_string(),
+        "--api-ip".into(),
+        "127.0.0.1".into(),
+        "--api-port".into(),
+        shared.to_string(),
+    ]);
+
+    assert!(
+        !binary.wait_for_exit().success(),
+        "identical public/API addresses started"
+    );
+    assert!(TcpStream::connect(("127.0.0.1", shared)).is_err());
+}
+
+#[test]
+#[serial]
+fn every_public_api_metrics_tcp_collision_fails_before_startup() {
+    for collision in ["public-metrics", "api-metrics"] {
+        let shared = reserve_port();
+        let public = if collision == "public-metrics" {
+            shared
+        } else {
+            reserve_port()
+        };
+        let api = if collision == "api-metrics" {
+            shared
+        } else {
+            reserve_port()
+        };
+        let mut binary = Binary::spawn(&[
+            "--ip".into(),
+            "127.0.0.1".into(),
+            "--port".into(),
+            public.to_string(),
+            "--api-ip".into(),
+            "127.0.0.1".into(),
+            "--api-port".into(),
+            api.to_string(),
+            "--metrics-ip".into(),
+            "127.0.0.1".into(),
+            "--metrics-port".into(),
+            shared.to_string(),
+        ]);
+        assert!(
+            !binary.wait_for_exit().success(),
+            "{collision} collision started"
+        );
+        assert!(TcpStream::connect(("127.0.0.1", shared)).is_err());
     }
 }
 
@@ -470,6 +598,36 @@ async fn public_and_api_https_accept_encrypted_listener_keys() {
 
 #[tokio::test]
 #[serial]
+async fn occupied_public_tls_port_fails_closed_without_serving_the_api() {
+    let directory = tempfile::tempdir().expect("temporary TLS conflict directory");
+    let pki = TestPki::new(&directory, false);
+    let occupied = StdTcpListener::bind(("127.0.0.1", 0)).expect("occupy public TLS port");
+    let public = occupied.local_addr().expect("occupied TLS address").port();
+    let api = reserve_port();
+    let mut binary = Binary::spawn(&[
+        "--ip".into(),
+        "127.0.0.1".into(),
+        "--port".into(),
+        public.to_string(),
+        "--api-ip".into(),
+        "127.0.0.1".into(),
+        "--api-port".into(),
+        api.to_string(),
+        "--ssl-cert".into(),
+        pki.server_path.display().to_string(),
+        "--ssl-key".into(),
+        pki.server_key_path.display().to_string(),
+    ]);
+
+    assert!(
+        !binary.wait_for_exit().success(),
+        "occupied public TLS port started"
+    );
+    assert!(TcpStream::connect(("127.0.0.1", api)).is_err());
+}
+
+#[tokio::test]
+#[serial]
 async fn stalled_api_tls_handshake_cannot_block_later_clients_indefinitely() {
     let directory = tempfile::tempdir().expect("temporary stalled TLS directory");
     let pki = TestPki::new(&directory, false);
@@ -507,6 +665,56 @@ async fn stalled_api_tls_handshake_cannot_block_later_clients_indefinitely() {
     )
     .await;
     drop(stalled);
+}
+
+#[tokio::test]
+#[serial]
+async fn many_silent_api_tls_clients_do_not_linearly_delay_a_valid_client() {
+    let directory = tempfile::tempdir().expect("temporary TLS dispatcher directory");
+    let pki = TestPki::new(&directory, false);
+    let public = reserve_port();
+    let api = reserve_port();
+    let mut binary = Binary::spawn(&[
+        "--ip".into(),
+        "127.0.0.1".into(),
+        "--port".into(),
+        public.to_string(),
+        "--api-ip".into(),
+        "127.0.0.1".into(),
+        "--api-port".into(),
+        api.to_string(),
+        "--api-ssl-cert".into(),
+        pki.server_path.display().to_string(),
+        "--api-ssl-key".into(),
+        pki.server_key_path.display().to_string(),
+    ]);
+    assert_http(
+        &tcp_http(
+            public,
+            b"GET /_chp_healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        ),
+        "200 OK",
+        br#"{"status":"OK"}"#,
+    );
+
+    let mut silent = Vec::new();
+    for _ in 0..24 {
+        silent.push(TcpStream::connect(("127.0.0.1", api)).expect("silent TLS client"));
+    }
+    let started = tokio::time::Instant::now();
+    wait_https_response(
+        &mut binary,
+        &https_client(&pki, false),
+        &format!("https://127.0.0.1:{api}/api/routes"),
+        "{}",
+    )
+    .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "valid TLS client waited behind silent clients: {:?}",
+        started.elapsed()
+    );
+    drop(silent);
 }
 
 #[tokio::test]
@@ -990,6 +1198,81 @@ fn unix_http(path: &Path, request: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(unix)]
+fn percent_encode_path(path: &Path) -> String {
+    path.as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .map(|byte| format!("%{byte:02X}"))
+        .collect()
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+fn selected_route_reaches_a_real_unix_upstream_with_path_and_query() {
+    use std::os::unix::net::UnixListener;
+
+    let directory = tempfile::tempdir().expect("temporary selected Unix upstream directory");
+    let upstream_path = directory.path().join("upstream.sock");
+    let upstream = UnixListener::bind(&upstream_path).expect("bind selected Unix upstream");
+    let upstream_thread = std::thread::spawn(move || {
+        let (mut stream, _) = upstream.accept().expect("accept selected Unix upstream");
+        stream
+            .set_read_timeout(Some(IO_TIMEOUT))
+            .expect("selected Unix upstream read timeout");
+        stream
+            .set_write_timeout(Some(IO_TIMEOUT))
+            .expect("selected Unix upstream write timeout");
+        let mut request = [0; 4096];
+        let count = stream
+            .read(&mut request)
+            .expect("read selected Unix upstream request");
+        let request = std::str::from_utf8(&request[..count]).expect("Unix upstream request UTF-8");
+        assert!(
+            request.starts_with("GET /base/user/alice/tree?name=%2F HTTP/1.1\r\n"),
+            "unexpected selected Unix upstream request: {request}"
+        );
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\nunix-selected",
+            )
+            .expect("write selected Unix upstream response");
+    });
+
+    let public = reserve_port();
+    let api = reserve_port();
+    let mut binary = Binary::spawn(&[
+        "--ip".into(),
+        "127.0.0.1".into(),
+        "--port".into(),
+        public.to_string(),
+        "--api-ip".into(),
+        "127.0.0.1".into(),
+        "--api-port".into(),
+        api.to_string(),
+    ]);
+    let target = format!("http+unix://{}/base/", percent_encode_path(&upstream_path));
+    let body = serde_json::json!({ "target": target }).to_string();
+    let request = format!(
+        "POST /api/routes/user/alice HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    assert_http(&tcp_http(api, request.as_bytes()), "201 Created", b"");
+    assert_http(
+        &tcp_http(
+            public,
+            b"GET /user/alice/tree?name=%2F HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        ),
+        "200 OK",
+        b"unix-selected",
+    );
+    binary.assert_running("proxy exited after selected Unix upstream request");
+    upstream_thread
+        .join()
+        .expect("selected Unix upstream thread panicked");
+}
+
+#[cfg(unix)]
 #[test]
 #[serial]
 fn public_api_and_metrics_unix_sockets_serve_and_are_cleaned_up() {
@@ -1087,6 +1370,45 @@ fn sigterm_drains_and_removes_the_atomic_pid_guard() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+#[serial]
+fn pid_cleanup_retains_a_replacement_created_while_the_process_is_running() {
+    let directory = tempfile::tempdir().expect("temporary PID replacement directory");
+    let pid_file = directory.path().join("proxy.pid");
+    let displaced = directory.path().join("owned.pid");
+    let api = reserve_port();
+    let mut binary = Binary::spawn(&[
+        "--port".into(),
+        reserve_port().to_string(),
+        "--api-ip".into(),
+        "127.0.0.1".into(),
+        "--api-port".into(),
+        api.to_string(),
+        "--pid-file".into(),
+        pid_file.display().to_string(),
+    ]);
+    assert_http(
+        &tcp_http(
+            api,
+            b"GET /api/routes HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        ),
+        "200 OK",
+        b"{}",
+    );
+    fs::rename(&pid_file, &displaced).expect("move owned PID file");
+    fs::write(&pid_file, b"replacement owner\n").expect("install replacement PID file");
+
+    unsafe {
+        libc::kill(binary.child.id() as libc::pid_t, libc::SIGTERM);
+    }
+    assert!(binary.wait_for_graceful_exit().success());
+    assert_eq!(
+        fs::read(&pid_file).expect("replacement PID retained"),
+        b"replacement owner\n"
+    );
+}
+
 #[test]
 #[serial]
 fn existing_pid_or_socket_paths_are_refused_without_deleting_the_owner() {
@@ -1129,6 +1451,62 @@ fn existing_pid_or_socket_paths_are_refused_without_deleting_the_owner() {
             b"owner data"
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+fn unix_listener_aliases_fail_closed_and_running_cleanup_retains_replacements() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().expect("temporary socket alias directory");
+    let real = directory.path().join("real");
+    let alias = directory.path().join("alias");
+    fs::create_dir(&real).expect("create real socket directory");
+    symlink(&real, &alias).expect("create socket directory alias");
+    let public = real.join("shared.sock");
+    let api_alias = alias.join("shared.sock");
+    let mut collision = Binary::spawn(&[
+        "--socket".into(),
+        public.display().to_string(),
+        "--api-socket".into(),
+        api_alias.display().to_string(),
+    ]);
+    assert!(
+        !collision.wait_for_exit().success(),
+        "symlink-aliased public/API sockets started"
+    );
+    assert!(
+        !public.exists(),
+        "failed startup left a socket owner behind"
+    );
+
+    let public = directory.path().join("public.sock");
+    let api = directory.path().join("api.sock");
+    let mut binary = Binary::spawn(&[
+        "--socket".into(),
+        public.display().to_string(),
+        "--api-socket".into(),
+        api.display().to_string(),
+    ]);
+    assert_http(
+        &unix_http(
+            &api,
+            b"GET /api/routes HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        ),
+        "200 OK",
+        b"{}",
+    );
+    fs::remove_file(&public).expect("unlink owned public socket");
+    fs::write(&public, b"replacement owner").expect("replace public socket path");
+    unsafe {
+        libc::kill(binary.child.id() as libc::pid_t, libc::SIGTERM);
+    }
+    assert!(binary.wait_for_graceful_exit().success());
+    assert_eq!(
+        fs::read(&public).expect("replacement public path retained"),
+        b"replacement owner"
+    );
 }
 
 #[allow(dead_code)]

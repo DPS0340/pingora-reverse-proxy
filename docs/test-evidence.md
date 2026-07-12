@@ -401,3 +401,48 @@ run passed `206` tests: library `8`, binary `0`, API `33`, config `26`, proxy
 failures or ignores. The dedicated `PROPTEST_CASES=512` route suite passed all
 `11` tests. Clippy with `-D warnings` and the all-target/all-feature check both
 exited `0`; final formatting and diff checks were rerun after documentation.
+
+### Task 8 final acceptance closure (2026-07-13)
+
+Bounded probes confirmed that the interrupted foreground command was a normal
+long-running server, not a startup hang. The actual partial prebind defect was a
+public socket transferred without listener/nonblocking setup: TCP connected but
+health responses timed out. RED regressions also reproduced serialized API TLS
+handshakes behind 24 silent clients and incorrect public UDS cleanup identity on
+macOS. Each passed after the production fix.
+
+The completed contracts cover synchronous fail-closed public TCP/TLS/UDS
+ownership, every public/API/metrics collision, canonical UDS aliases and
+replacement-safe cleanup, bounded 64-way TLS handshake dispatch, explicit CHP
+5.3.0 client-TLS flag rejection, Windows and Unix PID identity, exact ordered
+shutdown acknowledgements and watermarks, a real selected-route Unix upstream,
+and WebSocket binary/close/header/query/UDS/activity/active-drain behavior. Test
+subprocesses continuously drain stdout and stderr; WebSocket readiness retries
+only early process exits caused by the dropped-port reservation window.
+
+Verification passed:
+
+```bash
+cargo test --test websocket_contract --test tls_unix_contract -- \
+  --nocapture --test-threads=1
+```
+
+Results: TLS/Unix/lifecycle `20 passed`; WebSocket `4 passed`.
+
+The active HTTP shutdown regression passed 20 consecutive bounded runs
+(`20/20`). A separate unit stress drained 64 concurrent admitted lifecycle
+tokens after admission closed. The complete matrix passed:
+
+```bash
+PROPTEST_CASES=256 cargo test --all-targets --all-features -- \
+  --nocapture --test-threads=1
+PROPTEST_CASES=512 cargo test --test route_properties -- \
+  --nocapture --test-threads=1
+```
+
+The first command passed `218` tests with zero failures or ignores: library 9,
+binary 0, API 33, config 27, proxy 69, routes 11, store 45, TLS/Unix 20, and
+WebSocket 4. The second passed all 11 route contracts. `cargo fmt --check`,
+Clippy with `-D warnings`, all-target/all-feature `cargo check`, and
+`git diff --check` all exited `0`. Cargo resolved Pingora 0.8.1 exactly. No Task
+9 files or implementation were added.

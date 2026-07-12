@@ -8,9 +8,11 @@ use pingora::services::background::background_service;
 use pingora_reverse_proxy::activity::ActivityWriter;
 use pingora_reverse_proxy::api::{router as api_router, ApiState};
 #[cfg(unix)]
-use pingora_reverse_proxy::api_server::UnixSocketCleanup;
+use pingora_reverse_proxy::api_server::PreboundPublicService;
+#[cfg(not(unix))]
+use pingora_reverse_proxy::api_server::TrackedPublicService;
 use pingora_reverse_proxy::api_server::{
-    ensure_socket_path_available, install_listener, metrics_router, redirect_router, ApiServer,
+    ensure_listener_paths_distinct, install_listener, metrics_router, redirect_router, ApiServer,
     ListenerError, ManagementLifecycle,
 };
 use pingora_reverse_proxy::config::{
@@ -79,9 +81,11 @@ fn run() -> Result<(), StartupError> {
     if config.store != StoreConfig::Memory {
         return Err(StartupError::UnsupportedStore(config.store));
     }
-    if let ListenerConfig::Unix(path) = &config.public_listener {
-        ensure_socket_path_available(path)?;
-    }
+    ensure_listener_paths_distinct(
+        std::iter::once(&config.public_listener)
+            .chain(std::iter::once(&config.api_listener))
+            .chain(config.metrics_listener.iter()),
+    )?;
     let _pid_file = config
         .pid_file
         .as_ref()
@@ -105,6 +109,7 @@ fn run() -> Result<(), StartupError> {
         &config,
         activity.clone(),
     ))?;
+    let traffic = proxy.traffic_lifecycle();
 
     let management = Arc::new(ManagementLifecycle::default());
     let api_state = ApiState::new(
@@ -158,14 +163,16 @@ fn run() -> Result<(), StartupError> {
         config.public_listener.clone(),
         config.public_tls.clone(),
     )?;
-    server.add_service(public);
     #[cfg(unix)]
-    if let ListenerConfig::Unix(path) = &config.public_listener {
-        server.add_service(background_service(
-            "CHP public UDS cleanup",
-            UnixSocketCleanup::new(path.clone()),
-        ));
+    {
+        server.add_service(PreboundPublicService::new(
+            public,
+            &config.public_listener,
+            Arc::clone(&traffic),
+        )?);
     }
+    #[cfg(not(unix))]
+    server.add_service(TrackedPublicService::new(public, Arc::clone(&traffic)));
     server.add_service(background_service("CHP management API", api_server));
     if let Some(metrics_server) = metrics_server {
         server.add_service(background_service("CHP metrics", metrics_server));
@@ -177,6 +184,7 @@ fn run() -> Result<(), StartupError> {
         "CHP graceful shutdown",
         ShutdownCoordinator::new(
             management,
+            traffic,
             registry,
             activity,
             TERMINAL_MUTATION_DRAIN_TIMEOUT,

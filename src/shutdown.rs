@@ -12,12 +12,19 @@ use pingora::services::background::BackgroundService;
 use thiserror::Error;
 
 use crate::activity::ActivityWriter;
-use crate::api_server::{wait_for_shutdown, ManagementLifecycle};
+use crate::api_server::{wait_for_shutdown, ManagementLifecycle, TrafficLifecycle};
 use crate::route_table::RouteRegistry;
 
-pub const TERMINAL_MUTATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-/// Pingora's grace phase keeps admitted work alive while the terminal mutation drain completes.
-pub const SHUTDOWN_GRACE_PERIOD_SECONDS: u64 = TERMINAL_MUTATION_DRAIN_TIMEOUT.as_secs() + 1;
+pub const TERMINAL_MUTATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+pub const ACCEPT_STOP_TIMEOUT: Duration = Duration::from_secs(1);
+pub const ACTIVITY_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
+pub const TRAFFIC_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Pingora's timer strictly contains every ordered lifecycle phase plus one safety second.
+pub const SHUTDOWN_GRACE_PERIOD_SECONDS: u64 = TERMINAL_MUTATION_DRAIN_TIMEOUT.as_secs()
+    + ACCEPT_STOP_TIMEOUT.as_secs()
+    + ACTIVITY_FLUSH_TIMEOUT.as_secs()
+    + TRAFFIC_DRAIN_TIMEOUT.as_secs()
+    + 1;
 /// Once the grace phase finishes, bound final Tokio runtime teardown separately.
 pub const RUNTIME_SHUTDOWN_TIMEOUT_SECONDS: u64 = 1;
 
@@ -69,7 +76,11 @@ struct FileIdentity {
     device: u64,
     #[cfg(unix)]
     inode: u64,
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    volume_serial_number: Option<u32>,
+    #[cfg(windows)]
+    file_index: Option<u64>,
+    #[cfg(not(any(unix, windows)))]
     length: u64,
 }
 
@@ -84,7 +95,15 @@ impl FileIdentity {
                 inode: metadata.ino(),
             })
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            Ok(Self {
+                volume_serial_number: metadata.volume_serial_number(),
+                file_index: metadata.file_index(),
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             Ok(Self {
                 length: metadata.len(),
@@ -98,9 +117,18 @@ impl FileIdentity {
             use std::os::unix::fs::MetadataExt;
             metadata.dev() == self.device && metadata.ino() == self.inode
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            metadata.is_file() && metadata.len() >= self.length
+            use std::os::windows::fs::MetadataExt;
+            self.volume_serial_number.is_some()
+                && self.file_index.is_some()
+                && metadata.volume_serial_number() == self.volume_serial_number
+                && metadata.file_index() == self.file_index
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (self.length, metadata);
+            false
         }
     }
 }
@@ -108,6 +136,7 @@ impl FileIdentity {
 /// Stops management admission, drains registry work, then flushes activity.
 pub struct ShutdownCoordinator {
     management: Arc<ManagementLifecycle>,
+    traffic: Arc<TrafficLifecycle>,
     registry: Arc<RouteRegistry>,
     activity: ActivityWriter,
     mutation_timeout: Duration,
@@ -116,12 +145,14 @@ pub struct ShutdownCoordinator {
 impl ShutdownCoordinator {
     pub fn new(
         management: Arc<ManagementLifecycle>,
+        traffic: Arc<TrafficLifecycle>,
         registry: Arc<RouteRegistry>,
         activity: ActivityWriter,
         mutation_timeout: Duration,
     ) -> Self {
         Self {
             management,
+            traffic,
             registry,
             activity,
             mutation_timeout,
@@ -133,7 +164,20 @@ impl ShutdownCoordinator {
 impl BackgroundService for ShutdownCoordinator {
     async fn start(&self, mut shutdown: ShutdownWatch) {
         wait_for_shutdown(&mut shutdown).await;
-        self.management.wait_for_accepts_stopped().await;
+        if tokio::time::timeout(ACCEPT_STOP_TIMEOUT, async {
+            tokio::join!(
+                self.management.wait_for_accepts_stopped(),
+                self.traffic.wait_for_accepts_stopped()
+            );
+        })
+        .await
+        .is_err()
+        {
+            tracing::error!(
+                timeout_ms = ACCEPT_STOP_TIMEOUT.as_millis(),
+                "listener accept-stop acknowledgement timed out"
+            );
+        }
 
         let outcome = self.registry.drain_mutations(self.mutation_timeout).await;
         if outcome.timed_out {
@@ -164,7 +208,26 @@ impl BackgroundService for ShutdownCoordinator {
             );
         }
 
-        self.activity.flush().await;
-        tracing::info!("management mutations and activity persistence drained");
+        if tokio::time::timeout(ACTIVITY_FLUSH_TIMEOUT, self.activity.flush())
+            .await
+            .is_err()
+        {
+            tracing::error!(
+                timeout_ms = ACTIVITY_FLUSH_TIMEOUT.as_millis(),
+                "activity acceptance watermark flush timed out"
+            );
+        }
+
+        if tokio::time::timeout(TRAFFIC_DRAIN_TIMEOUT, self.traffic.wait_for_drain())
+            .await
+            .is_err()
+        {
+            tracing::error!(
+                active_traffic = self.traffic.active(),
+                timeout_ms = TRAFFIC_DRAIN_TIMEOUT.as_millis(),
+                "admitted HTTP/WebSocket drain timed out"
+            );
+        }
+        tracing::info!("ordered shutdown lifecycle completed");
     }
 }

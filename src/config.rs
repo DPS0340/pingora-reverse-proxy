@@ -330,12 +330,24 @@ pub enum ConfigError {
     InvalidCustomHeader(String),
     #[error("public port 65535 cannot supply the default API port; specify --api-port")]
     ApiPortOverflow,
+    #[error("{0} is unsupported because CHP 5.3.0 does not apply it to upstream TLS connections")]
+    UnsupportedClientTlsFlag(&'static str),
 }
 
 impl TryFrom<Cli> for AppConfig {
     type Error = ConfigError;
 
     fn try_from(cli: Cli) -> Result<Self, Self::Error> {
+        if cli.client_ssl_request_cert {
+            return Err(ConfigError::UnsupportedClientTlsFlag(
+                "--client-ssl-request-cert",
+            ));
+        }
+        if cli.client_ssl_reject_unauthorized {
+            return Err(ConfigError::UnsupportedClientTlsFlag(
+                "--client-ssl-reject-unauthorized",
+            ));
+        }
         if cli.ssl_allow_rc4 {
             return Err(ConfigError::Rc4Unsupported);
         }
