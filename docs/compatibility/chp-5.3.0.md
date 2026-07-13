@@ -77,8 +77,10 @@ UID are not isolated by Unix file permissions; same-UID namespace attackers
 are outside this enforceable trust boundary.
 
 Public UDS prebinding captures that parent before bind and uses a
-descriptor-backed stable published path as Pingora's own `ListenAddr`, so
-Pingora's UDS permission update cannot follow a replaced configured alias.
+descriptor-backed stable published path as Pingora's own `ListenAddr`. The
+application applies mode 0660 relative to the retained parent descriptor with
+nofollow semantics and exact socket identity checks before and after. Pingora's
+explicit preconfigured-permissions endpoint then skips its pathname chmod.
 Before readiness, a reopened configured parent and descriptor-relative basename
 lookup must match the captured parent and socket identities; otherwise startup
 fails closed and only the anchored socket is cleaned. The raw listener FD

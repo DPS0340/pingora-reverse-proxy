@@ -849,6 +849,10 @@ impl SocketOwner {
         self.owned.configured_entry_matches()
     }
 
+    fn set_permissions(&self, mode: u32) -> io::Result<()> {
+        self.owned.set_permissions(mode)
+    }
+
     fn publish_as(&mut self, path: PathBuf, name: std::ffi::OsString) -> io::Result<()> {
         self.owned.publish_as(path, name)
     }
@@ -887,6 +891,8 @@ pub struct PreboundPublicService<A> {
     startup_failure_hook: Option<Box<dyn FnOnce() + Send + Sync>>,
     #[cfg(test)]
     descriptor_override: Option<std::os::fd::OwnedFd>,
+    #[cfg(test)]
+    after_uds_path_resolution: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 #[cfg(unix)]
@@ -960,21 +966,29 @@ impl PublicListenerReservation {
         }
     }
 
-    fn into_parts<A>(
+    fn into_parts<A, F>(
         self,
         service: &mut Service<A>,
-    ) -> Result<(String, socket2::Socket, Option<SocketOwner>), ListenerError> {
+        after_uds_path_resolution: F,
+    ) -> Result<(String, socket2::Socket, Option<SocketOwner>), ListenerError>
+    where
+        F: FnOnce(),
+    {
         match self {
             Self::Tcp { socket, key } => Ok((key, socket, None)),
             Self::Unix { socket, owner } => {
                 let pingora_path = owner.pingora_path().map_err(ListenerError::UnixBind)?;
+                after_uds_path_resolution();
                 let path = pingora_path.to_str().ok_or_else(|| {
                     ListenerError::UnixBind(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         "Unix socket path is not UTF-8",
                     ))
                 })?;
-                service.add_uds(path, None);
+                owner
+                    .set_permissions(0o660)
+                    .map_err(ListenerError::UnixBind)?;
+                service.add_uds_with_preconfigured_permissions(path);
                 Ok((path.to_string(), socket, Some(owner)))
             }
         }
@@ -1110,6 +1124,8 @@ impl<A> PreboundPublicService<A> {
             startup_failure_hook: None,
             #[cfg(test)]
             descriptor_override: None,
+            #[cfg(test)]
+            after_uds_path_resolution: None,
         })
     }
 
@@ -1148,6 +1164,14 @@ impl<A> PreboundPublicService<A> {
     #[cfg(test)]
     fn set_descriptor_override(&mut self, descriptor: std::os::fd::OwnedFd) {
         self.descriptor_override = Some(descriptor);
+    }
+
+    #[cfg(test)]
+    fn set_after_uds_path_resolution_hook<F>(&mut self, hook: F)
+    where
+        F: FnOnce() + Send + Sync + 'static,
+    {
+        self.after_uds_path_resolution = Some(Box::new(hook));
     }
 
     fn signal_startup_failure(&mut self) {
@@ -1194,7 +1218,14 @@ where
             self.signal_startup_failure();
             return;
         };
-        let (key, socket, owner) = match reservation.into_parts(&mut service) {
+        #[cfg(test)]
+        let after_uds_path_resolution = self.after_uds_path_resolution.take();
+        let (key, socket, owner) = match reservation.into_parts(&mut service, || {
+            #[cfg(test)]
+            if let Some(hook) = after_uds_path_resolution {
+                hook();
+            }
+        }) {
             Ok(parts) => parts,
             Err(error) => {
                 tracing::error!(%error, "pre-bound public listener address resolution failed");
@@ -2018,6 +2049,184 @@ mod tests {
             0,
             "owned socket or private cleanup debris remained"
         );
+    }
+
+    #[cfg(unix)]
+    async fn assert_replacement_after_stable_resolution_is_untouched(use_symlink: bool) {
+        use pingora::server::{Fds, ListenFds};
+        use pingora::services::ServiceWithDependents;
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::sync::atomic::Ordering;
+
+        let root = tempfile::tempdir_in("/tmp").expect("temporary stable-resolution root");
+        let configured_parent = root.path().join("live");
+        let anchored_parent = root.path().join("anchored");
+        let sentinel = root.path().join("sentinel");
+        fs::create_dir(&configured_parent).expect("create configured parent");
+        fs::write(&sentinel, b"sentinel content").expect("create sentinel");
+        fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o600))
+            .expect("set sentinel permissions");
+        let configured_path = configured_parent.join("public.sock");
+        let traffic = Arc::new(TrafficLifecycle::new());
+        let startup_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let service =
+            pingora::services::listening::Service::new("test public".to_string(), TestServerApp);
+        let mut public = super::PreboundPublicService::new(
+            service,
+            &crate::config::ListenerConfig::Unix(configured_path.clone()),
+            None,
+            Arc::clone(&traffic),
+            Arc::clone(&startup_failed),
+        )
+        .expect("prebind public UDS");
+        public.set_startup_failure_hook(|| {});
+        public.set_after_uds_path_resolution_hook({
+            let configured_parent = configured_parent.clone();
+            let anchored_parent = anchored_parent.clone();
+            let configured_path = configured_path.clone();
+            let sentinel = sentinel.clone();
+            move || {
+                fs::rename(&configured_parent, &anchored_parent).expect("move anchored parent");
+                fs::create_dir(&configured_parent).expect("replace configured parent alias");
+                if use_symlink {
+                    symlink(&sentinel, &configured_path).expect("install foreign symlink");
+                } else {
+                    fs::write(&configured_path, b"foreign replacement")
+                        .expect("install foreign regular file");
+                    fs::set_permissions(&configured_path, fs::Permissions::from_mode(0o600))
+                        .expect("set foreign permissions");
+                }
+            }
+        });
+
+        let fds: ListenFds = Arc::new(tokio::sync::Mutex::new(Fds::new()));
+        let (_shutdown_sender, shutdown) = tokio::sync::watch::channel(false);
+        let (ready_sender, ready_watch) = tokio::sync::watch::channel(false);
+        tokio::time::timeout(Duration::from_secs(1), async move {
+            public
+                .start_service(
+                    Some(fds),
+                    shutdown,
+                    1,
+                    ServiceReadyNotifier::new(ready_sender),
+                )
+                .await;
+        })
+        .await
+        .expect("fail-closed public service did not exit");
+
+        assert!(!*ready_watch.borrow(), "foreign alias announced ready");
+        assert!(startup_failed.load(Ordering::Acquire));
+        tokio::time::timeout(Duration::from_secs(1), traffic.wait_for_accepts_stopped())
+            .await
+            .expect("public exit acknowledgement did not fire");
+        if use_symlink {
+            assert_eq!(
+                fs::read_link(&configured_path).expect("foreign symlink retained"),
+                sentinel
+            );
+        } else {
+            assert_eq!(
+                fs::read(&configured_path).expect("foreign regular file retained"),
+                b"foreign replacement"
+            );
+            assert_eq!(
+                fs::metadata(&configured_path)
+                    .expect("foreign metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "Pingora chmod'd the foreign regular file"
+            );
+        }
+        assert_eq!(
+            fs::read(&sentinel).expect("sentinel retained"),
+            b"sentinel content"
+        );
+        assert_eq!(
+            fs::metadata(&sentinel)
+                .expect("sentinel metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "Pingora followed the foreign symlink"
+        );
+        assert_eq!(
+            fs::read_dir(&anchored_parent)
+                .expect("list anchored parent")
+                .count(),
+            0,
+            "owned socket or private cleanup debris remained"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn regular_file_replacement_after_stable_resolution_is_not_mutated() {
+        assert_replacement_after_stable_resolution_is_untouched(false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_replacement_after_stable_resolution_does_not_mutate_target() {
+        assert_replacement_after_stable_resolution_is_untouched(true).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn normal_public_unix_socket_mode_is_0660() {
+        use pingora::server::{Fds, ListenFds};
+        use pingora::services::ServiceWithDependents;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir_in("/tmp").expect("temporary socket-mode root");
+        let socket_path = root.path().join("public.sock");
+        let traffic = Arc::new(TrafficLifecycle::new());
+        let startup_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let service =
+            pingora::services::listening::Service::new("test public".to_string(), TestServerApp);
+        let mut public = super::PreboundPublicService::new(
+            service,
+            &crate::config::ListenerConfig::Unix(socket_path.clone()),
+            None,
+            Arc::clone(&traffic),
+            startup_failed,
+        )
+        .expect("prebind public UDS");
+        public.set_startup_failure_hook(|| {});
+
+        let fds: ListenFds = Arc::new(tokio::sync::Mutex::new(Fds::new()));
+        let (shutdown_sender, shutdown) = tokio::sync::watch::channel(false);
+        let (ready_sender, mut ready_watch) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move {
+            public
+                .start_service(
+                    Some(fds),
+                    shutdown,
+                    1,
+                    ServiceReadyNotifier::new(ready_sender),
+                )
+                .await;
+        });
+        tokio::time::timeout(Duration::from_secs(1), ready_watch.changed())
+            .await
+            .expect("public readiness timed out")
+            .expect("public readiness channel closed");
+        assert!(*ready_watch.borrow(), "public UDS never announced ready");
+        assert_eq!(
+            fs::metadata(&socket_path)
+                .expect("public socket metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o660
+        );
+
+        let _ = shutdown_sender.send(true);
+        task.await.expect("public service task");
+        assert!(!socket_path.exists(), "public socket cleanup leaked");
     }
 
     #[cfg(unix)]

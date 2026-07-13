@@ -658,3 +658,43 @@ library `37`, binary `0`, API `33`, config `27`, proxy `69`, routes `11`, store
 route_properties` passed `11/11`. Formatting, warnings-denied Clippy,
 all-target/all-feature checking, whitespace validation, final diff review, and
 status review all passed. No Task 9 implementation or broad refactor was added.
+
+### Task 8 Apple UDS permission finalization (2026-07-13)
+
+Apple's descriptor-backed `F_GETPATH` resolution still left Pingora's adopted
+UDS path subject to Pingora's pathname chmod. `pingora-core` 0.8.1 is now
+vendored exactly, with one explicit preconfigured-permissions API as its only
+behavioral delta. The existing `add_uds(path, None)` behavior remains 0666; only
+the new endpoint skips `set_perms` for a caller that already configured the
+socket.
+
+The application applies mode 0660 relative to the retained parent descriptor,
+without following a final symlink, and verifies the captured socket device,
+inode, and type before and after the chmod. Deterministic post-`F_GETPATH` tests
+replace the configured alias with either a mode-0600 regular file or a symlink
+to a mode-0600 sentinel. Both replacements retain their exact content and mode,
+readiness is withheld, public exit is acknowledged, and the anchored socket is
+cleaned without private debris. The ordinary public UDS contract observes mode
+0660 and normal cleanup.
+
+The regular-file test that had previously been interrupted compiled and passed
+on its first resumed run; no speculative source change was made. The Apple
+replacement/symlink/mode group passed `20/20` rounds with three contracts per
+round, and the prior raw-FD/private-namespace group passed `20/20` rounds with
+eight contracts per round. The complete 40-test library harness passed
+`100/100` default-parallel runs (`4,000` test executions). Focused TLS/Unix and
+WebSocket suites passed `22/22` and `4/4`.
+
+`PROPTEST_CASES=256 cargo test --all-targets --all-features` passed `251/251`:
+library `40`, binary `0`, API `33`, config `27`, proxy `69`, routes `11`, store
+`45`, TLS/Unix `22`, and WebSocket `4`. `PROPTEST_CASES=512 cargo test --test
+route_properties` passed `11/11`.
+
+The vendor audit compared all 114 `pingora-core` package files with Cargo's
+checksum-verified 0.8.1 registry source. The remaining 111 files, including the
+license, generated and original manifests, lockfile, and package metadata, are
+byte-identical; only `listeners/l4.rs`, `listeners/mod.rs`, and
+`services/listening.rs` differ.
+Formatting, warnings-denied Clippy, all-target/all-feature checking, whitespace
+validation, final diff review, and status review passed. No Task 9 work was
+added.

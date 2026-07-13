@@ -293,6 +293,40 @@ impl OwnedPath {
     }
 
     #[cfg(unix)]
+    pub(crate) fn set_permissions(&self, mode: u32) -> io::Result<()> {
+        self.verify_owned_socket()?;
+        chmodat_nofollow(&self.directory, &self.public_name, mode)?;
+        self.verify_owned_socket()?;
+        let stat = rustix::fs::statat(
+            &self.directory,
+            &self.public_name,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+        if stat.st_mode as u32 & 0o777 != mode {
+            return Err(io::Error::other("owned Unix socket mode did not persist"));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn verify_owned_socket(&self) -> io::Result<()> {
+        let stat = rustix::fs::statat(
+            &self.directory,
+            &self.public_name,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+        if self.identity.device != stat.st_dev as u64
+            || self.identity.inode != stat.st_ino
+            || stat.st_mode as u32 & libc::S_IFMT as u32 != libc::S_IFSOCK as u32
+        {
+            return Err(io::Error::other("owned Unix socket identity changed"));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
     pub(crate) fn publish_as(
         &mut self,
         path: PathBuf,
@@ -586,6 +620,41 @@ impl OwnedPath {
         )
         .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn chmodat_nofollow(directory: &File, name: &OsStr, mode: u32) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket name contains NUL"))?;
+    // fchmodat2 is the Linux interface that atomically honors AT_SYMLINK_NOFOLLOW.
+    let result = unsafe {
+        libc::syscall(
+            452 as libc::c_long,
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            mode as libc::mode_t,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn chmodat_nofollow(directory: &File, name: &OsStr, mode: u32) -> io::Result<()> {
+    rustix::fs::chmodat(
+        directory,
+        name,
+        rustix::fs::Mode::from_raw_mode(mode as _),
+        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+    )
+    .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))
 }
 
 #[cfg(unix)]
