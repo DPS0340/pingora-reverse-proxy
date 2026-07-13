@@ -19,12 +19,22 @@ fn fake_tool_directory() -> tempfile::TempDir {
 if [ "${1:-}" = compose ]; then exit 1; fi
 printf '%s docker %s\n' "${COMPOSE_PROJECT_NAME:-missing}" "$*" >> "$LIFECYCLE_LOG"
 if [ "${1:-}" = ps ]; then
+  if [ -s "${CARGO_PGID_FILE:-}" ]; then
+    pgid="$(cat "$CARGO_PGID_FILE")"
+    if kill -0 "-$pgid" 2>/dev/null; then
+      printf '%s group-live-at-container-scan %s\n' "${COMPOSE_PROJECT_NAME:-missing}" "$pgid" >> "$LIFECYCLE_LOG"
+    fi
+  fi
   printf '%s-oracle-container\n' "${COMPOSE_PROJECT_NAME:-missing}"
   exit 0
 fi
 case " $* " in
+  *" image rm "*)
+    if [ "${FAIL_IMAGE_RM:-0}" = 1 ]; then exit 26; fi
+    ;;
   *" run "*)
     if [ "${FAIL_RUNTIME_PROBE:-0}" = 1 ]; then exit 24; fi
+    if [ "${INTERRUPT_STAGE:-}" = runtime-probe ]; then sleep "${FAKE_STAGE_DELAY:-0}"; fi
     printf '%s\n' '{"node":"v20.20.2","package":"configurable-http-proxy@5.3.0","source":"/opt/chp-5.3.0"}'
     ;;
 esac
@@ -38,9 +48,11 @@ printf '%s compose %s\n' "${COMPOSE_PROJECT_NAME:-missing}" "$*" >> "$LIFECYCLE_
 case " $* " in
   *" build chp "*)
     if [ "${FAIL_BUILD:-0}" = 1 ]; then exit 21; fi
+    if [ "${INTERRUPT_STAGE:-}" = build ]; then sleep "${FAKE_STAGE_DELAY:-0}"; fi
     ;;
   *" up "*)
     if [ "${FAIL_COMPOSE_UP:-0}" = 1 ]; then exit 23; fi
+    if [ "${INTERRUPT_STAGE:-}" = up ]; then sleep "${FAKE_STAGE_DELAY:-0}"; fi
     ;;
   *" port redis 6379 "*) printf '127.0.0.1:43123\n' ;;
 esac
@@ -51,6 +63,19 @@ exit 0
         &directory.path().join("cargo"),
         r#"#!/bin/sh
 printf '%s cargo %s\n' "${COMPOSE_PROJECT_NAME:-missing}" "$*" >> "$LIFECYCLE_LOG"
+if [ "${FAKE_CARGO_TREE:-0}" = 1 ]; then
+  trap '' TERM
+  (
+    trap '' TERM
+    sleep "${FAKE_LATE_CONTAINER_DELAY:-0.5}"
+    printf '%s late-container-created\n' "${COMPOSE_PROJECT_NAME:-missing}" >> "$LIFECYCLE_LOG"
+  ) &
+  grandchild=$!
+  pgid="$(ps -o pgid= -p $$ | tr -d ' ')"
+  printf '%s\n' "$pgid" > "$CARGO_PGID_FILE"
+  printf '%s cargo-tree leader=%s grandchild=%s pgid=%s\n' "${COMPOSE_PROJECT_NAME:-missing}" "$$" "$grandchild" "$pgid" >> "$LIFECYCLE_LOG"
+  wait "$grandchild"
+fi
 sleep "${FAKE_CARGO_SLEEP:-0}"
 if [ "${FAIL_CARGO:-0}" = 1 ]; then exit 25; fi
 exit 0
@@ -70,6 +95,9 @@ fn script_command(tools: &tempfile::TempDir, log: &std::path::Path) -> Command {
         .arg("scripts/test-differential.sh")
         .env("PATH", path)
         .env("LIFECYCLE_LOG", log)
+        .env("CARGO_PGID_FILE", log.with_extension("pgid"))
+        .env("DIFFERENTIAL_TERM_GRACE_ATTEMPTS", "2")
+        .env("DIFFERENTIAL_TERM_GRACE_INTERVAL", "0.02")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     command
@@ -138,14 +166,14 @@ fn differential_script_cleans_its_image_on_signal_interruption() {
     let tools = fake_tool_directory();
     let log = tools.path().join("signal.log");
     let mut child = script_command(&tools, &log)
-        .env("FAKE_CARGO_SLEEP", "10")
+        .env("FAKE_CARGO_TREE", "1")
         .spawn()
         .expect("spawn differential script for signal");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         if std::fs::read_to_string(&log)
             .unwrap_or_default()
-            .contains(" cargo ")
+            .contains(" cargo-tree ")
         {
             break;
         }
@@ -158,8 +186,72 @@ fn differential_script_cleans_its_image_on_signal_interruption() {
     let killed = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
     assert_eq!(killed, 0);
     assert_eq!(child.wait().expect("signal script exit").code(), Some(143));
+    std::thread::sleep(std::time::Duration::from_millis(600));
     let log = std::fs::read_to_string(log).expect("read signal lifecycle log");
     assert_owned_cleanup(&log);
+    assert!(
+        !log.contains("late-container-created"),
+        "cargo descendant survived cleanup and created a late container: {log}"
+    );
+    assert!(
+        !log.contains("group-live-at-container-scan"),
+        "container scan ran before the cargo process group terminated: {log}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn differential_script_cleans_up_when_early_stages_are_interrupted() {
+    let tools = fake_tool_directory();
+    for (index, stage, marker) in [
+        (0, "build", " compose -f compose.test.yml build chp"),
+        (1, "up", " compose -f compose.test.yml up -d redis sidecar"),
+        (2, "runtime-probe", " docker run --rm"),
+    ] {
+        let log = tools.path().join(format!("signal-{index}.log"));
+        let mut child = script_command(&tools, &log)
+            .env("INTERRUPT_STAGE", stage)
+            .env("FAKE_STAGE_DELAY", "0.2")
+            .spawn()
+            .expect("spawn differential script stage");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains(marker)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{stage} stage not reached"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) },
+            0
+        );
+        assert_eq!(child.wait().expect("signal script exit").code(), Some(143));
+        assert_owned_cleanup(&std::fs::read_to_string(log).expect("stage lifecycle log"));
+    }
+}
+
+#[test]
+fn differential_script_reports_image_removal_failure() {
+    let tools = fake_tool_directory();
+    for (index, cargo_failure, expected) in [(0, false, 1), (1, true, 25)] {
+        let log = tools.path().join(format!("image-rm-failure-{index}.log"));
+        let output = script_command(&tools, &log)
+            .env("FAIL_IMAGE_RM", "1")
+            .env("FAIL_CARGO", if cargo_failure { "1" } else { "0" })
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run image removal failure");
+        assert_eq!(output.status.code(), Some(expected));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("failed to remove oracle image"),
+            "image removal failure was silent: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]

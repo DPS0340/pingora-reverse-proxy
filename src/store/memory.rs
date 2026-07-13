@@ -9,7 +9,7 @@ use tokio::sync::RwLock;
 
 use crate::route::{RouteData, RouteKey};
 
-use super::{ActivityFloor, Store, StoreError};
+use super::{differential_fixed_now, ActivityFloor, Store, StoreError};
 
 /// Process-local route storage primarily used as the default ephemeral backend.
 #[derive(Debug, Default)]
@@ -37,7 +37,7 @@ impl Store for MemoryStore {
         activity_floor: ActivityFloor,
     ) -> Result<RouteData, StoreError> {
         let mut routes = self.routes.write().await;
-        let now = Utc::now();
+        let now = differential_fixed_now().unwrap_or_else(Utc::now);
         let data = RouteData {
             target,
             last_activity: activity_floor.current().map_or(now, |floor| now.max(floor)),

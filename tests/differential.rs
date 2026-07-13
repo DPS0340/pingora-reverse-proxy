@@ -12,9 +12,10 @@ use serde_json::json;
 use tower::ServiceExt;
 
 use oracle::{
-    assert_equal_with_diagnostics_for_test, compare_metric_expositions,
-    observation_for_context_test, observation_for_test, route_body_for_test, CapturedProcess,
-    EndpointMapping, LaunchLock, ObservationContext, ObservationSide, OraclePair, PortLease,
+    assert_equal_with_diagnostics_for_test, compare_metric_deltas_for_test,
+    compare_metric_expositions, observation_for_context_test, observation_for_test,
+    route_body_for_test, CapturedProcess, EndpointMapping, LaunchLock, ObservationContext,
+    ObservationSide, OraclePair, PortLease,
 };
 use support::{read_text, request, test_api, StatusCode};
 
@@ -210,7 +211,7 @@ fn route_mutation_preparation_rewrites_only_the_root_target_sentinel() {
         prepared["metadata"]["last_activity"],
         "2024-02-03T04:05:06Z"
     );
-    assert_eq!(prepared["last_activity"], "2000-01-01T00:00:00.000Z");
+    assert_eq!(prepared["last_activity"], "2100-01-01T00:00:00.000Z");
 
     let user_target = route_body_for_test(
         json!({ "target": "http://example.test/oracle-echo.invalid/user-data" }),
@@ -242,8 +243,14 @@ fn route_table_context_normalizes_only_direct_route_targets() {
     }"#;
     let nested_target_changed =
         matching_rust.replace("127.0.0.1:11004/user", "127.0.0.1:21004/user");
+    let direct_target_path_changed = matching_rust.replace(
+        "http://127.0.0.1:21004/base",
+        "http://127.0.0.1:21004/different",
+    );
     let last_activity_changed =
         matching_rust.replace("2000-01-01T00:00:00.000Z", "2001-01-01T00:00:00.000Z");
+    let metadata_changed =
+        matching_rust.replace("\"metadata\": {", "\"metadata\": {\"arbitrary\": true,");
     let observe = |side, body: &[u8]| {
         observation_for_context_test(
             ObservationContext::RouteTable,
@@ -264,7 +271,50 @@ fn route_table_context_normalizes_only_direct_route_targets() {
     );
     assert_ne!(
         observe(ObservationSide::Chp, chp.as_bytes()),
+        observe(ObservationSide::Rust, direct_target_path_changed.as_bytes()),
+        "route target paths remain exact after endpoint normalization"
+    );
+    assert_ne!(
+        observe(ObservationSide::Chp, chp.as_bytes()),
         observe(ObservationSide::Rust, last_activity_changed.as_bytes())
+    );
+    assert_ne!(
+        observe(ObservationSide::Chp, chp.as_bytes()),
+        observe(ObservationSide::Rust, metadata_changed.as_bytes()),
+        "arbitrary route metadata remains semantic"
+    );
+}
+
+#[test]
+fn crud_scenarios_compare_populated_route_tables_at_each_mutation() {
+    let source = include_str!("differential.rs");
+    let tcp = source
+        .split_once(
+            "#[tokio::test]\nasync fn chp_and_rust_agree_on_api_crud_and_encoded_unicode_route()",
+        )
+        .expect("TCP CRUD scenario")
+        .1
+        .split_once("#[tokio::test]\nasync fn chp_and_rust_agree_on_longest_http_route_selection()")
+        .expect("next TCP scenario")
+        .0;
+    assert_eq!(
+        tcp.matches("pair.assert_same_route_tables().await;")
+            .count(),
+        3,
+        "TCP CRUD must compare live tables after CREATE, UPDATE, and DELETE"
+    );
+
+    let uds = source
+        .split_once(
+            "#[tokio::test]\nasync fn chp_and_rust_agree_on_unix_public_api_and_metrics_sockets()",
+        )
+        .expect("UDS CRUD scenario")
+        .1;
+    assert_eq!(
+        uds.matches("pair.assert_same_route_tables().await;")
+            .count(),
+        2,
+        "UDS CRUD must compare live tables after CREATE and DELETE"
     );
 }
 
@@ -310,7 +360,7 @@ fn metric_comparator_rejects_runtime_families_from_rust_only() {
 
 #[test]
 fn metric_comparator_rejects_invalid_summary_structure_even_on_both_sides() {
-    let mutations = [
+    let mut mutations = vec![
         EXACT_METRICS.replacen(
             "find_target_for_req{quantile=\"0.01\"} 0.1\n",
             "",
@@ -339,6 +389,18 @@ fn metric_comparator_rejects_invalid_summary_structure_even_on_both_sides() {
             1,
         ),
     ];
+    mutations.push(EXACT_METRICS.replacen(
+        "find_target_for_req_count 3",
+        &format!("find_target_for_req_count {}", "9".repeat(400)),
+        1,
+    ));
+    for value in ["NaN", "+Inf", "-Inf"] {
+        mutations.push(EXACT_METRICS.replacen(
+            "find_target_for_req{quantile=\"0.5\"} 0.2",
+            &format!("find_target_for_req{{quantile=\"0.5\"}} {value}"),
+            1,
+        ));
+    }
     for invalid in mutations {
         assert!(
             compare_metric_expositions(&invalid, &invalid).is_err(),
@@ -353,6 +415,20 @@ fn metric_comparator_rejects_invalid_summary_structure_even_on_both_sides() {
         );
         assert!(compare_metric_expositions(&invalid, &invalid).is_err());
     }
+}
+
+#[test]
+fn metric_delta_comparator_rejects_decreasing_summary_counts() {
+    let decreased = EXACT_METRICS.replacen(
+        "find_target_for_req_count 3",
+        "find_target_for_req_count 2",
+        1,
+    );
+    assert!(
+        compare_metric_deltas_for_test(EXACT_METRICS, &decreased, EXACT_METRICS, &decreased)
+            .is_err(),
+        "matching decreases on both sides must not be accepted as a zero delta"
+    );
 }
 
 fn fake_chp_source(name: &str, version: &str) -> tempfile::TempDir {
@@ -444,14 +520,6 @@ fn oracle_launcher_rejects_global_node_modules_source_attempts() {
 }
 
 #[test]
-fn oracle_launcher_rejects_the_host_wrong_node_major() {
-    let source = fake_chp_source("configurable-http-proxy", "5.3.0");
-    let output = run_host_launcher(source.path());
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("requires Node 20"));
-}
-
-#[test]
 fn node_major_validator_is_deterministic_without_using_the_host_runtime() {
     let output = std::process::Command::new("node")
         .args([
@@ -507,6 +575,9 @@ fn cross_process_launch_barrier_holds_lease_until_serialized_binder_can_run() {
     let directory = tempfile::tempdir().expect("launch barrier directory");
     let lock_path = directory.path().join("launch.lock");
     let ready = directory.path().join("ready");
+    // Keep concurrent oracle launches from claiming the released handoff port
+    // while this private-lock subprocess is waking up to bind it.
+    let _suite_lock = LaunchLock::acquire();
     let lock = LaunchLock::acquire_at(&lock_path);
     let lease = PortLease::new();
     let port = lease.port();
@@ -617,24 +688,34 @@ fn captured_process_redacts_a_workspace_path_split_across_pipe_reads() {
 
 #[test]
 fn ordinary_assertion_diagnostics_include_both_bounded_redacted_tails() {
-    let panic = std::panic::catch_unwind(|| {
-        assert_equal_with_diagnostics_for_test(
-            "HTTP response",
-            &"chp-value",
-            &"rust-value",
-            "chp-tail",
-            "rust-tail",
-        );
-    })
-    .expect_err("mismatched ordinary assertion should panic");
-    let message = panic
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| panic.downcast_ref::<&str>().copied())
-        .expect("diagnostic panic text");
-    assert!(message.contains("HTTP response"));
-    assert!(message.contains("CHP stderr tail=chp-tail"));
-    assert!(message.contains("Rust stderr tail=rust-tail"));
+    for scenario in [
+        "HTTP response",
+        "route table",
+        "WebSocket",
+        "TLS/mTLS",
+        "UDS",
+        "metrics",
+        "readiness",
+    ] {
+        let panic = std::panic::catch_unwind(|| {
+            assert_equal_with_diagnostics_for_test(
+                scenario,
+                &"chp-value",
+                &"rust-value",
+                "chp-tail",
+                "rust-tail",
+            );
+        })
+        .expect_err("mismatched ordinary assertion should panic");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("diagnostic panic text");
+        assert!(message.contains(scenario));
+        assert!(message.contains("CHP stderr tail=chp-tail"));
+        assert!(message.contains("Rust stderr tail=rust-tail"));
+    }
 }
 
 #[test]
@@ -838,6 +919,7 @@ async fn chp_and_rust_agree_on_api_crud_and_encoded_unicode_route() {
         }),
     )
     .await;
+    pair.assert_same_route_tables().await;
     pair.assert_same_http("/user/%E7%A7%80%E6%A8%B9/tree?x=%2F")
         .await;
     pair.post_route(
@@ -849,6 +931,7 @@ async fn chp_and_rust_agree_on_api_crud_and_encoded_unicode_route() {
         }),
     )
     .await;
+    pair.assert_same_route_tables().await;
     pair.assert_same_http("/user/%E7%A7%80%E6%A8%B9/tree?x=%2F")
         .await;
     pair.delete_route("/user/%E7%A7%80%E6%A8%B9").await;
@@ -1117,6 +1200,7 @@ async fn chp_and_rust_agree_on_unix_public_api_and_metrics_sockets() {
     let pair = OraclePair::start_unix().await;
     pair.post_route("/unix", json!({ "target": pair.echo_target() }))
         .await;
+    pair.assert_same_route_tables().await;
     pair.assert_same_unix_http("/unix/tree?x=%2F").await;
     pair.delete_route("/unix").await;
     pair.assert_same_route_tables().await;

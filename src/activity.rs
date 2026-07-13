@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, Notify};
 use crate::metrics::Metrics;
 use crate::route::RouteKey;
 use crate::route_table::RouteRegistry;
+use crate::store::differential_fixed_now;
 
 struct ActivityState {
     pending: Mutex<PendingActivities>,
@@ -137,6 +138,17 @@ impl ActivityWriter {
 
     /// Observe activity using the current UTC timestamp.
     pub fn record(&self, key: &RouteKey) {
+        if differential_fixed_now().is_some() {
+            // CHP still times an update when its frozen Date equals the stored
+            // value; mirror that no-op accounting without scheduling a write.
+            let started = Instant::now();
+            if self.registry.get(key).is_some() {
+                self.state
+                    .metrics
+                    .record_last_activity_update(started.elapsed());
+            }
+            return;
+        }
         self.record_at(key, Utc::now());
     }
 

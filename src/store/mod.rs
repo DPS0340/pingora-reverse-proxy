@@ -14,6 +14,17 @@ pub mod memory;
 pub mod redis;
 pub mod sidecar;
 
+/// Freeze the debug-only differential harness without changing release clocks.
+pub(crate) fn differential_fixed_now() -> Option<DateTime<Utc>> {
+    #[cfg(debug_assertions)]
+    if let Ok(value) = std::env::var("PINGORA_CHP_DIFFERENTIAL_FIXED_NOW") {
+        if let Ok(value) = DateTime::parse_from_rfc3339(&value) {
+            return Some(value.with_timezone(&Utc));
+        }
+    }
+    None
+}
+
 /// A monotonic activity source sampled inside an atomic route replacement.
 #[derive(Clone)]
 pub struct ActivityFloor {

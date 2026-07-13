@@ -35,6 +35,26 @@ if (
 
 validateNodeMajor(process.version);
 
+const fixedNow = process.env.PINGORA_CHP_DIFFERENTIAL_FIXED_NOW;
+if (fixedNow) {
+  // The Rust debug oracle uses the same instant, keeping route tables exact
+  // while the pinned CHP implementation still executes its normal Date calls.
+  const NativeDate = Date;
+  const fixedMillis = NativeDate.parse(fixedNow);
+  if (!Number.isFinite(fixedMillis)) {
+    throw new Error(`invalid differential fixed time: ${fixedNow}`);
+  }
+  globalThis.Date = class extends NativeDate {
+    constructor(...args) {
+      super(...(args.length === 0 ? [fixedMillis] : args));
+    }
+
+    static now() {
+      return fixedMillis;
+    }
+  };
+}
+
 if (process.argv[2] === "--runtime-probe") {
   process.stdout.write(
     `${JSON.stringify({

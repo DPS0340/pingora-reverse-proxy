@@ -383,6 +383,15 @@ fn compare_metric_deltas(
     Ok(())
 }
 
+pub(crate) fn compare_metric_deltas_for_test(
+    left_before: &str,
+    left_after: &str,
+    right_before: &str,
+    right_after: &str,
+) -> Result<(), String> {
+    compare_metric_deltas(left_before, left_after, right_before, right_after)
+}
+
 fn counter_delta(before: &MetricFamily, after: &MetricFamily) -> Result<CounterValues, String> {
     let before = counter_samples(before)?;
     let after = counter_samples(after)?;
@@ -687,6 +696,7 @@ static ORACLE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static PORT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const PORT_HANDOFF_START: u16 = 20_000;
 const PORT_HANDOFF_END: u16 = 30_000;
+const DIFFERENTIAL_FIXED_NOW: &str = "2100-01-01T00:00:00.000Z";
 
 fn diagnostic_panic<T: std::fmt::Debug + PartialEq>(
     scenario: &str,
@@ -1082,6 +1092,7 @@ impl OraclePair {
             .arg("oracle-launch-gate")
             .arg(&gate_path)
             .arg(env!("CARGO_BIN_EXE_pingora-reverse-proxy"))
+            .env("PINGORA_CHP_DIFFERENTIAL_FIXED_NOW", DIFFERENTIAL_FIXED_NOW)
             .args(&rust_args);
         let mut rust = CapturedProcess::spawn(rust_command);
         assert!(!rust.exited(), "Rust child exited before launch handoff");
@@ -1193,7 +1204,9 @@ impl OraclePair {
         )
         .await;
         let mut rust_command = Command::new(env!("CARGO_BIN_EXE_pingora-reverse-proxy"));
-        rust_command.args(arguments(&rust_public, &rust_api, &rust_metrics));
+        rust_command
+            .env("PINGORA_CHP_DIFFERENTIAL_FIXED_NOW", DIFFERENTIAL_FIXED_NOW)
+            .args(arguments(&rust_public, &rust_api, &rust_metrics));
         let mut rust = CapturedProcess::spawn(rust_command);
         wait_unix_ready(
             &mut chp,
@@ -1776,7 +1789,7 @@ fn prepare_route_body(value: &mut Value, side: ObservationSide, echo_port: u16) 
     };
     route
         .entry("last_activity")
-        .or_insert_with(|| Value::String("2000-01-01T00:00:00.000Z".to_owned()));
+        .or_insert_with(|| Value::String(DIFFERENTIAL_FIXED_NOW.to_owned()));
     if let Some(Value::String(target)) = route.get_mut("target") {
         let Ok(mut parsed) = url::Url::parse(target) else {
             return;
@@ -1856,6 +1869,8 @@ async fn spawn_docker_oracle(
         &name,
         "--add-host",
         "host.docker.internal:host-gateway",
+        "--env",
+        &format!("PINGORA_CHP_DIFFERENTIAL_FIXED_NOW={DIFFERENTIAL_FIXED_NOW}"),
     ]);
     if publish {
         for port in [8000, 8001, 8002] {

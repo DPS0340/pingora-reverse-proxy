@@ -972,3 +972,43 @@ all-target/all-feature checking, whitespace validation, final diff/status
 review, and removal of all `chp-diff` images, containers, networks, and related
 processes passed. The only emitted warning remains the established vendored
 Pingora OpenSSL deprecation.
+
+### Task 11 final reviewer closure (2026-07-13)
+
+Live populated route tables are now compared immediately after TCP create and
+update and UDS create, as well as after deletion. Both debug-only oracle clocks
+use `2100-01-01T00:00:00.000Z`; this retains exact `last_activity`, target path,
+and arbitrary metadata comparison instead of normalizing dynamic activity.
+Focused adversarials additionally reject non-finite quantiles, decreasing
+summary counts, and overflowing count input. The host-Node-major negative was
+removed; the deterministic pure validator and real pinned Docker Node 20 probe
+remain.
+
+The standalone script records Cargo's isolated job-control PGID and performs
+bounded group TERM/KILL, leader reaping, and group-exit verification before
+Compose teardown, ancestor scanning, and image removal. Fake lifecycle tests
+cover interruption during build, up, runtime probe, and a TERM-resistant Cargo
+process tree. They prove no delayed container creation, no live group at scan,
+unique concurrent ownership, surfaced image-removal failures, and preservation
+of original Cargo and signal statuses. The final all-suite run exposed and then
+closed two parallel-only harness races: the launch-barrier contract now holds
+the suite launch lock while exercising its private subprocess lock, and the
+standalone script exports its unique project before any Compose probe can
+observe an inherited project identity.
+
+Focused populated route-table verification passed TCP `1/1` and UDS `1/1`.
+The final literal standalone Docker gate passed `34/34` against Node `20.20.2`
+and `configurable-http-proxy@5.3.0`, then removed its unique image, containers,
+and network. Lifecycle passed `7/7`, proxy `74/74`, TLS/Unix `22/22`, and
+WebSocket `4/4`. With a separately rebuilt and runtime-probed oracle plus
+disposable Docker-assigned Redis on host port `33608`, `PROPTEST_CASES=256 cargo
+test --all-targets --all-features -- --nocapture` passed `386/386`: library
+`67`, binary `0`, API `34`, config `27`, differential `34`, differential script
+`7`, proxy `74`, routes `11`, store `106`, TLS/Unix `22`, and WebSocket `4`.
+`PROPTEST_CASES=512 cargo test --test route_properties -- --nocapture` passed
+`11/11`. Formatting, Bash and Node syntax, warnings-denied Clippy, debug and
+release all-target/all-feature checking, whitespace and diff validation, and
+the final resource/process audit passed. The release build compiles the fixed
+clock environment lookup out behind `cfg(debug_assertions)`, so release clocks
+remain native. The sole warning remains the established vendored Pingora
+OpenSSL deprecation.
