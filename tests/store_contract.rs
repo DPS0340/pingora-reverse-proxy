@@ -31,9 +31,9 @@ use tokio::sync::{Barrier, RwLock, Semaphore};
 mod sidecar_support;
 
 use sidecar_support::{
-    chp_timestamp, Fault as SidecarFault, FaultGate, SidecarFixture, ACTIVITY as SIDECAR_ACTIVITY,
-    DELETE as SIDECAR_DELETE, HEALTH as SIDECAR_HEALTH, PUT as SIDECAR_PUT,
-    SNAPSHOT as SIDECAR_SNAPSHOT,
+    chp_timestamp, Fault as SidecarFault, FaultGate, RawMutationAckFixture, SidecarFixture,
+    ACTIVITY as SIDECAR_ACTIVITY, DELETE as SIDECAR_DELETE, HEALTH as SIDECAR_HEALTH,
+    PUT as SIDECAR_PUT, SNAPSHOT as SIDECAR_SNAPSHOT,
 };
 
 fn key(path: &str) -> RouteKey {
@@ -85,10 +85,12 @@ async fn assert_store_contract(store: Arc<dyn Store>) {
         "add must return the exact atomically committed record"
     );
 
+    let mut original_candidate = route("http://127.0.0.1:9000/base");
+    original_candidate.last_activity = added.last_activity + chrono::Duration::seconds(1);
     let original = store
         .put_preserving_activity(
             route_key.clone(),
-            route("http://127.0.0.1:9000/base"),
+            original_candidate,
             ActivityFloor::fixed(None),
         )
         .await
@@ -98,7 +100,7 @@ async fn assert_store_contract(store: Arc<dyn Store>) {
         Some(&original)
     );
 
-    let activity_floor = Utc.timestamp_opt(7, 0).unwrap();
+    let activity_floor = original.last_activity + chrono::Duration::seconds(1);
     let replacement = store
         .put_preserving_activity(
             route_key.clone(),
@@ -882,6 +884,22 @@ async fn sidecar_fixture_fallbacks_and_auth_are_protocol_conformant() {
         (http::Method::GET, "/missing"),
         (http::Method::POST, "/v1/health"),
     ] {
+        let missing_protocol_and_auth =
+            raw_sidecar_request(&fixture, method.clone(), path, None, None, None, None).await;
+        assert_eq!(
+            missing_protocol_and_auth.status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            missing_protocol_and_auth.headers()["x-store-protocol"],
+            "v1"
+        );
+
+        let missing_auth =
+            raw_sidecar_request(&fixture, method.clone(), path, Some("v1"), None, None, None).await;
+        assert_eq!(missing_auth.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(missing_auth.headers()["x-store-protocol"], "v1");
+
         let response = raw_sidecar_request(
             &fixture,
             method,
@@ -893,6 +911,25 @@ async fn sidecar_fixture_fallbacks_and_auth_are_protocol_conformant() {
         )
         .await;
         assert!(matches!(response.status().as_u16(), 404 | 405));
+        assert_eq!(response.headers()["x-store-protocol"], "v1");
+    }
+
+    for protocol in [None, Some("v1")] {
+        let response = raw_sidecar_request(
+            &fixture,
+            http::Method::GET,
+            "/v1/routes/%FF",
+            protocol,
+            None,
+            protocol.map(|_| "Bearer fixture-secret-token"),
+            None,
+        )
+        .await;
+        if protocol.is_none() {
+            assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        } else {
+            assert!(!response.status().is_success());
+        }
         assert_eq!(response.headers()["x-store-protocol"], "v1");
     }
 }
@@ -1058,6 +1095,13 @@ async fn sidecar_put_resamples_activity_floor_before_each_attempt() {
         tokio::spawn(async move { registry.put(route_key, candidate).await })
     };
     gate.wait_until_arrived().await;
+    let independent = sidecar_store(&fixture).await;
+    let mut independently_advanced = route("http://independent-retry.example");
+    independently_advanced.last_activity = Utc.timestamp_opt(100, 0).unwrap();
+    independent
+        .put(route_key.clone(), independently_advanced)
+        .await
+        .unwrap();
     let observed = Utc.timestamp_opt(50, 123).unwrap();
     assert!(registry.observe_activity(&route_key, observed));
     gate.release();
@@ -1065,14 +1109,24 @@ async fn sidecar_put_resamples_activity_floor_before_each_attempt() {
     mutation.await.unwrap().unwrap();
 
     let persisted = fixture.routes().await.remove("/dynamic-floor").unwrap();
-    assert_eq!(persisted.last_activity, observed);
+    let expected = RouteData {
+        target: "http://replacement.example".to_owned(),
+        last_activity: Utc.timestamp_opt(100, 0).unwrap(),
+        extra: Map::new(),
+    };
+    assert_eq!(persisted, expected);
+    assert_eq!(registry.get(&route_key).as_ref(), Some(&expected));
     let requests = fixture.requests().await;
     let bodies: Vec<Value> = requests
         .iter()
         .filter(|request| request.method == http::Method::PUT)
         .map(|request| serde_json::from_slice(&request.body).unwrap())
+        .filter(|body: &Value| {
+            body["route"]["target"] == Value::String("http://replacement.example".to_owned())
+        })
         .collect();
-    let retry = &bodies[bodies.len() - 2..];
+    let retry = &bodies;
+    assert_eq!(retry.len(), 2);
     assert_eq!(retry[0]["route"], retry[1]["route"]);
     assert!(
         retry[0]["activityFloor"].as_str().unwrap() < retry[1]["activityFloor"].as_str().unwrap()
@@ -1081,10 +1135,7 @@ async fn sidecar_put_resamples_activity_floor_before_each_attempt() {
 
     fixture.restart().await;
     let reconnected = sidecar_store(&fixture).await;
-    assert_eq!(
-        reconnected.snapshot().await.unwrap()[&route_key].last_activity,
-        observed
-    );
+    assert_eq!(reconnected.snapshot().await.unwrap()[&route_key], expected);
 }
 
 #[tokio::test]
@@ -1145,7 +1196,7 @@ async fn sidecar_add_resamples_activity_floor_before_each_attempt() {
 
 #[tokio::test]
 async fn sidecar_preserving_put_never_regresses_existing_persisted_activity() {
-    let fixture = SidecarFixture::start().await;
+    let mut fixture = SidecarFixture::start().await;
     let store = sidecar_store(&fixture).await;
     let route_key = key("/persisted-floor");
     let mut newer = route("http://independent.example");
@@ -1154,34 +1205,115 @@ async fn sidecar_preserving_put_never_regresses_existing_persisted_activity() {
     let mut candidate = route("http://replacement.example");
     candidate.last_activity = Utc.timestamp_opt(5, 0).unwrap();
 
-    store
+    let committed = store
         .put_preserving_activity(
-            route_key,
-            candidate,
+            route_key.clone(),
+            candidate.clone(),
             ActivityFloor::fixed(Some(Utc.timestamp_opt(10, 0).unwrap())),
         )
         .await
         .unwrap();
 
-    assert_eq!(
-        fixture.routes().await["/persisted-floor"].last_activity,
-        newer.last_activity
-    );
+    let mut expected = candidate;
+    expected.last_activity = newer.last_activity;
+    assert_eq!(committed, expected);
+    assert_eq!(fixture.routes().await["/persisted-floor"], expected);
+
+    fixture.restart().await;
+    let reconnected = sidecar_store(&fixture).await;
+    assert_eq!(reconnected.snapshot().await.unwrap()[&route_key], expected);
+}
+
+#[tokio::test]
+async fn sidecar_registry_without_local_route_preserves_independent_writer_activity() {
+    let fixture = SidecarFixture::start().await;
+    let registry_store = Arc::new(sidecar_store(&fixture).await);
+    let registry = RouteRegistry::load(registry_store).await.unwrap();
+    let independent = sidecar_store(&fixture).await;
+    let route_key = key("/independent-only");
+    let mut independent_record = route("http://independent.example");
+    independent_record.last_activity = Utc.timestamp_opt(100, 0).unwrap();
+    independent
+        .put(route_key.clone(), independent_record)
+        .await
+        .unwrap();
+    let mut candidate = route("http://replacement.example");
+    candidate.last_activity = Utc.timestamp_opt(5, 0).unwrap();
+    candidate
+        .extra
+        .insert("revision".to_owned(), json!("replacement"));
+
+    registry
+        .put(route_key.clone(), candidate.clone())
+        .await
+        .unwrap();
+
+    let mut expected = candidate;
+    expected.last_activity = Utc.timestamp_opt(100, 0).unwrap();
+    assert_eq!(registry.get(&route_key).as_ref(), Some(&expected));
+    assert_eq!(fixture.routes().await["/independent-only"], expected);
+    let requests = fixture.requests().await;
+    let operation = requests
+        .iter()
+        .rev()
+        .find(|request| request.method == http::Method::PUT)
+        .map(|request| serde_json::from_slice::<Value>(&request.body).unwrap())
+        .unwrap();
+    assert_eq!(operation["operation"], "put_preserving_activity");
+}
+
+#[tokio::test]
+async fn sidecar_registry_caches_exact_server_selected_replacement() {
+    let mut fixture = SidecarFixture::start().await;
+    let independent = sidecar_store(&fixture).await;
+    let route_key = key("/exact-committed");
+    let mut cached = route("http://a.example");
+    cached.last_activity = Utc.timestamp_opt(10, 0).unwrap();
+    independent
+        .put(route_key.clone(), cached.clone())
+        .await
+        .unwrap();
+    let registry_store = Arc::new(sidecar_store(&fixture).await);
+    let registry = RouteRegistry::load(registry_store).await.unwrap();
+    cached.last_activity = Utc.timestamp_opt(100, 0).unwrap();
+    independent.put(route_key.clone(), cached).await.unwrap();
+    let mut replacement = route("http://b.example");
+    replacement.last_activity = Utc.timestamp_opt(5, 0).unwrap();
+    replacement.extra.insert("generation".to_owned(), json!(2));
+
+    registry
+        .put(route_key.clone(), replacement.clone())
+        .await
+        .unwrap();
+
+    let mut expected = replacement;
+    expected.last_activity = Utc.timestamp_opt(100, 0).unwrap();
+    assert_eq!(registry.get(&route_key).as_ref(), Some(&expected));
+    assert_eq!(fixture.routes().await["/exact-committed"], expected);
+
+    fixture.restart().await;
+    let reloaded = RouteRegistry::load(Arc::new(sidecar_store(&fixture).await))
+        .await
+        .unwrap();
+    assert_eq!(reloaded.get(&route_key).as_ref(), Some(&expected));
 }
 
 #[tokio::test]
 async fn sidecar_put_unusable_postcommit_acknowledgments_seal_registry() {
     for fault in [
         SidecarFault::MissingProtocol,
+        SidecarFault::DuplicateProtocol,
         SidecarFault::WrongProtocol,
         SidecarFault::WrongContentType,
         SidecarFault::WrongSuccessStatus,
         SidecarFault::MalformedBody,
-        SidecarFault::TruncatedBody,
-        SidecarFault::OversizedBody,
         SidecarFault::OversizedHeaders,
         SidecarFault::TooManyHeaders,
         SidecarFault::NonEmptyNoContent,
+        SidecarFault::MissingLastActivity,
+        SidecarFault::DuplicateLastActivity,
+        SidecarFault::MalformedLastActivity,
+        SidecarFault::NoncanonicalLastActivity,
     ] {
         let fixture = SidecarFixture::start().await;
         let store = Arc::new(sidecar_store(&fixture).await);
@@ -1190,12 +1322,16 @@ async fn sidecar_put_unusable_postcommit_acknowledgments_seal_registry() {
             .put(key("/cached"), route("http://cached-secret.example"))
             .await
             .unwrap();
-        fixture.push_fault(SIDECAR_PUT, fault).await;
+        fixture.push_fault(SIDECAR_PUT, fault.clone()).await;
 
-        let error = registry
+        let result = registry
             .put(key("/uncertain"), route("http://body-secret.example"))
-            .await
-            .unwrap_err();
+            .await;
+        assert!(
+            result.is_err(),
+            "fault unexpectedly acknowledged: {fault:?}"
+        );
+        let error = result.unwrap_err();
 
         assert_indeterminate_and_sealed(&error, "put", &registry);
         assert!(registry.get(&key("/cached")).is_none());
@@ -1209,12 +1345,11 @@ async fn sidecar_put_unusable_postcommit_acknowledgments_seal_registry() {
 async fn sidecar_patch_unusable_postcommit_acknowledgments_seal_registry() {
     for fault in [
         SidecarFault::MissingProtocol,
+        SidecarFault::DuplicateProtocol,
         SidecarFault::WrongProtocol,
         SidecarFault::WrongContentType,
         SidecarFault::WrongSuccessStatus,
         SidecarFault::MalformedBody,
-        SidecarFault::TruncatedBody,
-        SidecarFault::OversizedBody,
         SidecarFault::OversizedHeaders,
         SidecarFault::TooManyHeaders,
         SidecarFault::NonEmptyNoContent,
@@ -1226,12 +1361,16 @@ async fn sidecar_patch_unusable_postcommit_acknowledgments_seal_registry() {
             .put(key("/activity"), route("http://activity-secret.example"))
             .await
             .unwrap();
-        fixture.push_fault(SIDECAR_ACTIVITY, fault).await;
+        fixture.push_fault(SIDECAR_ACTIVITY, fault.clone()).await;
 
-        let error = registry
+        let result = registry
             .update_activity(&key("/activity"), Utc.timestamp_opt(80, 0).unwrap())
-            .await
-            .unwrap_err();
+            .await;
+        assert!(
+            result.is_err(),
+            "fault unexpectedly acknowledged: {fault:?}"
+        );
+        let error = result.unwrap_err();
 
         assert_indeterminate_and_sealed(&error, "update_activity", &registry);
         assert!(registry.get(&key("/activity")).is_none());
@@ -1319,18 +1458,113 @@ async fn sidecar_mutation_precommit_timeout_never_late_commits() {
     assert_eq!(fixture.request_count(SIDECAR_PUT).await, 1);
 }
 
+fn raw_no_content_acknowledgment(headers: &[&str], late_body: &[u8]) -> Vec<u8> {
+    let mut response = b"HTTP/1.1 204 No Content\r\n".to_vec();
+    for header in headers {
+        response.extend_from_slice(header.as_bytes());
+        response.extend_from_slice(b"\r\n");
+    }
+    response.extend_from_slice(b"Connection: close\r\n\r\n");
+    response.extend_from_slice(late_body);
+    response
+}
+
+#[tokio::test]
+async fn sidecar_raw_204_mutation_acknowledgment_faults_are_indeterminate_and_seal() {
+    let cases = [
+        raw_no_content_acknowledgment(
+            &[
+                "X-Store-Protocol: v1",
+                "X-Store-Protocol: v1",
+                "X-Store-Last-Activity: 1970-01-01T00:00:01.000000000Z",
+            ],
+            b"",
+        ),
+        raw_no_content_acknowledgment(
+            &[
+                "X-Store-Protocol: v1",
+                "X-Store-Last-Activity: 1970-01-01T00:00:01.000000000Z",
+                "Content-Length: 0",
+                "Content-Length: 0",
+            ],
+            b"",
+        ),
+        raw_no_content_acknowledgment(
+            &[
+                "X-Store-Protocol: v1",
+                "X-Store-Last-Activity: 1970-01-01T00:00:01.000000000Z",
+                "Transfer-Encoding: chunked",
+            ],
+            b"0\r\n\r\n",
+        ),
+        raw_no_content_acknowledgment(
+            &[
+                "X-Store-Protocol: v1",
+                "X-Store-Last-Activity: 1970-01-01T00:00:01.000000000Z",
+                "Content-Length: 29",
+            ],
+            b"partial",
+        ),
+        raw_no_content_acknowledgment(
+            &[
+                "X-Store-Protocol: v1",
+                "X-Store-Last-Activity: 1970-01-01T00:00:01.000000000Z",
+                "Content-Length: 4194305",
+            ],
+            b"",
+        ),
+    ];
+
+    for acknowledgment in cases {
+        for operation in [SIDECAR_PUT, SIDECAR_ACTIVITY] {
+            let fixture = RawMutationAckFixture::start(acknowledgment.clone()).await;
+            let config = SidecarConfig::new(fixture.base_url())
+                .with_connect_timeout(Duration::from_millis(100))
+                .with_request_timeout(Duration::from_millis(100))
+                .with_retry_policy(1, Duration::ZERO, Duration::ZERO);
+            let store = Arc::new(SidecarStore::connect(config).await.unwrap());
+            let registry = RouteRegistry::load(store).await.unwrap();
+
+            let result = if operation == SIDECAR_PUT {
+                registry
+                    .put(key("/raw-ack"), route("http://candidate.example"))
+                    .await
+            } else {
+                registry
+                    .update_activity(&key("/raw-ack"), Utc.timestamp_opt(10, 0).unwrap())
+                    .await
+            };
+
+            let error = result.unwrap_err();
+            let expected_operation = if operation == SIDECAR_PUT {
+                "put"
+            } else {
+                "update_activity"
+            };
+            assert_indeterminate_and_sealed(&error, expected_operation, &registry);
+        }
+    }
+}
+
 #[tokio::test]
 async fn sidecar_replacement_lost_reply_with_independent_writer_requires_reload() {
-    let fixture = SidecarFixture::start().await;
-    let registry_store = Arc::new(sidecar_store(&fixture).await);
+    let mut fixture = SidecarFixture::start().await;
+    let registry_store = Arc::new(
+        SidecarStore::connect(
+            sidecar_config(&fixture).with_request_timeout(Duration::from_millis(500)),
+        )
+        .await
+        .unwrap(),
+    );
     let registry = RouteRegistry::load(registry_store).await.unwrap();
     let route_key = key("/writer-race");
     registry
         .put(route_key.clone(), route("http://initial.example"))
         .await
         .unwrap();
+    let gate = FaultGate::new();
     fixture
-        .push_fault(SIDECAR_PUT, SidecarFault::LoseReply)
+        .push_fault(SIDECAR_PUT, SidecarFault::LoseReplyGate(gate.clone()))
         .await;
     let mutation = {
         let registry = Arc::clone(&registry);
@@ -1341,8 +1575,9 @@ async fn sidecar_replacement_lost_reply_with_independent_writer_requires_reload(
                 .await
         })
     };
-    fixture.wait_for_commits(2).await;
-    let independent = Arc::new(sidecar_store(&fixture).await);
+    gate.wait_until_arrived().await;
+    assert!(!mutation.is_finished());
+    let independent = sidecar_store(&fixture).await;
     independent
         .put(
             route_key.clone(),
@@ -1350,11 +1585,16 @@ async fn sidecar_replacement_lost_reply_with_independent_writer_requires_reload(
         )
         .await
         .unwrap();
+    assert!(!mutation.is_finished());
+    gate.release();
 
     let error = mutation.await.unwrap().unwrap_err();
 
     assert_indeterminate_and_sealed(&error, "put", &registry);
-    let reloaded = RouteRegistry::load(independent).await.unwrap();
+    fixture.restart().await;
+    let reloaded = RouteRegistry::load(Arc::new(sidecar_store(&fixture).await))
+        .await
+        .unwrap();
     assert_eq!(
         reloaded.get(&route_key).unwrap().target,
         "http://authoritative-writer.example"
@@ -1364,24 +1604,32 @@ async fn sidecar_replacement_lost_reply_with_independent_writer_requires_reload(
 
 #[tokio::test]
 async fn sidecar_delete_lost_reply_with_independent_writer_requires_reload() {
-    let fixture = SidecarFixture::start().await;
-    let registry_store = Arc::new(sidecar_store(&fixture).await);
+    let mut fixture = SidecarFixture::start().await;
+    let registry_store = Arc::new(
+        SidecarStore::connect(
+            sidecar_config(&fixture).with_request_timeout(Duration::from_millis(500)),
+        )
+        .await
+        .unwrap(),
+    );
     let registry = RouteRegistry::load(registry_store).await.unwrap();
     let route_key = key("/delete-race");
     registry
         .put(route_key.clone(), route("http://initial-delete.example"))
         .await
         .unwrap();
+    let gate = FaultGate::new();
     fixture
-        .push_fault(SIDECAR_DELETE, SidecarFault::LoseReply)
+        .push_fault(SIDECAR_DELETE, SidecarFault::LoseReplyGate(gate.clone()))
         .await;
     let mutation = {
         let registry = Arc::clone(&registry);
         let route_key = route_key.clone();
         tokio::spawn(async move { registry.delete(&route_key).await })
     };
-    fixture.wait_for_commits(2).await;
-    let independent = Arc::new(sidecar_store(&fixture).await);
+    gate.wait_until_arrived().await;
+    assert!(!mutation.is_finished());
+    let independent = sidecar_store(&fixture).await;
     independent
         .put(
             route_key.clone(),
@@ -1389,11 +1637,16 @@ async fn sidecar_delete_lost_reply_with_independent_writer_requires_reload() {
         )
         .await
         .unwrap();
+    assert!(!mutation.is_finished());
+    gate.release();
 
     let error = mutation.await.unwrap().unwrap_err();
 
     assert_indeterminate_and_sealed(&error, "delete", &registry);
-    let reloaded = RouteRegistry::load(independent).await.unwrap();
+    fixture.restart().await;
+    let reloaded = RouteRegistry::load(Arc::new(sidecar_store(&fixture).await))
+        .await
+        .unwrap();
     assert_eq!(
         reloaded.get(&route_key).unwrap().target,
         "http://authoritative-after-delete.example"

@@ -28,6 +28,12 @@ or any `Transfer-Encoding`, makes an otherwise empty acknowledgment unusable;
 the client checks framing because HTTP libraries may suppress illegal 204 body
 bytes before exposing the response body.
 
+Protocol and bearer-auth request validation is global middleware. It runs
+before endpoint handlers, path extractors, fallbacks, and method rejections.
+Consequently unknown paths, wrong methods, and malformed route paths cannot
+bypass validation, and their 400/401/404/405 responses still carry exactly one
+`X-Store-Protocol: v1` header.
+
 Serialized mutation requests are limited to 1 MiB before dispatch. Responses
 are limited to 64 header values, 32 KiB of aggregate header name/value bytes,
 and a 4 MiB body. The client uses HTTP/1 only and enforces the documented
@@ -136,6 +142,7 @@ Content-Type: application/json
 
 HTTP/1.1 204 No Content
 X-Store-Protocol: v1
+X-Store-Last-Activity: 2026-07-13T06:40:00.000000000Z
 ```
 
 The versioned envelope has four members:
@@ -148,11 +155,20 @@ The versioned envelope has four members:
 For `put`, the sidecar atomically stores `route` exactly. For `add` and
 `put_preserving_activity`, it atomically stores the same route except that
 `last_activity` is the maximum of the candidate, the incoming floor, and the
-existing persisted activity. When no preserving floor exists, the client sends
-the exact `put` operation with the candidate timestamp as the valid envelope
-floor. The client supplies the complete logical candidate and returns its
-latest locally known floor after the acknowledged 204. Repeating an envelope
-is idempotent.
+existing persisted activity. `put_preserving_activity` is always sent as that
+operation, including when the client's current local floor is absent; local
+absence never downgrades the request to `put`.
+
+Every successful PUT 204, including plain `put`, carries exactly one
+`X-Store-Last-Activity` header. Its value is the canonical UTC nanosecond
+timestamp selected by the atomic server commit. The client validates the
+single-valued header by parse plus canonical re-serialization. For `add` and
+`put_preserving_activity`, the Store result is constructed from the candidate
+target and metadata plus this server-selected activity, so the returned record,
+registry cache, and backend record are identical. Plain `Store::put` discards
+the reconstructed record but still requires and validates the header. Missing,
+repeated, malformed, or noncanonical activity headers after the possible commit
+are indeterminate. Repeating an envelope is idempotent.
 
 Validation and the activity-floor maximum happen before the single atomic map
 replacement. A 204 means the complete record committed. No other success
@@ -218,6 +234,8 @@ This pre-commit guarantee permits bounded 5xx retry. PATCH retries reuse the
 byte-for-byte identical payload. A logical PUT/add retry re-samples the activity
 floor immediately before every attempt and reserializes the envelope; all
 fields remain identical except that `activityFloor` may advance monotonically.
+The returned record always uses `X-Store-Last-Activity` from the final
+successful attempt rather than a locally predicted floor.
 DELETE may retry a returned 5xx because the guarantee proves the delete did not
 commit. A transport error or body/reply loss on any mutation is never retried,
 because reqwest cannot prove whether dispatch reached the commit point.
@@ -226,7 +244,11 @@ The executable fixture decodes PUT envelopes and nested route objects directly
 from raw JSON, before any `Value` map can collapse duplicate members. Its
 durable temp-file state is reconstructed into a new server state on restart;
 the retry-floor tests restart and reload to prove the last attempted floor was
-persisted.
+persisted. A raw TCP companion emits literal invalid 204 responses for duplicate
+protocol/content-length headers, transfer encoding, truncated framing, and
+oversized framing. HTTP semantics suppress 204 response bodies, so the protocol
+claims and tests the reachable framing-validation path rather than claiming an
+unreachable body-read path.
 
 ## Consistency, indeterminate outcomes, and recovery
 
@@ -236,9 +258,11 @@ The protocol has no ownership inference, operation marker, or corrective GET.
 
 After a mutation may have committed, success requires the complete exact
 acknowledgment: status, protocol header, content type/body shape, response
-headers, and bounded readable body. A missing/wrong protocol header, unexpected
-1xx/2xx/3xx status, invalid content type, nonempty 204/404, malformed DELETE
-200, truncated read, oversized headers/body, or body-read failure is
+headers, the exact committed-activity header for PUT, and bounded readable body.
+A missing/wrong protocol header, missing/duplicate/malformed/noncanonical PUT
+activity header, unexpected 1xx/2xx/3xx status, invalid content type, nonempty
+204/404, malformed DELETE 200, truncated read, oversized headers/body, or
+body-read failure is
 `StoreError::Indeterminate`. This remains true even if a later GET appears to
 show the requested value or absence. `RouteRegistry` terminally seals mutation
 admission and all cached serving on that error; readiness and
@@ -250,7 +274,7 @@ The poisoned registry is never unsealed in place.
 
 | Wire or validation result | Store result | Retry |
 | --- | --- | --- |
-| Exact GET 200 or mutation 200/204/404 acknowledgment | Success described above | No |
+| Exact GET 200 or mutation 200/204/404 acknowledgment, including the PUT committed-activity header | Success described above | No |
 | Mutation 4xx other than DELETE 404 | `StoreError::Backend` (v1 proves rejection/no commit) | No |
 | Mutation 5xx exhausted | `StoreError::Backend` (v1 proves pre-commit) | Bounded |
 | GET transport/body-read loss | `StoreError::Backend` after exhaustion | Bounded |

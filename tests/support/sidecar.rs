@@ -2,13 +2,13 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::io;
 use std::path::{Path as StdPath, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
-use axum::extract::{OriginalUri, Path, State};
+use axum::extract::{OriginalUri, Path, Request, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{get, patch, put};
 use axum::Router;
@@ -19,7 +19,8 @@ use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
+use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::{io::AsyncReadExt, io::AsyncWriteExt};
 
 pub const HEALTH: &str = "health";
 pub const SNAPSHOT: &str = "snapshot";
@@ -34,8 +35,10 @@ pub enum Fault {
     ClientError,
     Timeout,
     LoseReply,
+    LoseReplyGate(FaultGate),
     MalformedBody,
     MissingProtocol,
+    DuplicateProtocol,
     WrongProtocol,
     WrongContentType,
     WrongSuccessStatus,
@@ -45,6 +48,10 @@ pub enum Fault {
     TooManyHeaders,
     NonEmptyNoContent,
     NonEmptyNotFound,
+    MissingLastActivity,
+    DuplicateLastActivity,
+    MalformedLastActivity,
+    NoncanonicalLastActivity,
     RawBody(Vec<u8>),
 }
 
@@ -98,8 +105,6 @@ struct FixtureState {
     controls: Mutex<FixtureControls>,
     requests: Mutex<Vec<RecordedRequest>>,
     bearer_token: Option<String>,
-    commits: AtomicUsize,
-    commit_notify: Notify,
     durable_path: PathBuf,
 }
 
@@ -109,6 +114,105 @@ pub struct SidecarFixture {
     task: Option<tokio::task::JoinHandle<()>>,
     durable_path: PathBuf,
     durable_dir: Option<tempfile::TempDir>,
+}
+
+pub struct RawMutationAckFixture {
+    base_url: String,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl RawMutationAckFixture {
+    pub async fn start(raw_acknowledgment: impl Into<Vec<u8>>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let acknowledgment = Arc::new(raw_acknowledgment.into());
+        let task = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let acknowledgment = Arc::clone(&acknowledgment);
+                tokio::spawn(async move {
+                    serve_raw_ack_connection(stream, acknowledgment).await;
+                });
+            }
+        });
+        Self {
+            base_url: format!("http://{address}/"),
+            task,
+        }
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+}
+
+impl Drop for RawMutationAckFixture {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn serve_raw_ack_connection(mut stream: tokio::net::TcpStream, acknowledgment: Arc<Vec<u8>>) {
+    while let Some(path) = read_raw_request_path(&mut stream).await {
+        let response = match path.as_str() {
+            "/v1/health" => raw_json_response(br#"{"version":"v1","status":"ok"}"#),
+            "/v1/routes" => raw_json_response(b"{}"),
+            _ => acknowledgment.as_ref().clone(),
+        };
+        if stream.write_all(&response).await.is_err() {
+            return;
+        }
+        if !matches!(path.as_str(), "/v1/health" | "/v1/routes") {
+            let _ = stream.shutdown().await;
+            return;
+        }
+    }
+}
+
+fn raw_json_response(body: &[u8]) -> Vec<u8> {
+    let mut response = format!(
+        "HTTP/1.1 200 OK\r\nX-Store-Protocol: v1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(body);
+    response
+}
+
+async fn read_raw_request_path(stream: &mut tokio::net::TcpStream) -> Option<String> {
+    let mut request = Vec::new();
+    let header_end = loop {
+        if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position + 4;
+        }
+        let mut buffer = [0_u8; 1024];
+        let read = stream.read(&mut buffer).await.ok()?;
+        if read == 0 {
+            return None;
+        }
+        request.extend_from_slice(&buffer[..read]);
+    };
+    let headers = std::str::from_utf8(&request[..header_end]).ok()?;
+    let path = headers.split_whitespace().nth(1)?.to_owned();
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
+    let mut remaining = content_length.saturating_sub(request.len().saturating_sub(header_end));
+    while remaining != 0 {
+        let mut buffer = [0_u8; 1024];
+        let read = stream.read(&mut buffer[..remaining.min(1024)]).await.ok()?;
+        if read == 0 {
+            return None;
+        }
+        remaining -= read;
+    }
+    Some(path)
 }
 
 impl SidecarFixture {
@@ -136,7 +240,11 @@ impl SidecarFixture {
             .route("/v1/routes/{key}/activity", patch(update_activity))
             .fallback(not_found)
             .method_not_allowed_fallback(method_not_allowed)
-            .with_state(Arc::clone(&state));
+            .with_state(Arc::clone(&state))
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&state),
+                protocol_and_auth,
+            ));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
@@ -214,20 +322,6 @@ impl SidecarFixture {
         Some(&self.durable_path)
     }
 
-    pub async fn wait_for_commits(&self, expected: usize) {
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                let notified = self.state.commit_notify.notified();
-                if self.state.commits.load(Ordering::Acquire) >= expected {
-                    return;
-                }
-                notified.await;
-            }
-        })
-        .await
-        .unwrap();
-    }
-
     pub async fn restart(&mut self) {
         if let Some(task) = self.task.take() {
             task.abort();
@@ -253,8 +347,6 @@ fn load_state(durable_path: &StdPath, bearer_token: Option<String>) -> Arc<Fixtu
         controls: Mutex::new(FixtureControls::default()),
         requests: Mutex::new(Vec::new()),
         bearer_token,
-        commits: AtomicUsize::new(0),
-        commit_notify: Notify::new(),
         durable_path: durable_path.to_owned(),
     })
 }
@@ -301,6 +393,58 @@ fn protocol_response(status: StatusCode, body: impl Into<Body>) -> Response {
     response
 }
 
+#[derive(Clone, Copy)]
+struct PreserveFaultedProtocolHeader;
+
+async fn protocol_and_auth(
+    State(state): State<Arc<FixtureState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let headers = request.headers();
+    let protocol_is_valid = headers
+        .get_all("x-store-protocol")
+        .iter()
+        .map(|value| value.to_str().ok())
+        .collect::<Vec<_>>()
+        .as_slice()
+        == [Some("v1")];
+    let auth_is_valid = state.bearer_token.as_ref().is_none_or(|token| {
+        let expected = format!("Bearer {token}");
+        let mut values = headers.get_all(AUTHORIZATION).iter();
+        matches!(
+            (values.next(), values.next()),
+            (Some(value), None) if value.as_bytes() == expected.as_bytes()
+        )
+    });
+    let rejected_method = request.method().clone();
+    let rejected_path = request.uri().path().to_owned();
+    let mut response = if !protocol_is_valid {
+        protocol_response(StatusCode::BAD_REQUEST, Body::empty())
+    } else if !auth_is_valid {
+        protocol_response(StatusCode::UNAUTHORIZED, Body::empty())
+    } else {
+        next.run(request).await
+    };
+    if !protocol_is_valid || !auth_is_valid {
+        state.requests.lock().await.push(RecordedRequest {
+            method: rejected_method,
+            path: rejected_path,
+            body: Vec::new(),
+        });
+    }
+    if response
+        .extensions()
+        .get::<PreserveFaultedProtocolHeader>()
+        .is_none()
+    {
+        response
+            .headers_mut()
+            .insert("x-store-protocol", HeaderValue::from_static("v1"));
+    }
+    response
+}
+
 fn json_response(status: StatusCode, body: &impl serde::Serialize) -> Response {
     let mut response = protocol_response(status, Body::from(serde_json::to_vec(body).unwrap()));
     response
@@ -323,12 +467,27 @@ fn postcommit_response(fault: Option<&Fault>, mut response: Response) -> Respons
         Some(Fault::MissingProtocol) => {
             response.headers_mut().remove("x-store-protocol");
             response
+                .extensions_mut()
+                .insert(PreserveFaultedProtocolHeader);
+            response
+        }
+        Some(Fault::DuplicateProtocol) => {
+            response
+                .headers_mut()
+                .append("x-store-protocol", HeaderValue::from_static("v1"));
+            response
+                .extensions_mut()
+                .insert(PreserveFaultedProtocolHeader);
+            response
         }
         Some(Fault::WrongProtocol) => {
             response.headers_mut().insert(
                 "x-store-protocol",
                 HeaderValue::from_static("wrong-version"),
             );
+            response
+                .extensions_mut()
+                .insert(PreserveFaultedProtocolHeader);
             response
         }
         Some(Fault::WrongContentType) => {
@@ -342,22 +501,40 @@ fn postcommit_response(fault: Option<&Fault>, mut response: Response) -> Respons
             response
         }
         Some(Fault::TruncatedBody) => {
-            *response.status_mut() = StatusCode::OK;
-            response
-                .headers_mut()
-                .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-            *response.body_mut() = Body::from_stream(stream::iter([
-                Ok::<_, io::Error>(Bytes::from_static(b"{\"target\":\"secret")),
-                Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated")),
-            ]));
+            if response.status() == StatusCode::NO_CONTENT {
+                response.headers_mut().remove(CONTENT_TYPE);
+                response
+                    .headers_mut()
+                    .insert("content-length", HeaderValue::from_static("29"));
+                *response.body_mut() = Body::from_stream(stream::iter([
+                    Ok::<_, io::Error>(Bytes::from_static(b"partial")),
+                    Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated")),
+                ]));
+            } else {
+                *response.status_mut() = StatusCode::OK;
+                response
+                    .headers_mut()
+                    .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                *response.body_mut() = Body::from_stream(stream::iter([
+                    Ok::<_, io::Error>(Bytes::from_static(b"{\"target\":\"secret")),
+                    Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated")),
+                ]));
+            }
             response
         }
         Some(Fault::OversizedBody) => {
-            *response.status_mut() = StatusCode::OK;
-            response
-                .headers_mut()
-                .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-            *response.body_mut() = Body::from(vec![b'x'; 4 * 1024 * 1024 + 1]);
+            if response.status() == StatusCode::NO_CONTENT {
+                response.headers_mut().remove(CONTENT_TYPE);
+                response
+                    .headers_mut()
+                    .insert("content-length", HeaderValue::from_static("4194305"));
+            } else {
+                *response.status_mut() = StatusCode::OK;
+                response
+                    .headers_mut()
+                    .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                *response.body_mut() = Body::from(vec![b'x'; 4 * 1024 * 1024 + 1]);
+            }
             response
         }
         Some(Fault::OversizedHeaders) => {
@@ -391,6 +568,31 @@ fn postcommit_response(fault: Option<&Fault>, mut response: Response) -> Respons
             *response.body_mut() = Body::from("secret-body");
             response
         }
+        Some(Fault::MissingLastActivity) => {
+            response.headers_mut().remove("x-store-last-activity");
+            response
+        }
+        Some(Fault::DuplicateLastActivity) => {
+            response.headers_mut().append(
+                "x-store-last-activity",
+                HeaderValue::from_static("1970-01-01T00:00:01.000000000Z"),
+            );
+            response
+        }
+        Some(Fault::MalformedLastActivity) => {
+            response.headers_mut().insert(
+                "x-store-last-activity",
+                HeaderValue::from_static("not-a-timestamp"),
+            );
+            response
+        }
+        Some(Fault::NoncanonicalLastActivity) => {
+            response.headers_mut().insert(
+                "x-store-last-activity",
+                HeaderValue::from_static("1970-01-01T00:00:01Z"),
+            );
+            response
+        }
         Some(Fault::RawBody(body)) => {
             *response.status_mut() = StatusCode::OK;
             response
@@ -404,18 +606,14 @@ fn postcommit_response(fault: Option<&Fault>, mut response: Response) -> Respons
             | Fault::ServerErrorGate(_)
             | Fault::ClientError
             | Fault::Timeout
-            | Fault::LoseReply,
+            | Fault::LoseReply
+            | Fault::LoseReplyGate(_),
         )
         | None => response,
     }
 }
 
-fn record_commit(state: &FixtureState) {
-    state.commits.fetch_add(1, Ordering::Release);
-    state.commit_notify.notify_waiters();
-}
-
-async fn authorize_and_record(
+async fn validate_content_type_and_record(
     state: &FixtureState,
     method: Method,
     uri: OriginalUri,
@@ -427,16 +625,6 @@ async fn authorize_and_record(
         path: uri.path().to_owned(),
         body: body.to_vec(),
     });
-    if headers
-        .get_all("x-store-protocol")
-        .iter()
-        .map(|value| value.to_str().ok())
-        .collect::<Vec<_>>()
-        .as_slice()
-        != [Some("v1")]
-    {
-        return Some(protocol_response(StatusCode::BAD_REQUEST, Body::empty()));
-    }
     if matches!(method, Method::PUT | Method::PATCH)
         && headers
             .get_all(CONTENT_TYPE)
@@ -447,16 +635,6 @@ async fn authorize_and_record(
             != [Some("application/json")]
     {
         return Some(protocol_response(StatusCode::BAD_REQUEST, Body::empty()));
-    }
-    if let Some(token) = &state.bearer_token {
-        let expected = format!("Bearer {token}");
-        if headers
-            .get(AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            != Some(&expected)
-        {
-            return Some(protocol_response(StatusCode::UNAUTHORIZED, Body::empty()));
-        }
     }
     None
 }
@@ -502,11 +680,17 @@ async fn precommit_fault(state: &FixtureState, operation: &'static str) -> Optio
         }
         Some(
             Fault::LoseReply
+            | Fault::LoseReplyGate(_)
             | Fault::MissingProtocol
+            | Fault::DuplicateProtocol
             | Fault::WrongProtocol
             | Fault::WrongSuccessStatus
             | Fault::NonEmptyNoContent
             | Fault::NonEmptyNotFound
+            | Fault::MissingLastActivity
+            | Fault::DuplicateLastActivity
+            | Fault::MalformedLastActivity
+            | Fault::NoncanonicalLastActivity
             | Fault::RawBody(_),
         ) => None,
         Some(Fault::TruncatedBody) => {
@@ -526,7 +710,9 @@ async fn health(
     uri: OriginalUri,
     headers: HeaderMap,
 ) -> Response {
-    if let Some(response) = authorize_and_record(&state, Method::GET, uri, &headers, &[]).await {
+    if let Some(response) =
+        validate_content_type_and_record(&state, Method::GET, uri, &headers, &[]).await
+    {
         return response;
     }
     if let Some(response) = precommit_fault(&state, HEALTH).await {
@@ -546,6 +732,9 @@ async fn health(
             "x-store-protocol",
             HeaderValue::from_str(&protocol).unwrap(),
         );
+        response
+            .extensions_mut()
+            .insert(PreserveFaultedProtocolHeader);
     }
     response.headers_mut().insert(
         CONTENT_TYPE,
@@ -559,7 +748,9 @@ async fn snapshot(
     uri: OriginalUri,
     headers: HeaderMap,
 ) -> Response {
-    if let Some(response) = authorize_and_record(&state, Method::GET, uri, &headers, &[]).await {
+    if let Some(response) =
+        validate_content_type_and_record(&state, Method::GET, uri, &headers, &[]).await
+    {
         return response;
     }
     if let Some(response) = precommit_fault(&state, SNAPSHOT).await {
@@ -604,7 +795,9 @@ async fn put_route(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Some(response) = authorize_and_record(&state, Method::PUT, uri, &headers, &body).await {
+    if let Some(response) =
+        validate_content_type_and_record(&state, Method::PUT, uri, &headers, &body).await
+    {
         return response;
     }
     let fault = next_fault(&state, PUT).await;
@@ -622,8 +815,10 @@ async fn put_route(
         Some(Fault::Timeout) => std::future::pending::<()>().await,
         Some(
             Fault::LoseReply
+            | Fault::LoseReplyGate(_)
             | Fault::MalformedBody
             | Fault::MissingProtocol
+            | Fault::DuplicateProtocol
             | Fault::WrongProtocol
             | Fault::WrongContentType
             | Fault::WrongSuccessStatus
@@ -633,6 +828,10 @@ async fn put_route(
             | Fault::TooManyHeaders
             | Fault::NonEmptyNoContent
             | Fault::NonEmptyNotFound
+            | Fault::MissingLastActivity
+            | Fault::DuplicateLastActivity
+            | Fault::MalformedLastActivity
+            | Fault::NoncanonicalLastActivity
             | Fault::RawBody(_),
         )
         | None => {}
@@ -665,20 +864,25 @@ async fn put_route(
         "put" => {}
         _ => return protocol_response(StatusCode::BAD_REQUEST, Body::empty()),
     }
+    let committed_activity = route.last_activity;
     next.insert(route_key, route);
     if persist_routes(&state, &next).is_err() {
         return protocol_response(StatusCode::INTERNAL_SERVER_ERROR, Body::empty());
     }
     *routes = next;
     drop(routes);
-    record_commit(&state);
-    if matches!(fault, Some(Fault::LoseReply)) {
+    if let Some(Fault::LoseReplyGate(gate)) = fault.as_ref() {
+        gate.block_response().await;
+    }
+    if matches!(fault, Some(Fault::LoseReply | Fault::LoseReplyGate(_))) {
         std::future::pending::<()>().await;
     }
-    postcommit_response(
-        fault.as_ref(),
-        protocol_response(StatusCode::NO_CONTENT, Body::empty()),
-    )
+    let mut response = protocol_response(StatusCode::NO_CONTENT, Body::empty());
+    response.headers_mut().insert(
+        "x-store-last-activity",
+        HeaderValue::from_str(&chp_timestamp(committed_activity)).unwrap(),
+    );
+    postcommit_response(fault.as_ref(), response)
 }
 
 #[derive(Deserialize)]
@@ -696,7 +900,8 @@ async fn update_activity(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Some(response) = authorize_and_record(&state, Method::PATCH, uri, &headers, &body).await
+    if let Some(response) =
+        validate_content_type_and_record(&state, Method::PATCH, uri, &headers, &body).await
     {
         return response;
     }
@@ -715,8 +920,10 @@ async fn update_activity(
         Some(Fault::Timeout) => std::future::pending::<()>().await,
         Some(
             Fault::LoseReply
+            | Fault::LoseReplyGate(_)
             | Fault::MalformedBody
             | Fault::MissingProtocol
+            | Fault::DuplicateProtocol
             | Fault::WrongProtocol
             | Fault::WrongContentType
             | Fault::WrongSuccessStatus
@@ -726,6 +933,10 @@ async fn update_activity(
             | Fault::TooManyHeaders
             | Fault::NonEmptyNoContent
             | Fault::NonEmptyNotFound
+            | Fault::MissingLastActivity
+            | Fault::DuplicateLastActivity
+            | Fault::MalformedLastActivity
+            | Fault::NoncanonicalLastActivity
             | Fault::RawBody(_),
         )
         | None => {}
@@ -749,8 +960,10 @@ async fn update_activity(
     }
     *routes = next;
     drop(routes);
-    record_commit(&state);
-    if matches!(fault, Some(Fault::LoseReply)) {
+    if let Some(Fault::LoseReplyGate(gate)) = fault.as_ref() {
+        gate.block_response().await;
+    }
+    if matches!(fault, Some(Fault::LoseReply | Fault::LoseReplyGate(_))) {
         std::future::pending::<()>().await;
     }
     postcommit_response(
@@ -765,7 +978,9 @@ async fn delete_route(
     uri: OriginalUri,
     headers: HeaderMap,
 ) -> Response {
-    if let Some(response) = authorize_and_record(&state, Method::DELETE, uri, &headers, &[]).await {
+    if let Some(response) =
+        validate_content_type_and_record(&state, Method::DELETE, uri, &headers, &[]).await
+    {
         return response;
     }
     let fault = next_fault(&state, DELETE).await;
@@ -783,8 +998,10 @@ async fn delete_route(
         Some(Fault::Timeout) => std::future::pending::<()>().await,
         Some(
             Fault::LoseReply
+            | Fault::LoseReplyGate(_)
             | Fault::MalformedBody
             | Fault::MissingProtocol
+            | Fault::DuplicateProtocol
             | Fault::WrongProtocol
             | Fault::WrongContentType
             | Fault::WrongSuccessStatus
@@ -794,6 +1011,10 @@ async fn delete_route(
             | Fault::TooManyHeaders
             | Fault::NonEmptyNoContent
             | Fault::NonEmptyNotFound
+            | Fault::MissingLastActivity
+            | Fault::DuplicateLastActivity
+            | Fault::MalformedLastActivity
+            | Fault::NoncanonicalLastActivity
             | Fault::RawBody(_),
         )
         | None => {}
@@ -806,8 +1027,10 @@ async fn delete_route(
     }
     *routes = next;
     drop(routes);
-    record_commit(&state);
-    if matches!(fault, Some(Fault::LoseReply)) {
+    if let Some(Fault::LoseReplyGate(gate)) = fault.as_ref() {
+        gate.block_response().await;
+    }
+    if matches!(fault, Some(Fault::LoseReply | Fault::LoseReplyGate(_))) {
         std::future::pending::<()>().await;
     }
     let response = match prior {

@@ -21,6 +21,7 @@ use super::{ActivityFloor, Store, StoreError};
 
 const PROTOCOL_HEADER: &str = "x-store-protocol";
 const PROTOCOL_VERSION: &str = "v1";
+const LAST_ACTIVITY_HEADER: &str = "x-store-last-activity";
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_ATTEMPTS: usize = 3;
@@ -137,10 +138,12 @@ impl fmt::Debug for SidecarStore {
 struct HttpReply {
     status: StatusCode,
     body: Vec<u8>,
+    last_activity: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Copy)]
 enum MutationAcknowledgment {
+    Put,
     Empty,
     Delete,
 }
@@ -256,13 +259,20 @@ impl SidecarStore {
                 return Ok(HttpReply {
                     status,
                     body: Vec::new(),
+                    last_activity: None,
                 });
             }
             if !has_exact_content_type(response.headers(), "application/json") {
                 return Err(backend(operation));
             }
             match bounded_body(response).await {
-                Ok(body) => return Ok(HttpReply { status, body }),
+                Ok(body) => {
+                    return Ok(HttpReply {
+                        status,
+                        body,
+                        last_activity: None,
+                    })
+                }
                 Err(BodyReadError::TooLarge) if operation == "snapshot" => {
                     return Err(corrupt("snapshot", "<response>"));
                 }
@@ -319,7 +329,21 @@ impl SidecarStore {
             {
                 return Err(backend(operation));
             }
+            let mut last_activity = None;
             let body = match acknowledgment {
+                MutationAcknowledgment::Put if status == StatusCode::NO_CONTENT => {
+                    if response.headers().contains_key(CONTENT_TYPE)
+                        || has_nonempty_or_ambiguous_body_framing(response.headers())
+                    {
+                        return Err(indeterminate(operation));
+                    }
+                    last_activity = Some(
+                        single_header(response.headers(), LAST_ACTIVITY_HEADER)
+                            .and_then(|value| parse_timestamp(value).ok())
+                            .ok_or_else(|| indeterminate(operation))?,
+                    );
+                    read_mutation_body(response, operation).await?
+                }
                 MutationAcknowledgment::Empty if status == StatusCode::NO_CONTENT => {
                     if response.headers().contains_key(CONTENT_TYPE)
                         || has_nonempty_or_ambiguous_body_framing(response.headers())
@@ -346,14 +370,27 @@ impl SidecarStore {
                     }
                     body
                 }
-                MutationAcknowledgment::Empty | MutationAcknowledgment::Delete => {
+                MutationAcknowledgment::Put
+                | MutationAcknowledgment::Empty
+                | MutationAcknowledgment::Delete => {
                     return Err(indeterminate(operation));
                 }
             };
-            if matches!(acknowledgment, MutationAcknowledgment::Empty) && !body.is_empty() {
+            if matches!(
+                acknowledgment,
+                MutationAcknowledgment::Put | MutationAcknowledgment::Empty
+            ) && !body.is_empty()
+            {
                 return Err(indeterminate(operation));
             }
-            return Ok((HttpReply { status, body }, value));
+            return Ok((
+                HttpReply {
+                    status,
+                    body,
+                    last_activity,
+                },
+                value,
+            ));
         }
         Err(backend(operation))
     }
@@ -376,41 +413,33 @@ impl SidecarStore {
         activity_floor: Option<&ActivityFloor>,
     ) -> Result<RouteData, StoreError> {
         let route = encode_route(error_operation, data)?;
-        let candidate = data.clone();
         let mut sent_floor = data.last_activity;
-        let (_, committed) = self
+        let (reply, ()) = self
             .mutation_request(
                 error_operation,
                 Method::PUT,
                 self.route_endpoint(key, "")?,
-                MutationAcknowledgment::Empty,
+                MutationAcknowledgment::Put,
                 move || {
                     let current_floor = activity_floor.and_then(ActivityFloor::current);
                     if let Some(floor) = current_floor {
                         sent_floor = sent_floor.max(floor);
                     }
-                    let attempt_operation = if protocol_operation == "put_preserving_activity"
-                        && current_floor.is_none()
-                    {
-                        "put"
-                    } else {
-                        protocol_operation
-                    };
-                    let mut committed = candidate.clone();
-                    if attempt_operation != "put" {
-                        committed.last_activity = committed.last_activity.max(sent_floor);
-                    }
                     let body = serde_json::to_vec(&PutEnvelope {
                         version: PROTOCOL_VERSION,
-                        operation: attempt_operation,
+                        operation: protocol_operation,
                         route: route.clone(),
                         activity_floor: chp_timestamp(sent_floor),
                     })
                     .map_err(|_| corrupt(error_operation, "<outgoing>"))?;
-                    Ok((Some(body), committed))
+                    Ok((Some(body), ()))
                 },
             )
             .await?;
+        let mut committed = data.clone();
+        committed.last_activity = reply
+            .last_activity
+            .ok_or_else(|| indeterminate(error_operation))?;
         Ok(committed)
     }
 }
