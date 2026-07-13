@@ -706,7 +706,7 @@ Run the same store contract used by memory against a disposable Redis. Add corru
 
 - [ ] **Step 2: Verify RED**
 
-Run: `docker compose -f compose.test.yml up -d redis && TEST_REDIS_URL=redis://127.0.0.1:6379 cargo test --test store_contract redis_ -- --nocapture`
+Run: `docker compose -f compose.test.yml up -d --wait redis && TEST_REDIS_URL=redis://127.0.0.1:6379 cargo test --test store_contract redis_ -- --nocapture`
 
 Expected: missing Redis implementation.
 

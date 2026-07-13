@@ -366,7 +366,7 @@ impl pingora::server::ShutdownSignalWatch for TestShutdown {
 }
 
 struct ProxyHarness {
-    store: Arc<MemoryStore>,
+    store: Arc<dyn Store>,
     registry: Arc<RouteRegistry>,
     activity: ActivityWriter,
     base_url: String,
@@ -376,6 +376,14 @@ struct ProxyHarness {
 
 impl ProxyHarness {
     async fn start(arguments: &[String], routes: &[(&str, String)]) -> Self {
+        Self::start_with_store(arguments, routes, Arc::new(MemoryStore::new())).await
+    }
+
+    async fn start_with_store(
+        arguments: &[String],
+        routes: &[(&str, String)],
+        store: Arc<dyn Store>,
+    ) -> Self {
         let client = reqwest::Client::new();
         for _attempt in 0..5 {
             let mut reservation = ReservedPort::new();
@@ -391,7 +399,6 @@ impl ProxyHarness {
             ];
             argv.extend_from_slice(arguments);
             let config = AppConfig::try_from(Cli::try_parse_from(argv).unwrap()).unwrap();
-            let store = Arc::new(MemoryStore::new());
             let registry = RouteRegistry::load(store.clone()).await.unwrap();
             for (key, target) in routes {
                 registry
@@ -983,6 +990,89 @@ async fn network_binary_proxies_default_route_and_health_takes_precedence() {
         response.bytes().await.unwrap(),
         Bytes::from_static(br#"{"status":"OK"}"#)
     );
+}
+
+struct IndeterminateProxyStore {
+    routes: BTreeMap<RouteKey, RouteData>,
+}
+
+#[async_trait]
+impl Store for IndeterminateProxyStore {
+    async fn snapshot(&self) -> Result<BTreeMap<RouteKey, RouteData>, StoreError> {
+        Ok(self.routes.clone())
+    }
+
+    async fn add(
+        &self,
+        _key: RouteKey,
+        _target: String,
+        _extra: serde_json::Map<String, serde_json::Value>,
+        _activity_floor: ActivityFloor,
+    ) -> Result<RouteData, StoreError> {
+        Err(StoreError::Indeterminate { operation: "add" })
+    }
+
+    async fn put(&self, _key: RouteKey, _data: RouteData) -> Result<(), StoreError> {
+        unreachable!("proxy fail-stop test only injects add uncertainty")
+    }
+
+    async fn put_preserving_activity(
+        &self,
+        _key: RouteKey,
+        _data: RouteData,
+        _activity_floor: ActivityFloor,
+    ) -> Result<RouteData, StoreError> {
+        unreachable!("proxy fail-stop test only injects add uncertainty")
+    }
+
+    async fn update_activity(
+        &self,
+        _key: &RouteKey,
+        _at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), StoreError> {
+        unreachable!("sealed proxy must not record cached-route activity")
+    }
+
+    async fn delete(&self, _key: &RouteKey) -> Result<Option<RouteData>, StoreError> {
+        unreachable!("proxy fail-stop test only injects add uncertainty")
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn consistency_seal_makes_health_and_cached_routes_fixed_empty_503s() {
+    let upstream = EchoServer::start().await;
+    let route_key = RouteKey::parse("/cached").unwrap();
+    let root_key = RouteKey::parse("/").unwrap();
+    let cached = RouteData {
+        target: upstream.target("/must-not-be-used/"),
+        last_activity: chrono::Utc::now(),
+        extra: Default::default(),
+    };
+    let store: Arc<dyn Store> = Arc::new(IndeterminateProxyStore {
+        routes: BTreeMap::from([(route_key, cached.clone()), (root_key, cached)]),
+    });
+    let harness = ProxyHarness::start_with_store(&[], &[], store).await;
+
+    let error = harness
+        .registry
+        .add(
+            RouteKey::parse("/trigger").unwrap(),
+            "http://uncertain.example".to_owned(),
+            Default::default(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::Indeterminate { operation: "add" }
+    ));
+
+    for path in ["/_chp_healthz", "/cached/request", "/default/request"] {
+        let response = harness.get(path).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        assert!(response.bytes().await.unwrap().is_empty(), "{path}");
+    }
 }
 
 #[tokio::test]

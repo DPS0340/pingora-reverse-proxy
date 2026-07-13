@@ -17,7 +17,8 @@ use url::Url;
 
 use crate::metrics::Metrics;
 use crate::route::RouteKey;
-use crate::route_table::RouteRegistry;
+use crate::route_table::{ConsistencyStatus, RouteRegistry};
+use crate::store::StoreError;
 
 const MAX_JSON_BODY_BYTES: usize = 1024 * 1024;
 
@@ -106,6 +107,9 @@ async fn get_all_routes(
     if !authorized(&state, &headers) {
         return empty(StatusCode::FORBIDDEN);
     }
+    if registry_unavailable(&state) {
+        return empty(StatusCode::SERVICE_UNAVAILABLE);
+    }
 
     let inactive_since = match inactive_since(query.as_deref()) {
         Ok(value) => value,
@@ -127,6 +131,9 @@ async fn get_one_route(
 ) -> Response {
     if !authorized(&state, &headers) {
         return empty(StatusCode::FORBIDDEN);
+    }
+    if registry_unavailable(&state) {
+        return empty(StatusCode::SERVICE_UNAVAILABLE);
     }
 
     let key = match route_key_from_uri(&uri, 2) {
@@ -176,6 +183,9 @@ async fn post_route(state: ApiState, key: RouteKey, request: Request) -> Respons
     if !authorized(&state, &parts.headers) {
         return empty(StatusCode::FORBIDDEN);
     }
+    if registry_unavailable(&state) {
+        return empty(StatusCode::SERVICE_UNAVAILABLE);
+    }
     let mut object = match value {
         Value::Object(object) => object,
         _ => Map::new(),
@@ -187,8 +197,8 @@ async fn post_route(state: ApiState, key: RouteKey, request: Request) -> Respons
         return text(StatusCode::BAD_REQUEST, "Must specify 'target' as string");
     };
     object.remove("last_activity");
-    if state.registry.add(key, target, object).await.is_err() {
-        return text(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
+    if let Err(error) = state.registry.add(key, target, object).await {
+        return mutation_failure(&state, error);
     }
 
     state.metrics.record_api_route_add();
@@ -215,11 +225,14 @@ async fn delete_route(state: ApiState, key: RouteKey, headers: &HeaderMap) -> Re
     if !authorized(&state, headers) {
         return empty(StatusCode::FORBIDDEN);
     }
+    if registry_unavailable(&state) {
+        return empty(StatusCode::SERVICE_UNAVAILABLE);
+    }
 
     let status = match state.registry.delete(&key).await {
         Ok(Some(_)) => StatusCode::NO_CONTENT,
         Ok(None) => StatusCode::NOT_FOUND,
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        Err(error) => return mutation_failure(&state, error),
     };
     if !status.is_server_error() {
         state.metrics.record_api_route_delete();
@@ -239,6 +252,18 @@ fn route_key(route: &str) -> RouteKey {
     match RouteKey::parse(route) {
         Ok(key) => key,
         Err(error) => match error {},
+    }
+}
+
+fn registry_unavailable(state: &ApiState) -> bool {
+    state.registry.consistency_status() == ConsistencyStatus::Indeterminate
+}
+
+fn mutation_failure(state: &ApiState, error: StoreError) -> Response {
+    if matches!(error, StoreError::Indeterminate { .. }) || registry_unavailable(state) {
+        empty(StatusCode::SERVICE_UNAVAILABLE)
+    } else {
+        text(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
     }
 }
 

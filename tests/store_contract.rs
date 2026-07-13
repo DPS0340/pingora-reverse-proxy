@@ -1,8 +1,7 @@
-use std::collections::BTreeMap;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -11,8 +10,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use pingora_reverse_proxy::route::{RouteData, RouteKey};
 use pingora_reverse_proxy::route_table::{
-    install_route_mutation_panic_hook_at_startup, MutationOperation, MutationSeal, RouteMatch,
-    RouteRegistry, DETACHED_MUTATION_DIAGNOSTIC_CAPACITY, MUTATION_ADMISSION_SEALED_ERROR,
+    install_route_mutation_panic_hook_at_startup, ConsistencyStatus, MutationOperation,
+    MutationSeal, RouteMatch, RouteRegistry, DETACHED_MUTATION_DIAGNOSTIC_CAPACITY,
+    MUTATION_ADMISSION_SEALED_ERROR, MUTATION_INDETERMINATE_SEALED_ERROR,
     MUTATION_PANIC_SEALED_ERROR,
 };
 use pingora_reverse_proxy::store::memory::MemoryStore;
@@ -40,6 +40,20 @@ fn route(target: &str) -> RouteData {
 
 fn memory_store() -> Arc<dyn Store> {
     Arc::new(MemoryStore::new())
+}
+
+#[test]
+fn indeterminate_store_error_is_typed_and_redacted() {
+    let error = StoreError::Indeterminate { operation: "put" };
+
+    assert!(matches!(
+        error,
+        StoreError::Indeterminate { operation: "put" }
+    ));
+    assert_eq!(
+        error.to_string(),
+        "Redis put operation outcome is indeterminate"
+    );
 }
 
 async fn assert_store_contract(store: Arc<dyn Store>) {
@@ -149,28 +163,22 @@ async fn redis_client_ids(connection: &mut redis::aio::MultiplexedConnection) ->
         .collect()
 }
 
-async fn redis_exec_calls(connection: &mut redis::aio::MultiplexedConnection) -> u64 {
-    let command_stats: String = redis::cmd("INFO")
-        .arg("commandstats")
-        .query_async(connection)
-        .await
-        .unwrap();
-    command_stats
-        .lines()
-        .find_map(|line| line.strip_prefix("cmdstat_exec:calls="))
-        .and_then(|statistics| statistics.split(',').next())
-        .map(|calls| calls.parse().unwrap())
-        .unwrap_or_default()
-}
-
 struct SuppressMutationReplyProxy {
     url: String,
-    suppressed: tokio::sync::oneshot::Receiver<()>,
+    committed: Option<tokio::sync::oneshot::Receiver<()>>,
     task: tokio::task::JoinHandle<()>,
 }
 
-impl SuppressMutationReplyProxy {
-    async fn start(marker: &str) -> Self {
+struct PauseReplyProxy {
+    url: String,
+    paused: Option<tokio::sync::oneshot::Receiver<()>>,
+    release: Arc<Semaphore>,
+    exec_responses: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl PauseReplyProxy {
+    async fn start(command: &str) -> Self {
         let backend = url::Url::parse(&redis_url()).unwrap();
         let backend_address = format!(
             "{}:{}",
@@ -179,68 +187,294 @@ impl SuppressMutationReplyProxy {
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let marker = marker.as_bytes().to_vec();
-        let triggered = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (suppressed_tx, suppressed) = tokio::sync::oneshot::channel();
-        let suppressed_tx = Arc::new(std::sync::Mutex::new(Some(suppressed_tx)));
+        let command = Arc::new(command.as_bytes().to_ascii_uppercase());
+        let claimed = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(Semaphore::new(0));
+        let exec_responses = Arc::new(AtomicUsize::new(0));
+        let (paused_tx, paused) = tokio::sync::oneshot::channel();
+        let paused_tx = Arc::new(std::sync::Mutex::new(Some(paused_tx)));
+        let task = {
+            let release = Arc::clone(&release);
+            let exec_responses = Arc::clone(&exec_responses);
+            tokio::spawn(async move {
+                loop {
+                    let (client, _) = listener.accept().await.unwrap();
+                    let server = TcpStream::connect(&backend_address).await.unwrap();
+                    let command = Arc::clone(&command);
+                    let claimed = Arc::clone(&claimed);
+                    let release = Arc::clone(&release);
+                    let paused_tx = Arc::clone(&paused_tx);
+                    let exec_responses = Arc::clone(&exec_responses);
+                    tokio::spawn(async move {
+                        pause_reply_connection(
+                            client,
+                            server,
+                            command,
+                            claimed,
+                            paused_tx,
+                            release,
+                            exec_responses,
+                        )
+                        .await;
+                    });
+                }
+            })
+        };
+        Self {
+            url: format!("redis://{address}/"),
+            paused: Some(paused),
+            release,
+            exec_responses,
+            task,
+        }
+    }
+
+    async fn wait_until_paused(&mut self) {
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            self.paused.take().expect("pause signal is consumed once"),
+        )
+        .await
+        .expect("matching Redis reply was not paused")
+        .unwrap();
+    }
+
+    fn release(&self) {
+        self.release.add_permits(1);
+    }
+
+    fn exec_responses(&self) -> usize {
+        self.exec_responses.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for PauseReplyProxy {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl SuppressMutationReplyProxy {
+    async fn start(commands: &[&str]) -> Self {
+        let backend = url::Url::parse(&redis_url()).unwrap();
+        let backend_address = format!(
+            "{}:{}",
+            backend.host_str().unwrap(),
+            backend.port_or_known_default().unwrap()
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let commands: Arc<Vec<Vec<u8>>> = Arc::new(
+            commands
+                .iter()
+                .map(|command| command.as_bytes().to_ascii_uppercase())
+                .collect(),
+        );
+        let claimed = Arc::new(AtomicBool::new(false));
+        let (committed_tx, committed) = tokio::sync::oneshot::channel();
+        let committed_tx = Arc::new(std::sync::Mutex::new(Some(committed_tx)));
         let task = tokio::spawn(async move {
             loop {
                 let (client, _) = listener.accept().await.unwrap();
                 let server = TcpStream::connect(&backend_address).await.unwrap();
-                let marker = marker.clone();
-                let triggered = triggered.clone();
-                let suppressed_tx = suppressed_tx.clone();
+                let commands = Arc::clone(&commands);
+                let claimed = Arc::clone(&claimed);
+                let committed_tx = Arc::clone(&committed_tx);
                 tokio::spawn(async move {
-                    let (mut client_read, mut client_write) = client.into_split();
-                    let (mut server_read, mut server_write) = server.into_split();
-                    let request_triggered = triggered.clone();
-                    let request = tokio::spawn(async move {
-                        let mut buffer = [0_u8; 16 * 1024];
-                        loop {
-                            let read = client_read.read(&mut buffer).await.unwrap();
-                            if read == 0 {
-                                break;
-                            }
-                            server_write.write_all(&buffer[..read]).await.unwrap();
-                            if buffer[..read]
-                                .windows(marker.len())
-                                .any(|window| window == marker)
-                            {
-                                request_triggered.store(true, Ordering::SeqCst);
-                            }
-                        }
-                    });
-                    let response = tokio::spawn(async move {
-                        let mut buffer = [0_u8; 16 * 1024];
-                        loop {
-                            let read = server_read.read(&mut buffer).await.unwrap();
-                            if read == 0 {
-                                break;
-                            }
-                            if triggered.swap(false, Ordering::SeqCst) {
-                                if let Some(sender) = suppressed_tx.lock().unwrap().take() {
-                                    let _ = sender.send(());
-                                }
-                                tokio::time::sleep(Duration::from_millis(250)).await;
-                                break;
-                            }
-                            client_write.write_all(&buffer[..read]).await.unwrap();
-                        }
-                    });
-                    let _ = tokio::join!(request, response);
+                    proxy_connection(client, server, commands, claimed, committed_tx).await;
                 });
             }
         });
         Self {
             url: format!("redis://{address}/"),
-            suppressed,
+            committed: Some(committed),
             task,
         }
     }
 
-    async fn wait_for_suppressed_reply(&mut self) {
-        (&mut self.suppressed).await.unwrap();
+    async fn wait_for_committed_mutation(&mut self) {
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            self.committed
+                .take()
+                .expect("commit signal is consumed once"),
+        )
+        .await
+        .expect("matching Redis mutation reply was not suppressed")
+        .unwrap();
     }
+}
+
+async fn proxy_connection(
+    mut client: TcpStream,
+    mut server: TcpStream,
+    commands: Arc<Vec<Vec<u8>>>,
+    claimed: Arc<AtomicBool>,
+    committed: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+) {
+    let mut client_read = [0_u8; 16 * 1024];
+    let mut server_read = [0_u8; 16 * 1024];
+    let mut requests = Vec::new();
+    let mut responses = Vec::new();
+    let mut suppressions = VecDeque::new();
+    loop {
+        tokio::select! {
+            read = client.read(&mut client_read) => {
+                let Ok(read) = read else { break };
+                if read == 0 { break; }
+                requests.extend_from_slice(&client_read[..read]);
+                while let Some(length) = resp_frame_len(&requests) {
+                    let frame: Vec<_> = requests.drain(..length).collect();
+                    let matches = resp_command(&frame)
+                        .is_some_and(|command| commands.iter().any(|candidate| candidate == command));
+                    let suppress = matches
+                        && claimed
+                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok();
+                    suppressions.push_back(suppress);
+                    if server.write_all(&frame).await.is_err() { return; }
+                }
+            }
+            read = server.read(&mut server_read) => {
+                let Ok(read) = read else { break };
+                if read == 0 { break; }
+                responses.extend_from_slice(&server_read[..read]);
+                while let Some(length) = resp_frame_len(&responses) {
+                    let frame: Vec<_> = responses.drain(..length).collect();
+                    let suppress = suppressions.pop_front().unwrap_or(false);
+                    if suppress {
+                        if let Some(sender) = committed.lock().unwrap().take() {
+                            let _ = sender.send(());
+                        }
+                    } else if client.write_all(&frame).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn pause_reply_connection(
+    mut client: TcpStream,
+    mut server: TcpStream,
+    pause_command: Arc<Vec<u8>>,
+    claimed: Arc<AtomicBool>,
+    paused: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    release: Arc<Semaphore>,
+    exec_responses: Arc<AtomicUsize>,
+) {
+    let mut client_read = [0_u8; 16 * 1024];
+    let mut server_read = [0_u8; 16 * 1024];
+    let mut requests = Vec::new();
+    let mut responses = Vec::new();
+    let mut commands = VecDeque::new();
+    loop {
+        tokio::select! {
+            read = client.read(&mut client_read) => {
+                let Ok(read) = read else { break };
+                if read == 0 { break; }
+                requests.extend_from_slice(&client_read[..read]);
+                while let Some(length) = resp_frame_len(&requests) {
+                    let frame: Vec<_> = requests.drain(..length).collect();
+                    commands.push_back(resp_command(&frame).map(<[u8]>::to_vec));
+                    if server.write_all(&frame).await.is_err() { return; }
+                }
+            }
+            read = server.read(&mut server_read) => {
+                let Ok(read) = read else { break; };
+                if read == 0 { break; }
+                responses.extend_from_slice(&server_read[..read]);
+                while let Some(length) = resp_frame_len(&responses) {
+                    let frame: Vec<_> = responses.drain(..length).collect();
+                    let command = commands.pop_front().flatten();
+                    if command.as_deref() == Some(b"EXEC") {
+                        exec_responses.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let pause = command.as_deref() == Some(pause_command.as_slice())
+                        && claimed
+                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok();
+                    if pause {
+                        if let Some(sender) = paused.lock().unwrap().take() {
+                            let _ = sender.send(());
+                        }
+                        if release.acquire().await.is_err() { return; }
+                    }
+                    if client.write_all(&frame).await.is_err() { return; }
+                }
+            }
+        }
+    }
+}
+
+fn resp_frame_len(input: &[u8]) -> Option<usize> {
+    resp_frame_end(input, 0)
+}
+
+fn resp_frame_end(input: &[u8], start: usize) -> Option<usize> {
+    let kind = *input.get(start)?;
+    let line_end = input[start + 1..]
+        .windows(2)
+        .position(|bytes| bytes == b"\r\n")?
+        + start
+        + 1;
+    let after_line = line_end + 2;
+    match kind {
+        b'+' | b'-' | b':' | b',' | b'(' | b'#' => Some(after_line),
+        b'_' => Some(after_line),
+        b'$' | b'!' | b'=' => {
+            let length = std::str::from_utf8(&input[start + 1..line_end])
+                .ok()?
+                .parse::<isize>()
+                .ok()?;
+            if length < 0 {
+                Some(after_line)
+            } else {
+                let end = after_line.checked_add(length as usize)?.checked_add(2)?;
+                (input.get(end - 2..end) == Some(b"\r\n")).then_some(end)
+            }
+        }
+        b'*' | b'~' | b'>' | b'%' | b'|' => {
+            let mut count = std::str::from_utf8(&input[start + 1..line_end])
+                .ok()?
+                .parse::<isize>()
+                .ok()?;
+            if count < 0 {
+                return Some(after_line);
+            }
+            if matches!(kind, b'%' | b'|') {
+                count = count.checked_mul(2)?;
+            }
+            let mut end = after_line;
+            for _ in 0..count {
+                end = resp_frame_end(input, end)?;
+            }
+            Some(end)
+        }
+        _ => None,
+    }
+}
+
+fn resp_command(frame: &[u8]) -> Option<&[u8]> {
+    if frame.first() != Some(&b'*') {
+        return None;
+    }
+    let array_header = frame.windows(2).position(|bytes| bytes == b"\r\n")? + 2;
+    if frame.get(array_header) != Some(&b'$') {
+        return None;
+    }
+    let length_end = frame[array_header + 1..]
+        .windows(2)
+        .position(|bytes| bytes == b"\r\n")?
+        + array_header
+        + 1;
+    let length = std::str::from_utf8(&frame[array_header + 1..length_end])
+        .ok()?
+        .parse::<usize>()
+        .ok()?;
+    let command_start = length_end + 2;
+    frame.get(command_start..command_start + length)
 }
 
 impl Drop for SuppressMutationReplyProxy {
@@ -251,13 +485,13 @@ impl Drop for SuppressMutationReplyProxy {
 
 async fn fault_proxy_store(
     test_name: &str,
-    marker: &str,
+    commands: &[&str],
 ) -> (RedisStore, SuppressMutationReplyProxy) {
-    let proxy = SuppressMutationReplyProxy::start(marker).await;
+    let proxy = SuppressMutationReplyProxy::start(commands).await;
     let store = RedisStore::connect(
         RedisStoreConfig::new(proxy.url.clone())
             .with_key(redis_hash_key(test_name))
-            .with_operation_timeout(Duration::from_millis(100)),
+            .with_operation_timeout(Duration::from_millis(500)),
     )
     .await
     .unwrap();
@@ -398,13 +632,17 @@ async fn redis_corrupt_watched_record_poisoned_connection_is_not_reused() {
             ..
         }
     ));
-    tokio::task::yield_now().await;
-    assert!(
-        !redis_client_ids(&mut administrator)
-            .await
-            .contains(&store_id),
-        "a connection that may still be WATCHing must be replaced"
-    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while redis_client_ids(&mut administrator)
+        .await
+        .contains(&store_id)
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a connection that may still be WATCHing must be replaced"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 
     let replacement = route("http://replacement-after-corruption.example");
     store
@@ -482,128 +720,252 @@ async fn redis_disconnect_during_mutation_returns_typed_error_without_applying_w
     clear_redis_hash(TEST_NAME).await;
 }
 
+async fn independent_redis_put(test_name: &str, route_key: &RouteKey, data: &RouteData) {
+    let client = redis::Client::open(redis_url()).unwrap();
+    let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+    let encoded = serde_json::to_string(data).unwrap();
+    let _: usize = connection
+        .hset(redis_hash_key(test_name), route_key.as_str(), encoded)
+        .await
+        .unwrap();
+}
+
+async fn independent_redis_delete(test_name: &str, route_key: &RouteKey) {
+    let client = redis::Client::open(redis_url()).unwrap();
+    let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+    let _: usize = connection
+        .hdel(redis_hash_key(test_name), route_key.as_str())
+        .await
+        .unwrap();
+}
+
+fn assert_indeterminate(error: StoreError, operation: &'static str) {
+    assert!(matches!(
+        error,
+        StoreError::Indeterminate {
+            operation: actual
+        } if actual == operation
+    ));
+}
+
 #[tokio::test]
 #[serial(redis)]
-async fn redis_reconciles_committed_mutations_when_their_replies_are_lost() {
-    const TEST_NAME: &str = "lost-mutation-replies";
+async fn redis_lost_replacement_reply_with_intervening_writer_seals_registry() {
+    const TEST_NAME: &str = "indeterminate-replacement-writer";
     clear_redis_hash(TEST_NAME).await;
     let route_key = key("/uncertain");
+    let original = route("http://original.example");
+    independent_redis_put(TEST_NAME, &route_key, &original).await;
+    let (store, mut proxy) = fault_proxy_store(TEST_NAME, &["EXEC"]).await;
+    let registry = RouteRegistry::load(Arc::new(store)).await.unwrap();
 
-    let put_marker = "lost-put-reply.example";
-    let (put_store, mut put_proxy) = fault_proxy_store(TEST_NAME, put_marker).await;
-    let put_data = route(&format!("http://{put_marker}"));
-    put_store
-        .put(route_key.clone(), put_data.clone())
-        .await
-        .expect("a committed put with a lost reply must reconcile as success");
-    put_proxy.wait_for_suppressed_reply().await;
-    assert_eq!(put_store.snapshot().await.unwrap()[&route_key], put_data);
-    drop(put_store);
-    drop(put_proxy);
+    let replacement = {
+        let registry = Arc::clone(&registry);
+        let route_key = route_key.clone();
+        tokio::spawn(async move {
+            registry
+                .add(
+                    route_key,
+                    "http://attempted-replacement.example".to_owned(),
+                    Map::new(),
+                )
+                .await
+        })
+    };
+    proxy.wait_for_committed_mutation().await;
+    assert!(!replacement.is_finished());
+    assert_eq!(registry.get(&route_key), Some(original));
+    let queued = {
+        let registry = Arc::clone(&registry);
+        tokio::spawn(async move { registry.delete(&key("/queued-missing")).await })
+    };
+    let writer = route("http://independent-writer-b.example");
+    independent_redis_put(TEST_NAME, &route_key, &writer).await;
 
-    let add_marker = "lost-add-reply.example";
-    let (add_store, mut add_proxy) = fault_proxy_store(TEST_NAME, add_marker).await;
-    let added = add_store
-        .add(
-            route_key.clone(),
-            format!("http://{add_marker}"),
-            Map::from_iter([("mutation".to_owned(), json!("add"))]),
-            ActivityFloor::fixed(None),
-        )
-        .await
-        .expect("a committed add with a lost EXEC reply must reconcile as success");
-    add_proxy.wait_for_suppressed_reply().await;
-    assert_eq!(add_store.snapshot().await.unwrap()[&route_key], added);
-    drop(add_store);
-    drop(add_proxy);
-
-    let activity = Utc.timestamp_opt(7_654_321, 123_456_789).unwrap();
-    let activity_marker = activity.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
-    let (activity_store, mut activity_proxy) = fault_proxy_store(TEST_NAME, &activity_marker).await;
-    activity_store
-        .update_activity(&route_key, activity)
-        .await
-        .expect("a committed activity update with a lost EXEC reply must reconcile as success");
-    activity_proxy.wait_for_suppressed_reply().await;
+    assert_indeterminate(replacement.await.unwrap().unwrap_err(), "add");
     assert_eq!(
-        activity_store.snapshot().await.unwrap()[&route_key].last_activity,
-        activity
+        queued.await.unwrap().unwrap_err().to_string(),
+        MUTATION_INDETERMINATE_SEALED_ERROR
     );
-    drop(activity_store);
-    drop(activity_proxy);
+    assert!(registry.mutation_status().sealed);
+    assert_eq!(registry.mutation_status().seal, MutationSeal::Indeterminate);
+    assert_eq!(
+        registry.consistency_status(),
+        ConsistencyStatus::Indeterminate
+    );
+    assert_eq!(registry.get(&route_key), None);
+    assert!(registry.all().is_empty());
+    assert!(registry.resolve("/uncertain/child").is_none());
+    assert!(!registry.observe_activity(&route_key, Utc::now()));
+    assert_eq!(
+        registry
+            .delete(&key("/subsequent-missing"))
+            .await
+            .unwrap_err()
+            .to_string(),
+        MUTATION_INDETERMINATE_SEALED_ERROR
+    );
 
-    let delete_marker = "HDEL";
-    let (delete_store, mut delete_proxy) = fault_proxy_store(TEST_NAME, delete_marker).await;
-    let deleted = delete_store
-        .delete(&route_key)
+    let recovered = RouteRegistry::load(Arc::new(redis_store(TEST_NAME).await))
         .await
-        .expect("a committed delete with a lost reply must reconcile as success");
-    delete_proxy.wait_for_suppressed_reply().await;
-    assert!(deleted.is_some());
-    assert!(delete_store.snapshot().await.unwrap().is_empty());
+        .unwrap();
+    assert!(!recovered.mutation_status().sealed);
+    assert_eq!(
+        recovered.consistency_status(),
+        ConsistencyStatus::Consistent
+    );
+    assert_eq!(recovered.get(&route_key), Some(writer));
     clear_redis_hash(TEST_NAME).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test]
+#[serial(redis)]
+async fn redis_lost_delete_reply_with_intervening_writer_is_indeterminate() {
+    const TEST_NAME: &str = "indeterminate-delete-writer";
+    clear_redis_hash(TEST_NAME).await;
+    let route_key = key("/uncertain-delete");
+    independent_redis_put(TEST_NAME, &route_key, &route("http://delete-prior.example")).await;
+    let (store, mut proxy) = fault_proxy_store(TEST_NAME, &["EXEC", "EVAL"]).await;
+    let registry = RouteRegistry::load(Arc::new(store)).await.unwrap();
+
+    let deleting = {
+        let registry = Arc::clone(&registry);
+        let route_key = route_key.clone();
+        tokio::spawn(async move { registry.delete(&route_key).await })
+    };
+    proxy.wait_for_committed_mutation().await;
+    assert!(!deleting.is_finished());
+    let writer = route("http://independent-writer-b.example");
+    independent_redis_put(TEST_NAME, &route_key, &writer).await;
+
+    assert_indeterminate(deleting.await.unwrap().unwrap_err(), "delete");
+    assert!(registry.mutation_status().sealed);
+    assert_eq!(registry.get(&route_key), None);
+    let recovered = RouteRegistry::load(Arc::new(redis_store(TEST_NAME).await))
+        .await
+        .unwrap();
+    assert_eq!(recovered.get(&route_key), Some(writer));
+    clear_redis_hash(TEST_NAME).await;
+}
+
+#[tokio::test]
+#[serial(redis)]
+async fn redis_lost_delete_reply_with_intervening_absence_is_indeterminate() {
+    const TEST_NAME: &str = "indeterminate-delete-absence";
+    clear_redis_hash(TEST_NAME).await;
+    let route_key = key("/uncertain-delete");
+    independent_redis_put(TEST_NAME, &route_key, &route("http://delete-prior.example")).await;
+    let (store, mut proxy) = fault_proxy_store(TEST_NAME, &["EXEC", "EVAL"]).await;
+    let registry = RouteRegistry::load(Arc::new(store)).await.unwrap();
+
+    let deleting = {
+        let registry = Arc::clone(&registry);
+        let route_key = route_key.clone();
+        tokio::spawn(async move { registry.delete(&route_key).await })
+    };
+    proxy.wait_for_committed_mutation().await;
+    assert!(!deleting.is_finished());
+    independent_redis_delete(TEST_NAME, &route_key).await;
+
+    assert_indeterminate(deleting.await.unwrap().unwrap_err(), "delete");
+    assert!(registry.mutation_status().sealed);
+    let recovered = RouteRegistry::load(Arc::new(redis_store(TEST_NAME).await))
+        .await
+        .unwrap();
+    assert_eq!(recovered.get(&route_key), None);
+    clear_redis_hash(TEST_NAME).await;
+}
+
+#[tokio::test]
+#[serial(redis)]
+async fn redis_every_dispatched_mutator_reply_loss_is_indeterminate() {
+    const TEST_NAME: &str = "all-indeterminate-mutators";
+    clear_redis_hash(TEST_NAME).await;
+    let route_key = key("/uncertain-mutator");
+
+    let (put, mut proxy) = fault_proxy_store(TEST_NAME, &["HSET"]).await;
+    let putting = tokio::spawn(async move {
+        put.put(
+            key("/uncertain-mutator"),
+            route("http://lost-put-reply.example"),
+        )
+        .await
+    });
+    proxy.wait_for_committed_mutation().await;
+    assert_indeterminate(putting.await.unwrap().unwrap_err(), "put");
+
+    let (replace, mut proxy) = fault_proxy_store(TEST_NAME, &["EXEC"]).await;
+    let replacing = {
+        let route_key = route_key.clone();
+        tokio::spawn(async move {
+            replace
+                .put_preserving_activity(
+                    route_key,
+                    route("http://lost-replacement-reply.example"),
+                    ActivityFloor::fixed(None),
+                )
+                .await
+        })
+    };
+    proxy.wait_for_committed_mutation().await;
+    assert_indeterminate(replacing.await.unwrap().unwrap_err(), "put");
+
+    let (activity, mut proxy) = fault_proxy_store(TEST_NAME, &["EXEC"]).await;
+    let updating = {
+        let route_key = route_key.clone();
+        tokio::spawn(async move { activity.update_activity(&route_key, Utc::now()).await })
+    };
+    proxy.wait_for_committed_mutation().await;
+    assert_indeterminate(updating.await.unwrap().unwrap_err(), "update_activity");
+    clear_redis_hash(TEST_NAME).await;
+}
+
+#[tokio::test]
 #[serial(redis)]
 async fn redis_two_stores_retry_forced_exec_contention() {
     const TEST_NAME: &str = "two-store-contention";
-    const ROUNDS: u64 = 12;
     clear_redis_hash(TEST_NAME).await;
-    let first = Arc::new(redis_store(TEST_NAME).await);
-    let second = Arc::new(redis_store(TEST_NAME).await);
-    let client = redis::Client::open(redis_url()).unwrap();
-    let mut administrator = client.get_multiplexed_async_connection().await.unwrap();
-    let exec_calls_before = redis_exec_calls(&mut administrator).await;
-    let large_metadata = "x".repeat(512 * 1024);
-
-    for round in 0..ROUNDS {
-        let barrier = Arc::new(Barrier::new(3));
-        let first_task = {
-            let store = first.clone();
-            let barrier = barrier.clone();
-            let large_metadata = large_metadata.clone();
-            tokio::spawn(async move {
-                barrier.wait().await;
-                store
-                    .add(
-                        key("/contended"),
-                        format!("http://first-{round}.example"),
-                        Map::from_iter([("padding".to_owned(), json!(large_metadata))]),
-                        ActivityFloor::fixed(None),
-                    )
-                    .await
-                    .unwrap();
-            })
-        };
-        let second_task = {
-            let store = second.clone();
-            let barrier = barrier.clone();
-            let large_metadata = large_metadata.clone();
-            tokio::spawn(async move {
-                barrier.wait().await;
-                store
-                    .add(
-                        key("/contended"),
-                        format!("http://second-{round}.example"),
-                        Map::from_iter([("padding".to_owned(), json!(large_metadata))]),
-                        ActivityFloor::fixed(None),
-                    )
-                    .await
-                    .unwrap();
-            })
-        };
-        barrier.wait().await;
-        first_task.await.unwrap();
-        second_task.await.unwrap();
-    }
-
-    let exec_calls = redis_exec_calls(&mut administrator).await - exec_calls_before;
-    assert!(
-        exec_calls > ROUNDS * 2,
-        "at least one watched transaction must abort and retry: {exec_calls} EXEC calls"
+    let mut proxy = PauseReplyProxy::start("WATCH").await;
+    let first = RedisStore::connect(
+        RedisStoreConfig::new(proxy.url.clone())
+            .with_key(redis_hash_key(TEST_NAME))
+            .with_operation_timeout(Duration::from_secs(2)),
     );
-    assert_eq!(first.snapshot().await.unwrap().len(), 1);
+    let first = first.await.unwrap();
+    let first_write = tokio::spawn(async move {
+        first
+            .add(
+                key("/contended"),
+                "http://first-writer.example".to_owned(),
+                Map::new(),
+                ActivityFloor::fixed(None),
+            )
+            .await
+    });
+
+    proxy.wait_until_paused().await;
+    redis_store(TEST_NAME)
+        .await
+        .add(
+            key("/contended"),
+            "http://second-writer.example".to_owned(),
+            Map::new(),
+            ActivityFloor::fixed(None),
+        )
+        .await
+        .unwrap();
+    proxy.release();
+    let first_committed = first_write.await.unwrap().unwrap();
+
+    assert_eq!(
+        proxy.exec_responses(),
+        2,
+        "the first EXEC must abort and retry"
+    );
+    assert_eq!(
+        redis_store(TEST_NAME).await.snapshot().await.unwrap()[&key("/contended")],
+        first_committed
+    );
     clear_redis_hash(TEST_NAME).await;
 }
 
@@ -612,6 +974,25 @@ async fn redis_two_stores_retry_forced_exec_contention() {
 async fn redis_restart_persistence_recovers_complete_routes_without_clearing() {
     const TEST_NAME: &str = "restart-persistence";
     let Ok(phase) = std::env::var("REDIS_RESTART_PHASE") else {
+        for phase in ["writer", "reader"] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .arg("redis_restart_persistence_recovers_complete_routes_without_clearing")
+                .arg("--exact")
+                .arg("--nocapture")
+                .env("REDIS_RESTART_PHASE", phase)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "restart {phase} subprocess failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let client = redis::Client::open(redis_url()).unwrap();
+        let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+        let exists: bool = connection.exists(redis_hash_key(TEST_NAME)).await.unwrap();
+        assert!(!exists, "reader phase must clean the stable restart key");
         return;
     };
     let store = Arc::new(redis_store(TEST_NAME).await);

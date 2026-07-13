@@ -743,6 +743,82 @@ struct FailingMutationStore {
     routes: BTreeMap<RouteKey, RouteData>,
 }
 
+struct IndeterminateApiStore {
+    routes: BTreeMap<RouteKey, RouteData>,
+}
+
+#[async_trait]
+impl Store for IndeterminateApiStore {
+    async fn snapshot(&self) -> Result<BTreeMap<RouteKey, RouteData>, StoreError> {
+        Ok(self.routes.clone())
+    }
+
+    async fn add(
+        &self,
+        _key: RouteKey,
+        _target: String,
+        _extra: serde_json::Map<String, Value>,
+        _activity_floor: ActivityFloor,
+    ) -> Result<RouteData, StoreError> {
+        Err(StoreError::Indeterminate { operation: "add" })
+    }
+
+    async fn put(&self, _key: RouteKey, _data: RouteData) -> Result<(), StoreError> {
+        unreachable!("API fail-stop test only injects add uncertainty")
+    }
+
+    async fn put_preserving_activity(
+        &self,
+        _key: RouteKey,
+        _data: RouteData,
+        _activity_floor: ActivityFloor,
+    ) -> Result<RouteData, StoreError> {
+        unreachable!("API fail-stop test only injects add uncertainty")
+    }
+
+    async fn update_activity(
+        &self,
+        _key: &RouteKey,
+        _at: chrono::DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        unreachable!("API fail-stop test only injects add uncertainty")
+    }
+
+    async fn delete(&self, _key: &RouteKey) -> Result<Option<RouteData>, StoreError> {
+        unreachable!("sealed API must reject before persistence")
+    }
+}
+
+#[tokio::test]
+async fn indeterminate_mutation_makes_management_routes_fixed_empty_503s() {
+    let existing_key = RouteKey::parse("/existing").unwrap();
+    let store: Arc<dyn Store> = Arc::new(IndeterminateApiStore {
+        routes: BTreeMap::from([(
+            existing_key,
+            RouteData {
+                target: TARGET.to_owned(),
+                last_activity: Utc.timestamp_opt(1, 0).unwrap(),
+                extra: Default::default(),
+            },
+        )]),
+    });
+    let app = test_api_with_store(None, store).await;
+
+    let triggering = post_route(&app, "/api/routes/uncertain", TARGET).await;
+    assert_eq!(triggering.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(read_bytes(triggering).await.is_empty());
+
+    for (method, path) in [
+        ("GET", "/api/routes"),
+        ("GET", "/api/routes/existing"),
+        ("DELETE", "/api/routes/existing"),
+    ] {
+        let response = request(&app, method, path, None, None).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(read_bytes(response).await.is_empty());
+    }
+}
+
 struct AtomicAddFailureStore {
     routes: RwLock<BTreeMap<RouteKey, RouteData>>,
 }

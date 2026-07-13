@@ -208,12 +208,20 @@ pub struct MutationStatus {
     pub active_mutations: usize,
 }
 
+/// Whether cached route state is authoritative enough to serve or expose.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConsistencyStatus {
+    Consistent,
+    Indeterminate,
+}
+
 /// Terminal mutation-admission state exposed by [`RouteRegistry::mutation_status`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MutationSeal {
     Open,
     Shutdown,
     BackendPanic,
+    Indeterminate,
 }
 
 /// Fixed error returned by every mutation attempted after shutdown sealing.
@@ -223,6 +231,10 @@ pub const MUTATION_ADMISSION_SEALED_ERROR: &str =
 /// Fixed error returned after a supervised backend panic terminally seals a registry.
 pub const MUTATION_PANIC_SEALED_ERROR: &str =
     "route registry is terminally sealed after a backend panic";
+
+/// Fixed error returned after an indeterminate backend mutation seals a registry.
+pub const MUTATION_INDETERMINATE_SEALED_ERROR: &str =
+    "route registry is terminally sealed after an indeterminate backend mutation";
 
 /// Maximum detached mutation diagnostics retained between drains.
 ///
@@ -280,6 +292,9 @@ impl MutationTracker {
             MutationSeal::BackendPanic => {
                 return Err(StoreError::message(MUTATION_PANIC_SEALED_ERROR));
             }
+            MutationSeal::Indeterminate => {
+                return Err(StoreError::message(MUTATION_INDETERMINATE_SEALED_ERROR));
+            }
         }
         state.active = state.active.saturating_add(1);
         drop(state);
@@ -321,11 +336,25 @@ impl MutationTracker {
         self.state().seal = MutationSeal::BackendPanic;
     }
 
-    fn reject_if_panic_sealed(&self) -> Result<(), StoreError> {
-        if self.state().seal == MutationSeal::BackendPanic {
-            return Err(StoreError::message(MUTATION_PANIC_SEALED_ERROR));
+    fn indeterminate_seal(&self) {
+        self.state().seal = MutationSeal::Indeterminate;
+    }
+
+    fn reject_if_terminally_failed(&self) -> Result<(), StoreError> {
+        match self.state().seal {
+            MutationSeal::BackendPanic => {
+                return Err(StoreError::message(MUTATION_PANIC_SEALED_ERROR));
+            }
+            MutationSeal::Indeterminate => {
+                return Err(StoreError::message(MUTATION_INDETERMINATE_SEALED_ERROR));
+            }
+            MutationSeal::Open | MutationSeal::Shutdown => {}
         }
         Ok(())
+    }
+
+    fn is_indeterminate(&self) -> bool {
+        self.state().seal == MutationSeal::Indeterminate
     }
 
     async fn seal_and_drain(&self, timeout: Duration) -> MutationDrainOutcome {
@@ -567,16 +596,25 @@ impl RouteRegistry {
 
     /// Return one normalized route record from the current snapshot.
     pub fn get(&self, key: &RouteKey) -> Option<RouteData> {
+        if self.mutations.is_indeterminate() {
+            return None;
+        }
         self.snapshot.load().routes.by_key.get(key).cloned()
     }
 
     /// Return a complete clone of the current logical route map.
     pub fn all(&self) -> BTreeMap<RouteKey, RouteData> {
+        if self.mutations.is_indeterminate() {
+            return BTreeMap::new();
+        }
         self.snapshot.load().routes.by_key.clone()
     }
 
     /// Resolve a runtime request path against the current immutable snapshot.
     pub fn resolve(&self, request_path: &str) -> Option<RouteMatch> {
+        if self.mutations.is_indeterminate() {
+            return None;
+        }
         self.snapshot.load().resolve(request_path)
     }
 
@@ -587,6 +625,9 @@ impl RouteRegistry {
     /// data plane uses this method so a completed request is immediately
     /// observable even when best-effort activity persistence later fails.
     pub fn observe_activity(&self, key: &RouteKey, at: DateTime<Utc>) -> bool {
+        if self.mutations.is_indeterminate() {
+            return false;
+        }
         loop {
             let current = self.snapshot.load_full();
             let mut routes = current.routes.clone();
@@ -755,6 +796,18 @@ impl RouteRegistry {
         self.mutations.status()
     }
 
+    /// Report whether this registry may safely serve its cached snapshot.
+    ///
+    /// Indeterminate is terminal for this instance. Recovery requires loading
+    /// authoritative backend state into a new registry/process.
+    pub fn consistency_status(&self) -> ConsistencyStatus {
+        if self.mutations.is_indeterminate() {
+            ConsistencyStatus::Indeterminate
+        } else {
+            ConsistencyStatus::Consistent
+        }
+    }
+
     async fn run_mutation<T, F>(
         &self,
         operation: MutationOperation,
@@ -781,12 +834,15 @@ impl RouteRegistry {
         let spawned = catch_unwind(AssertUnwindSafe(|| {
             runtime.spawn(async move {
                 let _mutation_guard = mutation_lock.lock().await;
-                let supervised = match tracker.reject_if_panic_sealed() {
+                let supervised = match tracker.reject_if_terminally_failed() {
                     Ok(()) => CatchUnwindFuture::new(mutation, Arc::clone(&tracker)).await,
                     Err(error) => Ok(Err(error)),
                 };
                 match supervised {
                     Ok(result) => {
+                        if matches!(result, Err(StoreError::Indeterminate { .. })) {
+                            tracker.indeterminate_seal();
+                        }
                         let detached_error = result.as_ref().err().cloned();
                         let (acknowledged, acknowledgment) = oneshot::channel();
                         let detached = match response.send(MutationResponse {

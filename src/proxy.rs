@@ -18,7 +18,7 @@ use crate::api_server::TrafficLifecycle;
 use crate::config::{AppConfig, ProxyOptions};
 use crate::errors::{ErrorRendererBuildError, ProxyErrorClass, ProxyErrorRenderer};
 use crate::route::RouteKey;
-use crate::route_table::RouteRegistry;
+use crate::route_table::{ConsistencyStatus, RouteRegistry};
 use crate::store::StoreError;
 use crate::upstream::{
     apply_forwarded_headers, apply_request_headers, build_upstream_uri, rewrite_location,
@@ -235,6 +235,10 @@ impl ProxyHttp for ChpProxy {
             return Ok(true);
         }
         ctx.traffic_admission = Some(Arc::clone(&self.traffic));
+        if self.registry.consistency_status() == ConsistencyStatus::Indeterminate {
+            Self::send_empty(session, StatusCode::SERVICE_UNAVAILABLE).await?;
+            return Ok(true);
+        }
         ctx.original_uri = session.req_header().uri.clone();
         ctx.original_host = session.req_header().headers.get(HOST).cloned();
         let original = ctx

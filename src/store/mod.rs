@@ -48,6 +48,12 @@ pub enum StoreError {
     Message(String),
     #[error("Redis {operation} operation failed")]
     Backend { operation: &'static str },
+    /// A remote mutation was dispatched, but its reply was lost.
+    ///
+    /// The backend may or may not contain the mutation. Callers must fail stop
+    /// and recover by loading authoritative state into a new registry/process.
+    #[error("Redis {operation} operation outcome is indeterminate")]
+    Indeterminate { operation: &'static str },
     #[error("Redis {operation} found a corrupt route record for {key:?}")]
     CorruptData {
         operation: &'static str,
@@ -63,6 +69,11 @@ impl StoreError {
 }
 
 /// Persistent route operations required by the registry.
+///
+/// Ordinary errors guarantee that backend state was not changed by the failed
+/// operation. [`StoreError::Indeterminate`] instead means a dispatched remote
+/// mutation has an unknown outcome and requires fail-stop plus authoritative
+/// reload; later reads must never be used to infer which writer produced state.
 #[async_trait]
 pub trait Store: Send + Sync {
     async fn snapshot(&self) -> Result<BTreeMap<RouteKey, RouteData>, StoreError>;
@@ -87,7 +98,8 @@ pub trait Store: Send + Sync {
     ///
     /// Every backend must sample `activity_floor` inside the same lock or
     /// transaction as the replacement, immediately before its atomic commit.
-    /// An error must leave backend state unchanged.
+    /// An ordinary error must leave backend state unchanged. An indeterminate
+    /// error follows the fail-stop/reload contract documented on [`Store`].
     async fn put_preserving_activity(
         &self,
         key: RouteKey,
