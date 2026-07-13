@@ -280,4 +280,19 @@ mod tests {
             0
         );
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_pid_parent_is_rejected_before_file_creation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temporary unsafe PID directory");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o777))
+            .expect("make PID directory unsafe");
+        let path = directory.path().join("proxy.pid");
+
+        assert!(PidFileGuard::acquire(&path).is_err());
+        assert!(!path.exists(), "unsafe parent received a PID file");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
 }

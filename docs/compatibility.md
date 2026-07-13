@@ -74,23 +74,28 @@ watermark, and two seconds draining admitted HTTP/WebSocket traffic. Pingora's
 ten-second grace period strictly contains that nine-second sequential bound;
 final Tokio runtime teardown has its own one-second bound.
 
-On supported Unix targets, PID and UDS owners retain an open descriptor for the
-original canonical parent. Before publication staging, descriptor metadata must
-identify a directory whose group/other write bits are clear or whose sticky bit
-is set. This permits private application directories and `/tmp`-style parents,
-while rejecting non-sticky shared writable parents before debris is created.
-The invariant is rechecked before descriptor-backed child binding, publication,
-and guarded cleanup. UDS publication and cleanup are dirfd-relative.
+On supported Unix targets, PID and UDS owners authenticate every component from
+the filesystem root through the full canonical parent, and retain a descriptor
+for that parent. Every component must be owned by root or the process effective
+UID. Group/other-writable components are accepted only when also sticky and
+owned by root or the effective UID, permitting an authoritative `/tmp` while
+rejecting untrusted rename authority. Extended ACLs are rejected where the
+target supports authoritative ACL inspection; Unix targets without that support
+fail closed. These invariants are rechecked before pathname-dependent binding
+and publication. Linux uses descriptor-backed stable paths; on Apple, pathname
+stability instead derives from reauthentication of the complete ancestor chain
+around stable-path resolution. PID creation uses the same boundary.
+
 Cleanup atomically moves the public entry into an unpredictable mode-0700
-private directory, verifies and unlinks the candidate through that directory's
-descriptor, and removes the empty private directory during ordinary cleanup.
+private directory, verifies and unlinks the candidate through that retained
+directory descriptor, and removes the empty private directory during ordinary
+cleanup. The unlink itself is not claimed to be atomic with verification.
 A foreign replacement is restored with no-replace semantics; a restoration
 collision preserves both entries for diagnosis. This closes the public-parent
 verify/unlink race against separate-UID namespace attackers under normal Unix
 permission enforcement. Unix does not isolate processes sharing the service
-UID: a same-UID actor able to mutate the parent namespace is explicitly outside
-the enforceable trust boundary, so this is not claimed as a mathematical
-absolute against same-UID interference.
+UID, and root can bypass ordinary permission checks: same-UID and root actors
+are explicitly outside the enforceable trust boundary.
 
 Public-listener exit/readiness and descriptor ownership guards exist before
 the first await or FD handoff. Cancellation while Pingora's shared FD table is
@@ -102,17 +107,16 @@ completion callback and `Drop`, including panic and cancellation unwinding.
 The non-owning raw-FD guard remains armed after table insertion until Pingora's
 listener construction has completed; successful adoption explicitly disarms
 it. UDS prebinding opens the canonical parent before bind and continues through
-its descriptor-backed stable path if the configured parent alias is replaced.
+its authority-checked stable path if the configured parent alias is replaced.
 Immediately after creating a cryptographically named stage with `mkdirat`, a
-provisional guard is armed. The subsequent `openat(O_DIRECTORY|O_NOFOLLOW)` is
-authenticated by `fstat`: before any chmod or child use, the opened object must
-be a directory owned by the process effective UID whose permission bits are a
-subset of 0700. Only that authenticated descriptor is normalized with `fchmod`
-to 0700, then rechecked for exact mode and retained identity. Pathname metadata
-is used only to confirm that the parent entry still names that identity. This
-owner check covers replacement by other UIDs even when the proxy itself is
-privileged; Unix permissions still cannot isolate an attacker sharing the
-effective UID.
+provisional guard is armed. A nofollow `statat` must identify a directory owned
+by the effective UID whose permission bits are a subset of 0700. This accepts a
+mode-000 result from a fully restrictive umask; descriptor-relative `chmodat`
+normalizes it to exact mode 0700 before `openat(O_DIRECTORY|O_NOFOLLOW)`, then
+the opened descriptor is rechecked for identity, owner, exact mode, and ACL
+authority before child use. This owner check covers replacement by other UIDs
+even when the proxy itself is privileged; same-UID and root attackers remain
+outside the boundary.
 
 The socket is bound inside that authenticated private stage, verified by exact
 device, inode, and socket type, changed to mode 0660 with descriptor-relative

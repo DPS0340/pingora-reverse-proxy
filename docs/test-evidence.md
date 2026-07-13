@@ -806,3 +806,38 @@ files on each side and exactly the established three vendor deltas:
 `src/listeners/l4.rs`, `src/listeners/mod.rs`, and
 `src/services/listening.rs`. No Task 9 implementation or unrelated refactor was
 added.
+
+### Task 8 canonical namespace authority closure (2026-07-13)
+
+The final namespace-authority review authenticates the full canonical ancestor
+chain from the filesystem root. Components must be root/effective-UID-owned;
+sticky mode authorizes shared writes only for those owners. Supported Unix ACL
+interfaces reject extended authority, with fail-closed behavior elsewhere.
+Apple pathname stability is derived from ancestor reauthentication rather than
+descriptor-relative bind. PID creation shares this boundary. Fully restrictive
+umask stages are authenticated and normalized through safe-parent
+`statat`/`chmodat` before open. Cleanup remains anchored to retained descriptors;
+only quarantine movement is atomic, not verification plus unlink. Same-UID and
+root attackers remain excluded from the enforceable boundary.
+
+The focused safe-parent, ancestor, ACL, umask, PID, acquisition, and staging
+group passed `20/20` rounds across 21 named contracts (`420/420` executions).
+The prior raw-FD/private-namespace eight-contract group passed `20/20` rounds
+(`160/160`). The complete 61-test library harness passed `100/100` runs under
+default parallel scheduling (`6,100/6,100`), including its isolated mode-000
+child contracts. Focused TLS/Unix and WebSocket suites passed `22/22` and
+`4/4`.
+
+`PROPTEST_CASES=256 cargo test --all-targets --all-features` passed `272/272`:
+library `61`, binary `0`, API `33`, config `27`, proxy `69`, routes `11`, store
+`45`, TLS/Unix `22`, and WebSocket `4`. `PROPTEST_CASES=512 cargo test --test
+route_properties` passed `11/11`. Formatting, warnings-denied Clippy, complete
+checking, whitespace validation, vendor comparison, and final diff review
+passed. The sole build warning remained the established vendored OpenSSL
+deprecation outside the `--no-deps` Clippy scope.
+
+The checksum-verified Pingora 0.8.1 registry comparison remains exactly 114
+files on each side with only the established three vendor deltas:
+`src/listeners/l4.rs`, `src/listeners/mod.rs`, and
+`src/services/listening.rs`. No vendor target, Task 9 work, or unrelated change
+was added.

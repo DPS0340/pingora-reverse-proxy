@@ -93,6 +93,8 @@ pub(crate) struct OwnedPath {
     directory_path: PathBuf,
     #[cfg(unix)]
     public_name: OsString,
+    #[cfg(unix)]
+    boundary: AuthenticatedBoundary,
 }
 
 /// An opened parent directory and entry name captured before any pathname use.
@@ -100,6 +102,7 @@ pub(crate) struct OwnedPath {
 pub(crate) struct AnchoredDirectory {
     directory: File,
     directory_path: PathBuf,
+    boundary: AuthenticatedBoundary,
 }
 
 /// A cryptographically named, identity-anchored 0700 directory below a retained parent.
@@ -107,6 +110,7 @@ pub(crate) struct AnchoredDirectory {
 pub(crate) struct PrivateDirectory {
     parent: File,
     parent_path: PathBuf,
+    parent_boundary: AuthenticatedBoundary,
     name: OsString,
     directory: File,
     identity: FileIdentity,
@@ -114,14 +118,156 @@ pub(crate) struct PrivateDirectory {
 }
 
 #[cfg(unix)]
+#[derive(Clone)]
+struct AuthenticatedBoundary {
+    canonical_path: PathBuf,
+    components: Vec<BoundaryComponent>,
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+struct BoundaryComponent {
+    identity: FileIdentity,
+    name: Option<OsString>,
+    owner: libc::uid_t,
+    rename_authority: u32,
+}
+
+#[cfg(unix)]
+impl AuthenticatedBoundary {
+    fn capture(path: &Path) -> io::Result<(Self, File)> {
+        use std::path::Component;
+
+        let canonical_path = fs::canonicalize(path)?;
+        let mut components = Vec::new();
+        let mut directory = open_directory(Path::new("/"))?;
+        let authority = authenticate_boundary_directory(&directory)?;
+        components.push(BoundaryComponent {
+            identity: FileIdentity::from_file(&directory)?,
+            name: None,
+            owner: authority.owner,
+            rename_authority: authority.rename_authority,
+        });
+
+        for component in canonical_path.components() {
+            let Component::Normal(name) = component else {
+                continue;
+            };
+            let child = open_directory_at(&directory, name)?;
+            let authority = authenticate_boundary_directory(&child)?;
+            let identity = FileIdentity::from_file(&child)?;
+            authenticate_child_identity(&directory, name, identity)?;
+            components.push(BoundaryComponent {
+                identity,
+                name: Some(name.to_owned()),
+                owner: authority.owner,
+                rename_authority: authority.rename_authority,
+            });
+            directory = child;
+        }
+
+        let boundary = Self {
+            canonical_path,
+            components,
+        };
+        Ok((boundary, directory))
+    }
+
+    fn authenticate(&self) -> io::Result<()> {
+        self.authenticate_prefix(self.components.len()).map(drop)
+    }
+
+    /// Reauthenticate every pathname ancestor, while treating the retained
+    /// final dirfd as the authority for descriptor-relative operations.
+    fn authenticate_ancestors(&self) -> io::Result<()> {
+        self.authenticate_prefix(self.components.len().saturating_sub(1))
+            .map(drop)
+    }
+
+    fn authenticate_prefix(&self, count: usize) -> io::Result<File> {
+        let mut directory = open_directory(Path::new("/"))?;
+        for (index, component) in self.components.iter().take(count).enumerate() {
+            if index != 0 {
+                let name = component.name.as_deref().expect("non-root component name");
+                let child = open_directory_at(&directory, name)?;
+                authenticate_child_identity(&directory, name, component.identity)?;
+                directory = child;
+            }
+            let authority = authenticate_boundary_directory(&directory)?;
+            if FileIdentity::from_file(&directory)? != component.identity
+                || authority.owner != component.owner
+                || authority.rename_authority != component.rename_authority
+            {
+                return Err(io::Error::other(
+                    "boundary component identity or authority changed",
+                ));
+            }
+        }
+        Ok(directory)
+    }
+
+    fn directory_identity(&self) -> FileIdentity {
+        self.components
+            .last()
+            .expect("authenticated boundary has root")
+            .identity
+    }
+
+    fn authenticate_retained(&self, directory: &File) -> io::Result<()> {
+        let expected = self
+            .components
+            .last()
+            .expect("authenticated boundary has root");
+        let authority = authenticate_boundary_directory(directory)?;
+        if FileIdentity::from_file(directory)? != expected.identity
+            || authority.owner != expected.owner
+            || authority.rename_authority != expected.rename_authority
+        {
+            return Err(io::Error::other(
+                "retained boundary descriptor identity or authority changed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn authenticate_retained_with_ancestors(&self, directory: &File) -> io::Result<()> {
+        self.authenticate_ancestors()?;
+        self.authenticate_retained(directory)
+    }
+
+    fn with_child(
+        &self,
+        name: OsString,
+        directory: &File,
+        identity: FileIdentity,
+    ) -> io::Result<Self> {
+        let mut boundary = self.clone();
+        let authority = authenticate_boundary_directory(directory)?;
+        if FileIdentity::from_file(directory)? != identity {
+            return Err(io::Error::other(
+                "boundary child descriptor identity changed",
+            ));
+        }
+        boundary.canonical_path.push(&name);
+        boundary.components.push(BoundaryComponent {
+            identity,
+            name: Some(name),
+            owner: authority.owner,
+            rename_authority: authority.rename_authority,
+        });
+        Ok(boundary)
+    }
+}
+
+#[cfg(unix)]
 impl AnchoredDirectory {
     pub(crate) fn capture(parent: &Path) -> io::Result<Self> {
-        let directory_path = fs::canonicalize(parent)?;
-        let directory = open_directory(&directory_path)?;
-        authenticate_publication_parent(&directory)?;
+        let (boundary, directory) = AuthenticatedBoundary::capture(parent)?;
+        let directory_path = boundary.canonical_path.clone();
         Ok(Self {
             directory,
             directory_path,
+            boundary,
         })
     }
 
@@ -133,64 +279,43 @@ impl AnchoredDirectory {
     where
         F: FnMut(PublicationDirectoryStage) -> io::Result<()>,
     {
-        authenticate_publication_parent(&self.directory)?;
+        self.boundary
+            .authenticate_retained_with_ancestors(&self.directory)?;
         for _ in 0..QUARANTINE_ATTEMPTS {
             let name = random_stage_name()?;
-            match rustix::fs::mkdirat(
+            let created = create_authenticated_private_directory(
                 &self.directory,
+                &self.boundary,
                 &name,
-                rustix::fs::Mode::from_raw_mode(0o700),
-            ) {
-                Ok(()) => {}
-                Err(error) if error == rustix::io::Errno::EXIST => continue,
-                Err(error) => return Err(io::Error::from_raw_os_error(error.raw_os_error())),
-            }
-            let mut provisional_guard = ProvisionalPrivateDirectoryGuard {
-                parent: &self.directory,
-                name: name.clone(),
-                effective_uid: unsafe { libc::geteuid() },
-                armed: true,
+                false,
+                |stage| match stage {
+                    PrivateDirectoryCreationStage::Open => fault(PublicationDirectoryStage::Open),
+                    PrivateDirectoryCreationStage::Identity => {
+                        fault(PublicationDirectoryStage::Identity)
+                    }
+                    PrivateDirectoryCreationStage::InitialStat
+                    | PrivateDirectoryCreationStage::Chmod => Ok(()),
+                },
+            );
+            let (directory, identity) = match created {
+                Ok(created) => created,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
             };
-            fault(PublicationDirectoryStage::Open)?;
-            let directory = rustix::fs::openat(
-                &self.directory,
-                &name,
-                rustix::fs::OFlags::RDONLY
-                    | rustix::fs::OFlags::DIRECTORY
-                    | rustix::fs::OFlags::CLOEXEC
-                    | rustix::fs::OFlags::NOFOLLOW,
-                rustix::fs::Mode::empty(),
-            )
-            .map(File::from)
-            .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
-            fault(PublicationDirectoryStage::Identity)?;
-            let identity = authenticate_private_directory(&directory)?;
             let mut guard = PrivateNamespaceGuard {
                 parent: &self.directory,
+                boundary: &self.boundary,
                 name: name.clone(),
                 identity,
                 armed: true,
             };
-            provisional_guard.armed = false;
-            let published = rustix::fs::statat(
-                &self.directory,
-                &name,
-                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-            )
-            .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
-            if identity.device != published.st_dev as u64
-                || identity.inode != published.st_ino
-                || published.st_mode as u32 & libc::S_IFMT as u32 != libc::S_IFDIR as u32
-            {
-                return Err(io::Error::other(
-                    "private publication directory changed before verification",
-                ));
-            }
             let parent = self.directory.try_clone()?;
+            let parent_boundary = self.boundary.clone();
             guard.armed = false;
             return Ok(PrivateDirectory {
                 parent,
                 parent_path: self.directory_path.clone(),
+                parent_boundary,
                 name,
                 directory,
                 identity,
@@ -205,54 +330,223 @@ impl AnchoredDirectory {
 }
 
 #[cfg(unix)]
-fn authenticate_private_directory(directory: &File) -> io::Result<FileIdentity> {
-    use std::os::unix::fs::MetadataExt;
-
-    let metadata = directory.metadata()?;
-    let effective_uid = unsafe { libc::geteuid() };
-    if metadata.mode() & libc::S_IFMT as u32 != libc::S_IFDIR as u32
-        || metadata.uid() != effective_uid
-        || metadata.mode() & 0o7777 & !0o700 != 0
-    {
-        return Err(io::Error::other(
-            "private publication directory failed type, owner, or mode authentication",
-        ));
-    }
-    rustix::fs::fchmod(directory, rustix::fs::Mode::from_raw_mode(0o700))
-        .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
-    let normalized = directory.metadata()?;
-    if normalized.mode() & libc::S_IFMT as u32 != libc::S_IFDIR as u32
-        || normalized.uid() != effective_uid
-        || normalized.mode() & 0o7777 != 0o700
-    {
-        return Err(io::Error::other(
-            "private publication directory failed normalized authentication",
-        ));
-    }
-    FileIdentity::from_metadata(&normalized)
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PrivateDirectoryCreationStage {
+    Open,
+    InitialStat,
+    Chmod,
+    Identity,
 }
 
 #[cfg(unix)]
-fn authenticate_publication_parent(directory: &File) -> io::Result<()> {
+fn create_authenticated_private_directory<F>(
+    parent: &File,
+    boundary: &AuthenticatedBoundary,
+    name: &OsStr,
+    preserve_on_open_fault: bool,
+    mut fault: F,
+) -> io::Result<(File, FileIdentity)>
+where
+    F: FnMut(PrivateDirectoryCreationStage) -> io::Result<()>,
+{
+    use std::os::unix::fs::MetadataExt;
+
+    let effective_uid = unsafe { libc::geteuid() };
+    rustix::fs::mkdirat(parent, name, rustix::fs::Mode::from_raw_mode(0o700))
+        .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+    let mut provisional_guard = ProvisionalPrivateDirectoryGuard {
+        parent,
+        boundary,
+        name: name.to_owned(),
+        effective_uid,
+        armed: true,
+    };
+    if let Err(error) = fault(PrivateDirectoryCreationStage::Open) {
+        if preserve_on_open_fault {
+            provisional_guard.armed = false;
+        }
+        return Err(error);
+    }
+
+    let initial = rustix::fs::statat(parent, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+    if initial.st_mode as u32 & libc::S_IFMT as u32 != libc::S_IFDIR as u32
+        || initial.st_uid != effective_uid
+        || initial.st_mode as u32 & 0o7777 & !0o700 != 0
+    {
+        return Err(io::Error::other(
+            "private directory failed provisional type, owner, or mode authentication",
+        ));
+    }
+    let identity = FileIdentity {
+        device: initial.st_dev as u64,
+        inode: initial.st_ino,
+    };
+    let mut identity_guard = PrivateNamespaceGuard {
+        parent,
+        boundary,
+        name: name.to_owned(),
+        identity,
+        armed: true,
+    };
+    provisional_guard.armed = false;
+
+    fault(PrivateDirectoryCreationStage::InitialStat)?;
+    fault(PrivateDirectoryCreationStage::Chmod)?;
+    chmodat_portable(parent, name, 0o700)?;
+    let normalized = rustix::fs::statat(parent, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+    if normalized.st_dev as u64 != identity.device
+        || normalized.st_ino != identity.inode
+        || normalized.st_mode as u32 & libc::S_IFMT as u32 != libc::S_IFDIR as u32
+        || normalized.st_uid != effective_uid
+        || normalized.st_mode as u32 & 0o7777 != 0o700
+    {
+        return Err(io::Error::other(
+            "private directory failed normalized identity authentication",
+        ));
+    }
+    fault(PrivateDirectoryCreationStage::Identity)?;
+
+    let directory = open_directory_at(parent, name)?;
+    let opened = directory.metadata()?;
+    if FileIdentity::from_metadata(&opened)? != identity
+        || opened.mode() & libc::S_IFMT as u32 != libc::S_IFDIR as u32
+        || opened.uid() != effective_uid
+        || opened.mode() & 0o7777 != 0o700
+    {
+        return Err(io::Error::other(
+            "opened private directory failed identity authentication",
+        ));
+    }
+    authenticate_directory_acl(&directory)?;
+    identity_guard.armed = false;
+    Ok((directory, identity))
+}
+
+#[cfg(unix)]
+fn boundary_mode_is_safe(mode: u32, owner: libc::uid_t, effective_uid: libc::uid_t) -> bool {
+    (owner == effective_uid || owner == 0)
+        && (mode & 0o022 == 0 || mode & libc::S_ISVTX as u32 != 0)
+}
+
+#[cfg(unix)]
+struct BoundaryAuthority {
+    owner: libc::uid_t,
+    rename_authority: u32,
+}
+
+#[cfg(unix)]
+fn authenticate_boundary_directory(directory: &File) -> io::Result<BoundaryAuthority> {
     use std::os::unix::fs::MetadataExt;
 
     let metadata = directory.metadata()?;
     let mode = metadata.mode();
     if mode & libc::S_IFMT as u32 != libc::S_IFDIR as u32
-        || mode & 0o022 != 0 && mode & libc::S_ISVTX as u32 == 0
+        || !boundary_mode_is_safe(mode, metadata.uid(), unsafe { libc::geteuid() })
     {
         return Err(io::Error::other(
-            "publication parent must be a directory without shared writes or with sticky mode",
+            "boundary directory owner or rename authority is unsafe",
         ));
     }
+    authenticate_directory_acl(directory)?;
+    Ok(BoundaryAuthority {
+        owner: metadata.uid(),
+        rename_authority: mode & (libc::S_ISVTX as u32 | 0o022),
+    })
+}
+
+#[cfg(unix)]
+fn authenticate_child_identity(
+    parent: &File,
+    name: &OsStr,
+    identity: FileIdentity,
+) -> io::Result<()> {
+    let stat = rustix::fs::statat(parent, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+    if stat.st_mode as u32 & libc::S_IFMT as u32 != libc::S_IFDIR as u32
+        || stat.st_dev as u64 != identity.device
+        || stat.st_ino != identity.inode
+    {
+        return Err(io::Error::other("boundary path component identity changed"));
+    }
     Ok(())
+}
+
+#[cfg(target_vendor = "apple")]
+fn authenticate_directory_acl(directory: &File) -> io::Result<()> {
+    use std::ffi::c_void;
+    use std::ptr;
+
+    type Acl = *mut c_void;
+    unsafe extern "C" {
+        fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> Acl;
+        fn acl_get_entry(acl: Acl, entry_id: libc::c_int, entry: *mut *mut c_void) -> libc::c_int;
+        fn acl_free(object: *mut c_void) -> libc::c_int;
+    }
+
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x100;
+    const ACL_FIRST_ENTRY: libc::c_int = 0;
+    let acl = unsafe { acl_get_fd_np(directory.as_raw_fd(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ENOENT | libc::ENOATTR | libc::ENOTSUP) => Ok(()),
+            _ => Err(error),
+        };
+    }
+    let mut entry = ptr::null_mut();
+    let result = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) };
+    let entry_error = (result == -1).then(io::Error::last_os_error);
+    let free_result = unsafe { acl_free(acl) };
+    if free_result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    match result {
+        0 => Err(io::Error::other("boundary directory has an extended ACL")),
+        -1 if entry_error.as_ref().and_then(io::Error::raw_os_error) == Some(libc::EINVAL) => {
+            Ok(())
+        }
+        -1 => Err(entry_error.expect("acl_get_entry failure captured errno")),
+        _ => Err(io::Error::other("acl_get_entry returned an invalid result")),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn authenticate_directory_acl(directory: &File) -> io::Result<()> {
+    for name in ["system.posix_acl_access", "system.posix_acl_default"] {
+        match rustix::fs::fgetxattr(directory, name, Vec::new()) {
+            Ok(_) | Err(rustix::io::Errno::RANGE) => {
+                return Err(io::Error::other("boundary directory has a POSIX ACL"));
+            }
+            Err(error)
+                if error == rustix::io::Errno::NODATA || error == rustix::io::Errno::NOTSUP => {}
+            Err(error) => return Err(io::Error::from_raw_os_error(error.raw_os_error())),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+))]
+fn authenticate_directory_acl(_directory: &File) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "boundary ACL authority cannot be verified on this Unix target",
+    ))
 }
 
 #[cfg(unix)]
 impl PrivateDirectory {
     pub(crate) fn stable_path(&self) -> io::Result<PathBuf> {
-        authenticate_publication_parent(&self.parent)?;
-        stable_directory_path(&self.directory)
+        self.parent_boundary
+            .authenticate_retained_with_ancestors(&self.parent)?;
+        let path = stable_directory_path(&self.directory)?;
+        self.parent_boundary
+            .authenticate_retained_with_ancestors(&self.parent)?;
+        Ok(path)
     }
 
     pub(crate) fn own_entry(&self, name: OsString) -> io::Result<OwnedPath> {
@@ -273,6 +567,11 @@ impl PrivateDirectory {
             directory: self.directory.try_clone()?,
             directory_path: self.parent_path.join(&self.name),
             public_name: name,
+            boundary: self.parent_boundary.with_child(
+                self.name.clone(),
+                &self.directory,
+                self.identity,
+            )?,
         })
     }
 
@@ -308,7 +607,11 @@ impl Drop for PrivateDirectory {
             return;
         }
         self.active = false;
-        if authenticate_publication_parent(&self.parent).is_err() {
+        if self
+            .parent_boundary
+            .authenticate_retained(&self.parent)
+            .is_err()
+        {
             return;
         }
         let matches = rustix::fs::statat(
@@ -374,8 +677,9 @@ impl OwnedPath {
                 })?
                 .to_owned();
             let parent = path.parent().unwrap_or_else(|| Path::new("."));
-            let directory_path = fs::canonicalize(parent)?;
-            let directory = open_directory(&directory_path)?;
+            let (boundary, directory) = AuthenticatedBoundary::capture(parent)?;
+            let directory_path = boundary.canonical_path.clone();
+            boundary.authenticate_retained_with_ancestors(&directory)?;
             let descriptor = rustix::fs::openat(
                 &directory,
                 &public_name,
@@ -395,6 +699,7 @@ impl OwnedPath {
                 directory,
                 directory_path,
                 public_name,
+                boundary,
             };
             Ok((file, owner))
         }
@@ -420,8 +725,8 @@ impl OwnedPath {
             })?
             .to_owned();
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        let directory_path = fs::canonicalize(parent)?;
-        let directory = open_directory(&directory_path)?;
+        let (boundary, directory) = AuthenticatedBoundary::capture(parent)?;
+        let directory_path = boundary.canonical_path.clone();
         let stat = rustix::fs::statat(
             &directory,
             &public_name,
@@ -438,6 +743,7 @@ impl OwnedPath {
             directory,
             directory_path,
             public_name,
+            boundary,
         })
     }
 
@@ -457,15 +763,25 @@ impl OwnedPath {
 
     #[cfg(unix)]
     pub(crate) fn stable_entry_path(&self) -> io::Result<PathBuf> {
-        Ok(stable_directory_path(&self.directory)?.join(&self.public_name))
+        self.boundary
+            .authenticate_retained_with_ancestors(&self.directory)?;
+        let path = stable_directory_path(&self.directory)?.join(&self.public_name);
+        self.boundary
+            .authenticate_retained_with_ancestors(&self.directory)?;
+        Ok(path)
     }
 
     #[cfg(unix)]
     pub(crate) fn configured_entry_matches(&self) -> io::Result<bool> {
+        if self.boundary.authenticate().is_err() {
+            return Ok(false);
+        }
         let parent = self.public_path.parent().unwrap_or_else(|| Path::new("."));
         let reopened_path = fs::canonicalize(parent)?;
         let reopened = open_directory(&reopened_path)?;
-        if FileIdentity::from_file(&reopened)? != FileIdentity::from_file(&self.directory)? {
+        if FileIdentity::from_file(&reopened)? != self.boundary.directory_identity()
+            || FileIdentity::from_file(&reopened)? != FileIdentity::from_file(&self.directory)?
+        {
             return Ok(false);
         }
         let stat = rustix::fs::statat(
@@ -502,8 +818,11 @@ impl OwnedPath {
         path: PathBuf,
         destination_name: OsString,
     ) -> io::Result<()> {
-        authenticate_publication_parent(&destination.directory)?;
+        destination
+            .boundary
+            .authenticate_retained_with_ancestors(&destination.directory)?;
         let destination_directory = destination.directory.try_clone()?;
+        let destination_boundary = destination.boundary.clone();
         rename_relative_noreplace(
             &self.directory,
             &self.public_name,
@@ -511,6 +830,7 @@ impl OwnedPath {
             &destination_name,
         )?;
         self.directory = destination_directory;
+        self.boundary = destination_boundary;
         self.directory_path = destination.directory_path.clone();
         self.public_name = destination_name;
         self.public_path = path;
@@ -592,58 +912,35 @@ impl OwnedPath {
     where
         F: FnMut(NamespaceStage) -> io::Result<()>,
     {
-        authenticate_publication_parent(&self.directory)?;
+        self.boundary.authenticate_retained(&self.directory)?;
         for _ in 0..QUARANTINE_ATTEMPTS {
             let private_name = random_private_name()?;
-            match rustix::fs::mkdirat(
+            let created = create_authenticated_private_directory(
                 &self.directory,
+                &self.boundary,
                 &private_name,
-                rustix::fs::Mode::from_raw_mode(0o700),
-            ) {
-                Ok(()) => {}
-                Err(error) if error == rustix::io::Errno::EXIST => continue,
-                Err(error) => return Err(io::Error::from_raw_os_error(error.raw_os_error())),
-            }
-            fault(NamespaceStage::Open)?;
-            let private_directory = match rustix::fs::openat(
-                &self.directory,
-                &private_name,
-                rustix::fs::OFlags::RDONLY
-                    | rustix::fs::OFlags::DIRECTORY
-                    | rustix::fs::OFlags::CLOEXEC
-                    | rustix::fs::OFlags::NOFOLLOW,
-                rustix::fs::Mode::empty(),
-            ) {
-                Ok(descriptor) => File::from(descriptor),
-                Err(error) => {
-                    return Err(io::Error::from_raw_os_error(error.raw_os_error()));
-                }
+                true,
+                |stage| {
+                    fault(match stage {
+                        PrivateDirectoryCreationStage::Open => NamespaceStage::Open,
+                        PrivateDirectoryCreationStage::InitialStat => NamespaceStage::InitialStat,
+                        PrivateDirectoryCreationStage::Chmod => NamespaceStage::Chmod,
+                        PrivateDirectoryCreationStage::Identity => NamespaceStage::Identity,
+                    })
+                },
+            );
+            let (private_directory, directory_identity) = match created {
+                Ok(created) => created,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
             };
-            let directory_identity = authenticate_private_directory(&private_directory)?;
             let mut namespace_guard = PrivateNamespaceGuard {
                 parent: &self.directory,
+                boundary: &self.boundary,
                 name: private_name.clone(),
                 identity: directory_identity,
                 armed: true,
             };
-            fault(NamespaceStage::InitialStat)?;
-            let created = rustix::fs::statat(
-                &self.directory,
-                &private_name,
-                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-            )
-            .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
-            let published_identity = FileIdentity {
-                device: created.st_dev as u64,
-                inode: created.st_ino,
-            };
-            if published_identity != directory_identity {
-                return Err(io::Error::other(
-                    "private cleanup namespace changed before verification",
-                ));
-            }
-            fault(NamespaceStage::Chmod)?;
-            fault(NamespaceStage::Identity)?;
             let quarantine = UnixQuarantine {
                 name: private_name,
                 directory: private_directory,
@@ -836,6 +1133,7 @@ enum PublicationDirectoryStage {
 #[cfg(unix)]
 struct ProvisionalPrivateDirectoryGuard<'a> {
     parent: &'a File,
+    boundary: &'a AuthenticatedBoundary,
     name: OsString,
     effective_uid: libc::uid_t,
     armed: bool,
@@ -847,7 +1145,7 @@ impl Drop for ProvisionalPrivateDirectoryGuard<'_> {
         if !self.armed {
             return;
         }
-        if authenticate_publication_parent(self.parent).is_err() {
+        if self.boundary.authenticate_retained(self.parent).is_err() {
             return;
         }
         let safe_to_remove = rustix::fs::statat(
@@ -870,6 +1168,7 @@ impl Drop for ProvisionalPrivateDirectoryGuard<'_> {
 #[cfg(unix)]
 struct PrivateNamespaceGuard<'a> {
     parent: &'a File,
+    boundary: &'a AuthenticatedBoundary,
     name: OsString,
     identity: FileIdentity,
     armed: bool,
@@ -881,7 +1180,7 @@ impl Drop for PrivateNamespaceGuard<'_> {
         if !self.armed {
             return;
         }
-        if authenticate_publication_parent(self.parent).is_err() {
+        if self.boundary.authenticate_retained(self.parent).is_err() {
             return;
         }
         let matches = rustix::fs::statat(
@@ -903,6 +1202,21 @@ impl Drop for PrivateNamespaceGuard<'_> {
 fn open_directory(path: &Path) -> io::Result<File> {
     rustix::fs::open(
         path,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))
+}
+
+#[cfg(unix)]
+fn open_directory_at(parent: &File, name: &OsStr) -> io::Result<File> {
+    rustix::fs::openat(
+        parent,
+        name,
         rustix::fs::OFlags::RDONLY
             | rustix::fs::OFlags::DIRECTORY
             | rustix::fs::OFlags::CLOEXEC
@@ -998,7 +1312,10 @@ fn rename_noreplace(_source: &Path, _destination: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AnchoredDirectory, NamespaceStage, OwnedPath, PublicationDirectoryStage};
+    use super::{
+        boundary_mode_is_safe, AnchoredDirectory, NamespaceStage, OwnedPath,
+        PublicationDirectoryStage,
+    };
     use std::{fs, io};
 
     #[cfg(unix)]
@@ -1046,6 +1363,83 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn boundary_owner_and_sticky_policy_matches_the_separate_uid_model() {
+        let euid = 501;
+        assert!(boundary_mode_is_safe(0o755, euid, euid));
+        assert!(boundary_mode_is_safe(0o755, 0, euid));
+        assert!(boundary_mode_is_safe(0o1777, euid, euid));
+        assert!(boundary_mode_is_safe(0o1777, 0, euid));
+        assert!(!boundary_mode_is_safe(0o755, euid + 1, euid));
+        assert!(!boundary_mode_is_safe(0o1777, euid + 1, euid));
+        assert!(!boundary_mode_is_safe(0o777, euid, euid));
+        assert!(!boundary_mode_is_safe(0o777, 0, euid));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_canonical_ancestor_is_rejected_before_staging() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("temporary ancestor root");
+        let ancestor = root.path().join("ancestor");
+        let parent = ancestor.join("publication");
+        fs::create_dir_all(&parent).expect("create nested publication parent");
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o777))
+            .expect("make ancestor unsafe");
+
+        assert!(AnchoredDirectory::capture(&parent).is_err());
+        assert_eq!(fs::read_dir(&parent).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_canonical_ancestor_is_rejected_before_staging() {
+        let root = tempfile::tempdir().expect("temporary ancestor replacement root");
+        let ancestor = root.path().join("ancestor");
+        let displaced = root.path().join("displaced");
+        let parent = ancestor.join("publication");
+        fs::create_dir_all(&parent).expect("create nested publication parent");
+        let anchored = AnchoredDirectory::capture(&parent).expect("capture ancestor chain");
+
+        fs::rename(&ancestor, &displaced).expect("displace authenticated ancestor");
+        fs::create_dir_all(&parent).expect("replace ancestor chain");
+
+        assert!(anchored.create_private_directory().is_err());
+        assert_eq!(fs::read_dir(&parent).unwrap().count(), 0);
+        assert_eq!(
+            fs::read_dir(displaced.join("publication")).unwrap().count(),
+            0
+        );
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn extended_acl_on_boundary_directory_is_rejected() {
+        use std::process::Command;
+
+        let root = tempfile::tempdir().expect("temporary ACL boundary");
+        let status = Command::new("/bin/chmod")
+            .args(["+a", "everyone deny delete_child"])
+            .arg(root.path())
+            .status()
+            .expect("install extended ACL");
+        assert!(status.success(), "chmod +a failed");
+        let listing = Command::new("/bin/ls")
+            .args(["-lde"])
+            .arg(root.path())
+            .output()
+            .expect("inspect installed extended ACL");
+        assert!(listing.status.success(), "ls -lde failed");
+        assert!(
+            String::from_utf8_lossy(&listing.stdout).contains("deny delete_child"),
+            "test did not install a non-empty extended ACL"
+        );
+
+        assert!(AnchoredDirectory::capture(root.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn restrictive_umask_is_normalized_and_restored() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
@@ -1078,7 +1472,7 @@ mod tests {
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
             .expect("make restrictive-umask parent private");
         let anchored = AnchoredDirectory::capture(root.path()).expect("capture private parent");
-        let prior = unsafe { libc::umask(0o177) };
+        let prior = unsafe { libc::umask(0o777) };
         let guard = UmaskGuard(prior);
 
         let staging = anchored
@@ -1091,6 +1485,46 @@ mod tests {
         let observed = unsafe { libc::umask(prior) };
         unsafe { libc::umask(observed) };
         assert_eq!(observed, prior, "process umask was not restored");
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fully_restrictive_umask_cleanup_quarantine_leaves_no_debris() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const CHILD: &str = "CHP_CLEANUP_UMASK_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "path_ownership::tests::fully_restrictive_umask_cleanup_quarantine_leaves_no_debris",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .expect("run isolated cleanup-umask contract");
+            assert!(status.success(), "isolated cleanup-umask contract failed");
+            return;
+        }
+
+        struct UmaskGuard(libc::mode_t);
+        impl Drop for UmaskGuard {
+            fn drop(&mut self) {
+                unsafe { libc::umask(self.0) };
+            }
+        }
+
+        let root = tempfile::tempdir().expect("temporary cleanup-umask parent");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let public = root.path().join("owned");
+        fs::write(&public, b"owned").unwrap();
+        let mut owner = OwnedPath::from_path(public.clone()).expect("capture owned entry");
+        let guard = UmaskGuard(unsafe { libc::umask(0o777) });
+
+        assert_eq!(owner.cleanup(), None);
+        drop(guard);
+        assert!(!public.exists());
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
     }
 

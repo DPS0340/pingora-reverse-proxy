@@ -67,29 +67,33 @@ five seconds for terminal mutations, one second for the activity watermark,
 and two seconds for admitted HTTP/WebSocket traffic. Final runtime teardown is
 bounded separately at one second.
 
-Unix PID/UDS publication and cleanup remain anchored to the originally opened
-parent directory. The retained parent must be a directory with no group/other
-writes or with sticky mode, rejecting non-sticky shared writable parents before
-staging while permitting private and `/tmp`-style parents. That invariant is
-rechecked before stable-path child binding, publication, and guarded cleanup.
-Cleanup places the candidate inside an unpredictable 0700
-directory and verifies/unlinks it through that private dirfd, eliminating the
-public-parent verify/unlink window for separate-UID attackers under ordinary
-Unix permissions. Replacement and restoration collisions are preserved, and
-ordinary cleanup removes its private directory. Processes sharing the service
-UID are not isolated by Unix file permissions; same-UID namespace attackers
-are outside this enforceable trust boundary.
+Unix PID/UDS publication authenticates every component from the filesystem root
+through the full canonical parent and retains that parent's descriptor. Each
+component must be owned by root or the effective UID. Group/other-writable
+components are accepted only when sticky and root/effective-UID-owned; extended
+ACLs are rejected where Unix supplies authoritative inspection, and unsupported
+targets fail closed. The authority chain is rechecked before pathname-dependent
+binding and publication. Linux uses descriptor-backed stable paths; Apple
+pathname stability instead follows from complete ancestor reauthentication.
+PID creation uses the same boundary.
+
+Cleanup moves the candidate into an unpredictable 0700 directory and verifies
+and unlinks it through the retained private dirfd. The quarantine move is
+atomic; verification and unlink are not claimed as one atomic identity
+operation. Replacement and restoration collisions are preserved, and ordinary
+cleanup removes its private directory. Same-UID and root namespace attackers
+are outside this enforceable Unix permission boundary.
 
 Public UDS prebinding captures that parent before bind. Immediately after a
 cryptographically named stage is created with `mkdirat`, a provisional cleanup
-guard is armed. `openat(O_DIRECTORY|O_NOFOLLOW)` is followed by authoritative
-`fstat` authentication before any chmod or child use: the opened stage must be a
-directory owned by the process effective UID with permission bits that are a
-subset of 0700. Only then is its descriptor normalized with `fchmod` to 0700;
-an exact-mode recheck captures its identity, while a nofollow parent lookup only
-confirms that the published name still refers to that authenticated object. This
-rejects other-UID replacements even for a privileged proxy; Unix permissions do
-not isolate a process sharing the effective UID.
+guard is armed. A nofollow `statat` first requires a directory owned by the
+effective UID with permissions no more permissive than 0700. Thus a mode-000
+stage created under a fully restrictive umask is normalized by
+descriptor-relative `chmodat` to exact mode 0700 before
+`openat(O_DIRECTORY|O_NOFOLLOW)`. The opened descriptor is then authenticated
+for identity, owner, exact mode, and ACL authority before child use. This
+rejects other-UID replacements even for a privileged proxy; same-UID and root
+attackers remain outside the boundary.
 
 The socket is bound through the authenticated stage descriptor, verified by
 exact device, inode, and socket type, changed to mode 0660 with
