@@ -11,6 +11,7 @@ use thiserror::Error;
 use crate::route::{RouteData, RouteKey};
 
 pub mod memory;
+pub mod redis;
 
 /// A monotonic activity source sampled inside an atomic route replacement.
 #[derive(Clone)]
@@ -45,6 +46,13 @@ impl ActivityFloor {
 pub enum StoreError {
     #[error("{0}")]
     Message(String),
+    #[error("Redis {operation} operation failed")]
+    Backend { operation: &'static str },
+    #[error("Redis {operation} found a corrupt route record for {key:?}")]
+    CorruptData {
+        operation: &'static str,
+        key: String,
+    },
 }
 
 impl StoreError {

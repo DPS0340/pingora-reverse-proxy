@@ -15,9 +15,12 @@ use pingora_reverse_proxy::route_table::{
     MUTATION_PANIC_SEALED_ERROR,
 };
 use pingora_reverse_proxy::store::memory::MemoryStore;
+use pingora_reverse_proxy::store::redis::{RedisStore, RedisStoreConfig, DEFAULT_REDIS_ROUTE_KEY};
 use pingora_reverse_proxy::store::{ActivityFloor, Store, StoreError};
 use proptest::prelude::*;
+use redis::AsyncCommands;
 use serde_json::{json, Map};
+use serial_test::serial;
 use tokio::sync::{Barrier, RwLock, Semaphore};
 
 fn key(path: &str) -> RouteKey {
@@ -105,6 +108,208 @@ async fn assert_store_contract(store: Arc<dyn Store>) {
 #[tokio::test]
 async fn memory_store_satisfies_backend_neutral_contract() {
     assert_store_contract(memory_store()).await;
+}
+
+fn redis_url() -> String {
+    std::env::var("TEST_REDIS_URL").expect("TEST_REDIS_URL must name the disposable Redis")
+}
+
+fn redis_hash_key(test_name: &str) -> String {
+    format!("{DEFAULT_REDIS_ROUTE_KEY}:test:{test_name}")
+}
+
+async fn redis_store(test_name: &str) -> RedisStore {
+    RedisStore::connect(RedisStoreConfig::new(redis_url()).with_key(redis_hash_key(test_name)))
+        .await
+        .unwrap()
+}
+
+async fn clear_redis_hash(test_name: &str) {
+    let client = redis::Client::open(redis_url()).unwrap();
+    let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+    let _: usize = connection.del(redis_hash_key(test_name)).await.unwrap();
+}
+
+#[tokio::test]
+#[serial(redis)]
+async fn redis_store_satisfies_backend_neutral_contract() {
+    const TEST_NAME: &str = "shared-contract";
+    clear_redis_hash(TEST_NAME).await;
+    assert_store_contract(Arc::new(redis_store(TEST_NAME).await)).await;
+    clear_redis_hash(TEST_NAME).await;
+}
+
+#[tokio::test]
+#[serial(redis)]
+async fn redis_overwrite_delete_missing_and_metadata_round_trip() {
+    const TEST_NAME: &str = "metadata";
+    clear_redis_hash(TEST_NAME).await;
+    let store = redis_store(TEST_NAME).await;
+    let route_key = key("//user/alice///");
+    let original = RouteData {
+        target: "http://original.example/base".to_owned(),
+        last_activity: Utc.timestamp_opt(123, 456_000_000).unwrap(),
+        extra: Map::from_iter([
+            ("owner".to_owned(), json!("jupyterhub")),
+            (
+                "nested".to_owned(),
+                json!({"roles": ["user", "admin"], "enabled": true}),
+            ),
+            ("nullable".to_owned(), json!(null)),
+        ]),
+    };
+    store.put(route_key.clone(), original).await.unwrap();
+
+    let replacement = RouteData {
+        target: "https://replacement.example/path?query=1".to_owned(),
+        last_activity: Utc.timestamp_opt(987, 654_000_000).unwrap(),
+        extra: Map::from_iter([
+            ("owner".to_owned(), json!("replacement")),
+            (
+                "arbitrary".to_owned(),
+                json!({"deep": {"array": [1, "two", false]}}),
+            ),
+        ]),
+    };
+    store
+        .put(route_key.clone(), replacement.clone())
+        .await
+        .unwrap();
+
+    assert_eq!(store.snapshot().await.unwrap().len(), 1);
+    assert_eq!(store.snapshot().await.unwrap()[&route_key], replacement);
+    assert_eq!(store.delete(&key("/missing")).await.unwrap(), None);
+    assert_eq!(store.delete(&route_key).await.unwrap(), Some(replacement));
+    clear_redis_hash(TEST_NAME).await;
+}
+
+#[tokio::test]
+#[serial(redis)]
+async fn redis_corrupt_snapshot_is_typed_redacted_and_never_published() {
+    const TEST_NAME: &str = "corrupt-snapshot";
+    clear_redis_hash(TEST_NAME).await;
+    let hash_key = redis_hash_key(TEST_NAME);
+    let client = redis::Client::open(redis_url()).unwrap();
+    let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+    let corrupt = r#"{"target":"http://secret.example","last_activity":false}"#;
+    let _: usize = connection
+        .hset(&hash_key, "/corrupt", corrupt)
+        .await
+        .unwrap();
+
+    let store = Arc::new(redis_store(TEST_NAME).await);
+    let error = match RouteRegistry::load(store).await {
+        Ok(_) => panic!("corrupt Redis data must prevent registry publication"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        StoreError::CorruptData {
+            operation: "snapshot",
+            ..
+        }
+    ));
+    let rendered = error.to_string();
+    assert!(!rendered.contains(corrupt));
+    assert!(!rendered.contains("secret.example"));
+    clear_redis_hash(TEST_NAME).await;
+}
+
+#[tokio::test]
+#[serial(redis)]
+async fn redis_unavailable_startup_is_bounded_typed_and_redacts_credentials() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let secret = "redis-test-password-never-render";
+    let url = format!("redis://default:{secret}@127.0.0.1:{port}/");
+    let config = RedisStoreConfig::new(url);
+    assert!(!format!("{config:?}").contains(secret));
+
+    let error = tokio::time::timeout(Duration::from_secs(3), RedisStore::connect(config))
+        .await
+        .expect("startup must have a finite connection bound")
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::Backend {
+            operation: "connect",
+            ..
+        }
+    ));
+    assert!(!error.to_string().contains(secret));
+}
+
+#[tokio::test]
+#[serial(redis)]
+async fn redis_disconnect_during_mutation_returns_typed_error_without_applying_write() {
+    const TEST_NAME: &str = "disconnect";
+    clear_redis_hash(TEST_NAME).await;
+    let store = redis_store(TEST_NAME).await;
+    let client = redis::Client::open(redis_url()).unwrap();
+    let mut administrator = client.get_multiplexed_async_connection().await.unwrap();
+    let killed: usize = redis::cmd("CLIENT")
+        .arg("KILL")
+        .arg("TYPE")
+        .arg("normal")
+        .arg("SKIPME")
+        .arg("yes")
+        .query_async(&mut administrator)
+        .await
+        .unwrap();
+    assert!(killed >= 1, "the store connection must be disconnected");
+
+    let error = store
+        .put(key("/not-applied"), route("http://not-applied.example"))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::Backend {
+            operation: "put",
+            ..
+        }
+    ));
+
+    let mut verification = client.get_multiplexed_async_connection().await.unwrap();
+    let exists: bool = verification
+        .hexists(redis_hash_key(TEST_NAME), "/not-applied")
+        .await
+        .unwrap();
+    assert!(!exists);
+    clear_redis_hash(TEST_NAME).await;
+}
+
+#[tokio::test]
+#[serial(redis)]
+async fn redis_restart_persistence_recovers_complete_routes_without_clearing() {
+    const TEST_NAME: &str = "restart-persistence";
+    let store = Arc::new(redis_store(TEST_NAME).await);
+    let route_key = key("//persistent/user///");
+    let expected = RouteData {
+        target: "http://persistent.example/base".to_owned(),
+        last_activity: Utc.timestamp_opt(1_234_567, 890_000_000).unwrap(),
+        extra: Map::from_iter([
+            ("owner".to_owned(), json!("restart-test")),
+            (
+                "metadata".to_owned(),
+                json!({"survives": ["process", "restart"]}),
+            ),
+        ]),
+    };
+
+    let registry = RouteRegistry::load(store).await.unwrap();
+    if registry.get(&route_key).is_none() {
+        registry
+            .put(route_key.clone(), expected.clone())
+            .await
+            .unwrap();
+    }
+    drop(registry);
+
+    let reconnected = Arc::new(redis_store(TEST_NAME).await);
+    let reloaded = RouteRegistry::load(reconnected).await.unwrap();
+    assert_eq!(reloaded.get(&route_key), Some(expected));
 }
 
 #[derive(Clone, Debug)]
