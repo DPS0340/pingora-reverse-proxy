@@ -172,6 +172,20 @@ fn differential_script_uses_only_run_labels_for_dynamic_oracle_cleanup() {
         .expect("read differential oracle support");
     assert!(oracle.contains("CHP_ORACLE_RUN_LABEL must be a unique run ownership label"));
     assert!(oracle.contains("command.args([\"--label\", &owner_label])"));
+
+    let differential = std::fs::read_to_string("tests/differential.rs")
+        .expect("read differential integration tests");
+    let probe_start = differential
+        .find("fn oracle_image_runs_actual_node_20_and_exact_chp_source()")
+        .expect("runtime probe test");
+    let probe_end = differential[probe_start..]
+        .find("\nstruct CustomErrorFixture")
+        .map(|offset| probe_start + offset)
+        .expect("runtime probe test boundary");
+    let probe = &differential[probe_start..probe_end];
+    assert!(probe.contains("CHP_ORACLE_RUN_LABEL"));
+    assert!(probe.contains("oracle_run_owner_label_is_valid_for_test"));
+    assert!(probe.contains("\"--label\","));
 }
 
 #[test]

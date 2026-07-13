@@ -739,10 +739,18 @@ fn ordinary_assertion_diagnostics_include_both_bounded_redacted_tails() {
 #[test]
 fn oracle_image_runs_actual_node_20_and_exact_chp_source() {
     let image = std::env::var("CHP_ORACLE_IMAGE").expect("pinned oracle image from gate script");
+    let owner_label = std::env::var("CHP_ORACLE_RUN_LABEL")
+        .expect("CHP_ORACLE_RUN_LABEL must identify the current differential run");
+    assert!(
+        oracle_run_owner_label_is_valid_for_test(Some(&owner_label)),
+        "invalid CHP_ORACLE_RUN_LABEL"
+    );
     let output = std::process::Command::new("docker")
         .args([
             "run",
             "--rm",
+            "--label",
+            &owner_label,
             &image,
             "node",
             "/usr/local/bin/chp-oracle.mjs",

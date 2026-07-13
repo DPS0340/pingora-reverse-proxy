@@ -1042,3 +1042,24 @@ oracle and Docker-assigned Redis. `PROPTEST_CASES=512` route properties passed
 `11/11`. Formatting, Bash/Node syntax, warnings-denied Clippy, debug and release
 checks, whitespace/diff validation, and final resource/process cleanup passed.
 Only the established vendored Pingora OpenSSL deprecation was emitted.
+
+### Task 11 final direct-launch ownership closure (2026-07-13)
+
+A final read-only review found one runtime-probe `docker run --rm` outside the
+shared oracle launcher. It now requires and validates the same per-run owner
+label and passes it with `--label`; the source regression covers both the shared
+launcher and the direct probe block. The strict metric count conversion now
+branches before casting, so the finite exclusive upper bound `2^64` is rejected
+without an eager saturating cast.
+
+On the final patch, focused ownership and finite-overflow tests passed, lifecycle
+passed `9/9`, and the literal standalone Node 20 differential passed `35/35`.
+A fresh, runtime-probed oracle with Docker-assigned Redis completed all targets
+and features (`389/389`) plus `PROPTEST_CASES=512` route properties (`11/11`).
+The ad-hoc zsh gate wrapper itself returned nonzero only after all tests passed
+because `status` is a zsh readonly parameter; its exact project-scoped Redis,
+sidecar, network, and image tag were then removed explicitly. The repository's
+Bash lifecycle script was unaffected and passed its complete `9/9` suite.
+Formatting, Bash/Node syntax, warnings-denied Clippy, debug and release checks,
+whitespace validation, and the final resource audit passed. The sole warning
+remains the established vendored Pingora OpenSSL deprecation.

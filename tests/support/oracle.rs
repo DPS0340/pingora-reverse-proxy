@@ -319,8 +319,12 @@ type CounterValues = BTreeMap<MetricKey, u64>;
 
 fn exact_u64(value: f64) -> Option<u64> {
     const U64_EXCLUSIVE_MAX_AS_F64: f64 = 18_446_744_073_709_551_616.0;
-    (value.is_finite() && (0.0..U64_EXCLUSIVE_MAX_AS_F64).contains(&value) && value.fract() == 0.0)
-        .then_some(value as u64)
+    if value.is_finite() && (0.0..U64_EXCLUSIVE_MAX_AS_F64).contains(&value) && value.fract() == 0.0
+    {
+        Some(value as u64)
+    } else {
+        None
+    }
 }
 type RawHttpObservation = (u16, Vec<(String, Vec<u8>)>, Vec<u8>);
 
