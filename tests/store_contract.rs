@@ -17,6 +17,7 @@ use pingora_reverse_proxy::route_table::{
 };
 use pingora_reverse_proxy::store::memory::MemoryStore;
 use pingora_reverse_proxy::store::redis::{RedisStore, RedisStoreConfig, DEFAULT_REDIS_ROUTE_KEY};
+use pingora_reverse_proxy::store::sidecar::{SidecarConfig, SidecarStore};
 use pingora_reverse_proxy::store::{ActivityFloor, Store, StoreError};
 use proptest::prelude::*;
 use redis::AsyncCommands;
@@ -25,6 +26,14 @@ use serial_test::serial;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Barrier, RwLock, Semaphore};
+
+#[path = "support/sidecar.rs"]
+mod sidecar_support;
+
+use sidecar_support::{
+    chp_timestamp, Fault as SidecarFault, SidecarFixture, DELETE as SIDECAR_DELETE,
+    HEALTH as SIDECAR_HEALTH, PUT as SIDECAR_PUT, SNAPSHOT as SIDECAR_SNAPSHOT,
+};
 
 fn key(path: &str) -> RouteKey {
     RouteKey::parse(path).unwrap()
@@ -52,7 +61,7 @@ fn indeterminate_store_error_is_typed_and_redacted() {
     ));
     assert_eq!(
         error.to_string(),
-        "Redis put operation outcome is indeterminate"
+        "Route store put operation outcome is indeterminate"
     );
 }
 
@@ -125,6 +134,491 @@ async fn assert_store_contract(store: Arc<dyn Store>) {
 #[tokio::test]
 async fn memory_store_satisfies_backend_neutral_contract() {
     assert_store_contract(memory_store()).await;
+}
+
+fn sidecar_config(fixture: &SidecarFixture) -> SidecarConfig {
+    SidecarConfig::new(fixture.base_url())
+        .with_connect_timeout(Duration::from_millis(100))
+        .with_request_timeout(Duration::from_millis(100))
+        .with_retry_policy(3, Duration::from_millis(10), Duration::from_millis(40))
+}
+
+async fn sidecar_store(fixture: &SidecarFixture) -> SidecarStore {
+    SidecarStore::connect(sidecar_config(fixture))
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn sidecar_store_satisfies_backend_neutral_contract() {
+    let fixture = SidecarFixture::start().await;
+    assert_store_contract(Arc::new(sidecar_store(&fixture).await)).await;
+}
+
+#[tokio::test]
+async fn sidecar_connect_requires_exact_health_version_and_status() {
+    for body in [
+        json!({"version": "v2", "status": "ok"}),
+        json!({"version": "v1", "status": "starting"}),
+        json!({"version": "v1", "status": "ok", "extra": true}),
+    ] {
+        let fixture = SidecarFixture::start().await;
+        fixture.set_health_body(body).await;
+        let error = SidecarStore::connect(sidecar_config(&fixture))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            StoreError::Backend {
+                operation: "connect"
+            }
+        ));
+        assert_eq!(fixture.request_count(SIDECAR_HEALTH).await, 1);
+    }
+}
+
+#[tokio::test]
+async fn sidecar_connect_rejects_malformed_health_without_retry() {
+    let fixture = SidecarFixture::start().await;
+    fixture.set_raw_health_body(b"not-json").await;
+
+    let error = SidecarStore::connect(sidecar_config(&fixture))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        StoreError::Backend {
+            operation: "connect"
+        }
+    ));
+    assert_eq!(fixture.request_count(SIDECAR_HEALTH).await, 1);
+}
+
+#[tokio::test]
+async fn sidecar_connect_requires_exact_protocol_response_header() {
+    let fixture = SidecarFixture::start().await;
+    fixture.set_health_protocol("v2").await;
+
+    let error = SidecarStore::connect(sidecar_config(&fixture))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        StoreError::Backend {
+            operation: "connect"
+        }
+    ));
+    assert_eq!(fixture.request_count(SIDECAR_HEALTH).await, 1);
+}
+
+#[tokio::test]
+async fn sidecar_401_is_fixed_and_attempted_once() {
+    let fixture = SidecarFixture::start_with_token(Some("correct-token")).await;
+    let config = sidecar_config(&fixture).with_bearer_token("wrong-token");
+
+    let error = SidecarStore::connect(config).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        StoreError::Backend {
+            operation: "connect"
+        }
+    ));
+    assert_eq!(fixture.request_count(SIDECAR_HEALTH).await, 1);
+}
+
+#[tokio::test]
+async fn sidecar_optional_bearer_auth_authenticates_every_endpoint() {
+    let fixture = SidecarFixture::start_with_token(Some("correct-token")).await;
+    let store = SidecarStore::connect(sidecar_config(&fixture).with_bearer_token("correct-token"))
+        .await
+        .unwrap();
+
+    assert!(store.snapshot().await.unwrap().is_empty());
+    assert_eq!(fixture.request_count(SIDECAR_HEALTH).await, 1);
+    assert_eq!(fixture.request_count(SIDECAR_SNAPSHOT).await, 1);
+}
+
+#[tokio::test]
+async fn sidecar_health_5xx_retries_with_deterministic_attempt_count() {
+    let fixture = SidecarFixture::start().await;
+    fixture
+        .push_fault(SIDECAR_HEALTH, SidecarFault::ServerError)
+        .await;
+    fixture
+        .push_fault(SIDECAR_HEALTH, SidecarFault::ServerError)
+        .await;
+
+    SidecarStore::connect(sidecar_config(&fixture))
+        .await
+        .unwrap();
+
+    assert_eq!(fixture.request_count(SIDECAR_HEALTH).await, 3);
+}
+
+#[tokio::test]
+async fn sidecar_health_transport_timeout_retries_finitely() {
+    let fixture = SidecarFixture::start().await;
+    for _ in 0..3 {
+        fixture
+            .push_fault(SIDECAR_HEALTH, SidecarFault::Timeout)
+            .await;
+    }
+    let config = sidecar_config(&fixture).with_request_timeout(Duration::from_millis(30));
+    let started = tokio::time::Instant::now();
+
+    let error = SidecarStore::connect(config).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        StoreError::Backend {
+            operation: "connect"
+        }
+    ));
+    assert_eq!(fixture.request_count(SIDECAR_HEALTH).await, 3);
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn sidecar_snapshot_retries_transport_and_5xx_with_bounded_backoff() {
+    let fixture = SidecarFixture::start().await;
+    let store = sidecar_store(&fixture).await;
+    fixture
+        .push_fault(SIDECAR_SNAPSHOT, SidecarFault::ServerError)
+        .await;
+    fixture
+        .push_fault(SIDECAR_SNAPSHOT, SidecarFault::Timeout)
+        .await;
+    let started = tokio::time::Instant::now();
+
+    assert!(store.snapshot().await.unwrap().is_empty());
+
+    assert_eq!(fixture.request_count(SIDECAR_SNAPSHOT).await, 3);
+    assert!(started.elapsed() >= Duration::from_millis(45));
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn sidecar_snapshot_malformed_body_is_corrupt_and_not_retried() {
+    let fixture = SidecarFixture::start().await;
+    let store = sidecar_store(&fixture).await;
+    fixture
+        .push_fault(SIDECAR_SNAPSHOT, SidecarFault::MalformedBody)
+        .await;
+
+    let error = store.snapshot().await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        StoreError::CorruptData {
+            operation: "snapshot",
+            ..
+        }
+    ));
+    assert_eq!(fixture.request_count(SIDECAR_SNAPSHOT).await, 1);
+}
+
+#[tokio::test]
+async fn sidecar_put_retries_only_precommit_5xx_with_identical_payload() {
+    let fixture = SidecarFixture::start().await;
+    let store = sidecar_store(&fixture).await;
+    fixture
+        .push_fault(SIDECAR_PUT, SidecarFault::ServerError)
+        .await;
+    fixture
+        .push_fault(SIDECAR_PUT, SidecarFault::ServerError)
+        .await;
+    let expected = route("https://private-target.example/path");
+
+    store.put(key("/retry"), expected.clone()).await.unwrap();
+
+    assert_eq!(fixture.request_count(SIDECAR_PUT).await, 3);
+    let requests = fixture.requests().await;
+    let bodies: Vec<_> = requests
+        .iter()
+        .filter(|request| request.method == http::Method::PUT)
+        .map(|request| request.body.as_slice())
+        .collect();
+    assert_eq!(bodies.len(), 3);
+    assert!(bodies.windows(2).all(|pair| pair[0] == pair[1]));
+    assert_eq!(fixture.routes().await["/retry"], expected);
+}
+
+#[tokio::test]
+async fn sidecar_mutation_5xx_exhaustion_is_backend_and_never_commits() {
+    let fixture = SidecarFixture::start().await;
+    let store = sidecar_store(&fixture).await;
+    for _ in 0..3 {
+        fixture
+            .push_fault(SIDECAR_PUT, SidecarFault::ServerError)
+            .await;
+    }
+
+    let error = store
+        .put(key("/never-committed"), route("http://private.example"))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, StoreError::Backend { operation: "put" }));
+    assert_eq!(fixture.request_count(SIDECAR_PUT).await, 3);
+    assert!(fixture.routes().await.is_empty());
+}
+
+#[tokio::test]
+async fn sidecar_patch_5xx_retries_with_identical_payload() {
+    let fixture = SidecarFixture::start().await;
+    let store = sidecar_store(&fixture).await;
+    store
+        .put(key("/activity"), route("http://activity.example"))
+        .await
+        .unwrap();
+    fixture
+        .push_fault(sidecar_support::ACTIVITY, SidecarFault::ServerError)
+        .await;
+    let at = Utc.timestamp_opt(42, 123).unwrap();
+
+    store.update_activity(&key("/activity"), at).await.unwrap();
+
+    let requests = fixture.requests().await;
+    let bodies: Vec<_> = requests
+        .iter()
+        .filter(|request| request.method == http::Method::PATCH)
+        .map(|request| request.body.as_slice())
+        .collect();
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies[0], bodies[1]);
+    assert_eq!(fixture.routes().await["/activity"].last_activity, at);
+}
+
+#[tokio::test]
+async fn sidecar_mutation_4xx_is_not_retried() {
+    let fixture = SidecarFixture::start().await;
+    let store = sidecar_store(&fixture).await;
+    fixture
+        .push_fault(SIDECAR_PUT, SidecarFault::ClientError)
+        .await;
+
+    let error = store
+        .put(key("/fixed-error"), route("http://target.invalid"))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, StoreError::Backend { operation: "put" }));
+    assert_eq!(fixture.request_count(SIDECAR_PUT).await, 1);
+    assert!(fixture.routes().await.is_empty());
+}
+
+#[tokio::test]
+async fn sidecar_unknown_metadata_and_chp_timestamp_round_trip_exactly() {
+    let fixture = SidecarFixture::start().await;
+    let store = sidecar_store(&fixture).await;
+    let at = Utc.timestamp_opt(123, 456_000_000).unwrap();
+    let expected = RouteData {
+        target: "https://target.example/path?private=true".to_owned(),
+        last_activity: at,
+        extra: Map::from_iter([
+            ("nested".to_owned(), json!({"array": [1, "two", false]})),
+            ("nullable".to_owned(), json!(null)),
+        ]),
+    };
+
+    store.put(key("/metadata"), expected.clone()).await.unwrap();
+
+    assert_eq!(store.snapshot().await.unwrap()[&key("/metadata")], expected);
+    let request = fixture
+        .requests()
+        .await
+        .into_iter()
+        .find(|request| request.method == http::Method::PUT)
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+    assert_eq!(payload["route"]["last_activity"], chp_timestamp(at));
+    assert_eq!(
+        payload["route"]["nested"],
+        json!({"array": [1, "two", false]})
+    );
+}
+
+#[tokio::test]
+async fn sidecar_put_is_idempotent_and_restart_reconnect_preserves_state() {
+    let mut fixture = SidecarFixture::start().await;
+    let store = sidecar_store(&fixture).await;
+    let expected = route("http://persistent.example");
+    store
+        .put(key("/persistent"), expected.clone())
+        .await
+        .unwrap();
+    store
+        .put(key("/persistent"), expected.clone())
+        .await
+        .unwrap();
+    assert_eq!(fixture.routes().await.len(), 1);
+
+    fixture.restart().await;
+    let reconnected = sidecar_store(&fixture).await;
+
+    assert_eq!(
+        reconnected.snapshot().await.unwrap()[&key("/persistent")],
+        expected
+    );
+}
+
+#[tokio::test]
+async fn sidecar_delete_returns_exact_prior_and_404_none() {
+    let fixture = SidecarFixture::start().await;
+    let store = sidecar_store(&fixture).await;
+    let expected = route("http://delete.example");
+    store.put(key("/delete"), expected.clone()).await.unwrap();
+
+    assert_eq!(store.delete(&key("/delete")).await.unwrap(), Some(expected));
+    assert_eq!(store.delete(&key("/delete")).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn sidecar_malformed_delete_200_is_corrupt_and_does_not_publish() {
+    let fixture = SidecarFixture::start().await;
+    let store = Arc::new(sidecar_store(&fixture).await);
+    let registry = RouteRegistry::load(store).await.unwrap();
+    registry
+        .put(key("/delete"), route("http://secret-target.example"))
+        .await
+        .unwrap();
+    fixture
+        .push_fault(SIDECAR_DELETE, SidecarFault::MalformedBody)
+        .await;
+
+    let error = registry.delete(&key("/delete")).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        StoreError::CorruptData {
+            operation: "delete",
+            ..
+        }
+    ));
+    assert!(registry.get(&key("/delete")).is_some());
+    assert!(!error.to_string().contains("secret-target"));
+}
+
+#[tokio::test]
+async fn sidecar_route_key_is_exactly_one_rfc3986_encoded_segment() {
+    let fixture = SidecarFixture::start().await;
+    let store = sidecar_store(&fixture).await;
+    let cases = [
+        ("/", "%2F"),
+        ("//user/alice///", "%2F%2Fuser%2Falice%2F%2F"),
+        ("/with space", "%2Fwith%20space"),
+        ("/percent%", "%2Fpercent%25"),
+        ("/query?", "%2Fquery%3F"),
+        ("/fragment#", "%2Ffragment%23"),
+        ("/한글", "%2F%ED%95%9C%EA%B8%80"),
+    ];
+    for (raw, _) in cases {
+        store
+            .put(key(raw), route("http://encoding.example"))
+            .await
+            .unwrap();
+    }
+
+    let requests = fixture.requests().await;
+    let paths: Vec<_> = requests
+        .iter()
+        .filter(|request| request.method == http::Method::PUT)
+        .map(|request| request.path.as_str())
+        .collect();
+    let expected: Vec<_> = cases
+        .iter()
+        .map(|(_, encoded)| format!("/v1/routes/{encoded}"))
+        .collect();
+    assert_eq!(paths, expected);
+    assert!(paths.iter().all(|path| {
+        path.strip_prefix("/v1/routes/")
+            .is_some_and(|segment| !segment.contains('/'))
+    }));
+}
+
+#[tokio::test]
+async fn sidecar_mutation_reply_loss_is_indeterminate_and_seals_registry() {
+    let fixture = SidecarFixture::start().await;
+    let store = Arc::new(sidecar_store(&fixture).await);
+    let registry = RouteRegistry::load(store).await.unwrap();
+    fixture
+        .push_fault(SIDECAR_PUT, SidecarFault::LoseReply)
+        .await;
+
+    let error = registry
+        .put(key("/uncertain"), route("http://secret-target.example"))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        StoreError::Indeterminate { operation: "put" }
+    ));
+    assert_eq!(registry.mutation_status().seal, MutationSeal::Indeterminate);
+    assert_eq!(
+        registry.consistency_status(),
+        ConsistencyStatus::Indeterminate
+    );
+    assert!(registry.get(&key("/uncertain")).is_none());
+    assert_eq!(fixture.routes().await.len(), 1);
+    assert!(!error.to_string().contains("secret-target"));
+}
+
+#[tokio::test]
+async fn sidecar_delete_reply_loss_is_indeterminate_and_never_retried() {
+    let fixture = SidecarFixture::start().await;
+    let store = sidecar_store(&fixture).await;
+    store
+        .put(key("/uncertain-delete"), route("http://delete.example"))
+        .await
+        .unwrap();
+    fixture
+        .push_fault(SIDECAR_DELETE, SidecarFault::LoseReply)
+        .await;
+
+    let error = store.delete(&key("/uncertain-delete")).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        StoreError::Indeterminate {
+            operation: "delete"
+        }
+    ));
+    assert_eq!(fixture.request_count(SIDECAR_DELETE).await, 1);
+    assert!(fixture.routes().await.is_empty());
+}
+
+#[tokio::test]
+async fn sidecar_config_and_errors_redact_auth_body_and_ambiguous_base_url() {
+    let fixture = SidecarFixture::start_with_token(Some("server-token")).await;
+    let config = sidecar_config(&fixture).with_bearer_token("super-secret-token");
+    assert!(!format!("{config:?}").contains("super-secret-token"));
+    let error = SidecarStore::connect(config).await.unwrap_err();
+    assert!(!error.to_string().contains("super-secret-token"));
+    assert!(!error.to_string().contains("Redis"));
+
+    for ambiguous in [
+        format!("{}nested", fixture.base_url()),
+        format!("{}?query=secret", fixture.base_url()),
+        format!("{}#fragment", fixture.base_url()),
+        fixture
+            .base_url()
+            .replacen("http://", "http://user:secret@", 1),
+    ] {
+        let error = SidecarStore::connect(SidecarConfig::new(ambiguous))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            StoreError::Backend {
+                operation: "connect"
+            }
+        ));
+        assert!(!error.to_string().contains("secret"));
+    }
 }
 
 fn redis_url() -> String {

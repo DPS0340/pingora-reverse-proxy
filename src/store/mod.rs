@@ -12,6 +12,7 @@ use crate::route::{RouteData, RouteKey};
 
 pub mod memory;
 pub mod redis;
+pub mod sidecar;
 
 /// A monotonic activity source sampled inside an atomic route replacement.
 #[derive(Clone)]
@@ -46,15 +47,15 @@ impl ActivityFloor {
 pub enum StoreError {
     #[error("{0}")]
     Message(String),
-    #[error("Redis {operation} operation failed")]
+    #[error("Route store {operation} operation failed")]
     Backend { operation: &'static str },
     /// A remote mutation was dispatched, but its reply was lost.
     ///
     /// The backend may or may not contain the mutation. Callers must fail stop
     /// and recover by loading authoritative state into a new registry/process.
-    #[error("Redis {operation} operation outcome is indeterminate")]
+    #[error("Route store {operation} operation outcome is indeterminate")]
     Indeterminate { operation: &'static str },
-    #[error("Redis {operation} found a corrupt route record for {key:?}")]
+    #[error("Route store {operation} found a corrupt route record for {key:?}")]
     CorruptData {
         operation: &'static str,
         key: String,
