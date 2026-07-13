@@ -316,6 +316,12 @@ struct MetricFamily {
 
 type MetricKey = (String, BTreeMap<String, String>);
 type CounterValues = BTreeMap<MetricKey, u64>;
+
+fn exact_u64(value: f64) -> Option<u64> {
+    const U64_EXCLUSIVE_MAX_AS_F64: f64 = 18_446_744_073_709_551_616.0;
+    (value.is_finite() && (0.0..U64_EXCLUSIVE_MAX_AS_F64).contains(&value) && value.fract() == 0.0)
+        .then_some(value as u64)
+}
 type RawHttpObservation = (u16, Vec<(String, Vec<u8>)>, Vec<u8>);
 
 pub(crate) fn compare_metric_expositions(left: &str, right: &str) -> Result<(), String> {
@@ -412,13 +418,11 @@ fn counter_samples(family: &MetricFamily) -> Result<CounterValues, String> {
     let mut values = BTreeMap::new();
     for (sample_name, samples) in &family.samples {
         for sample in samples {
-            if sample.value.fract() != 0.0 || sample.value < 0.0 {
-                return Err(format!(
-                    "counter {sample_name} is not a non-negative integer"
-                ));
-            }
+            let value = exact_u64(sample.value).ok_or_else(|| {
+                format!("counter {sample_name} is not an in-range non-negative integer")
+            })?;
             let key = (sample_name.clone(), sample.labels.clone());
-            if values.insert(key, sample.value as u64).is_some() {
+            if values.insert(key, value).is_some() {
                 return Err(format!("duplicate counter label set for {sample_name}"));
             }
         }
@@ -432,10 +436,10 @@ fn scalar_delta(before: &MetricFamily, after: &MetricFamily, name: &str) -> Resu
             .samples
             .get(name)
             .ok_or_else(|| format!("missing {name}"))?;
-        if samples.len() != 1 || samples[0].value.fract() != 0.0 || samples[0].value < 0.0 {
+        if samples.len() != 1 {
             return Err(format!("invalid scalar counter {name}"));
         }
-        Ok(samples[0].value as u64)
+        exact_u64(samples[0].value).ok_or_else(|| format!("invalid scalar counter {name}"))
     };
     value(after)?
         .checked_sub(value(before)?)
@@ -684,7 +688,7 @@ fn compare_summary_structure(
             .samples
             .get(&count_name)
             .ok_or_else(|| format!("missing summary count for {name}"))?;
-        if counts.len() != 1 || counts[0].value < 0.0 || counts[0].value.fract() != 0.0 {
+        if counts.len() != 1 || exact_u64(counts[0].value).is_none() {
             return Err(format!("invalid summary count for {name}"));
         }
     }
@@ -1835,14 +1839,10 @@ fn metric_integer_delta(
             .samples
             .get(sample_name)
             .ok_or_else(|| format!("missing {sample_name}"))?;
-        if samples.len() != 1
-            || !samples[0].labels.is_empty()
-            || samples[0].value < 0.0
-            || samples[0].value.fract() != 0.0
-        {
+        if samples.len() != 1 || !samples[0].labels.is_empty() {
             return Err(format!("invalid integer sample {sample_name}"));
         }
-        Ok(samples[0].value as u64)
+        exact_u64(samples[0].value).ok_or_else(|| format!("invalid integer sample {sample_name}"))
     };
     sample(after)?
         .checked_sub(sample(before)?)
@@ -1856,6 +1856,7 @@ async fn spawn_docker_oracle(
 ) -> (DockerOracle, [u16; 3]) {
     let image = std::env::var("CHP_ORACLE_IMAGE")
         .expect("CHP_ORACLE_IMAGE must name the pinned Node 20 image");
+    let owner_label = oracle_run_owner_label();
     let name = format!(
         "chp-oracle-{}-{}",
         std::process::id(),
@@ -1872,6 +1873,7 @@ async fn spawn_docker_oracle(
         "--env",
         &format!("PINGORA_CHP_DIFFERENTIAL_FIXED_NOW={DIFFERENTIAL_FIXED_NOW}"),
     ]);
+    command.args(["--label", &owner_label]);
     if publish {
         for port in [8000, 8001, 8002] {
             command.args(["--publish", &format!("127.0.0.1::{port}")]);
@@ -1913,6 +1915,33 @@ async fn spawn_docker_oracle(
         [0, 0, 0]
     };
     (oracle, ports)
+}
+
+fn oracle_run_owner_label() -> String {
+    let label = std::env::var("CHP_ORACLE_RUN_LABEL")
+        .expect("CHP_ORACLE_RUN_LABEL must be a unique run ownership label");
+    assert!(
+        oracle_run_owner_label_is_valid(Some(&label)),
+        "CHP_ORACLE_RUN_LABEL must be a unique run ownership label"
+    );
+    label
+}
+
+fn oracle_run_owner_label_is_valid(label: Option<&str>) -> bool {
+    const PREFIX: &str = "io.openrusty.chp-differential.run=";
+    label
+        .and_then(|label| label.strip_prefix(PREFIX))
+        .is_some_and(|owner| {
+            owner.starts_with("chp-diff-")
+                && owner.len() > "chp-diff-".len()
+                && owner
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        })
+}
+
+pub(crate) fn oracle_run_owner_label_is_valid_for_test(label: Option<&str>) -> bool {
+    oracle_run_owner_label_is_valid(label)
 }
 
 fn docker_mapped_port(name: &str, port: u16) -> Option<u16> {

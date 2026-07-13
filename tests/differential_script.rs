@@ -25,7 +25,15 @@ if [ "${1:-}" = ps ]; then
       printf '%s group-live-at-container-scan %s\n' "${COMPOSE_PROJECT_NAME:-missing}" "$pgid" >> "$LIFECYCLE_LOG"
     fi
   fi
-  printf '%s-oracle-container\n' "${COMPOSE_PROJECT_NAME:-missing}"
+  case " $* " in
+    *" --filter label=io.openrusty.chp-differential.run=${COMPOSE_PROJECT_NAME:-missing} "*)
+      printf '%s-oracle-container\n' "${COMPOSE_PROJECT_NAME:-missing}"
+      ;;
+    *" --filter ancestor="*)
+      printf '%s ancestor-filter-used\n' "${COMPOSE_PROJECT_NAME:-missing}" >> "$LIFECYCLE_LOG"
+      printf 'shared-image-first-container\nshared-image-second-container\n'
+      ;;
+  esac
   exit 0
 fi
 case " $* " in
@@ -61,8 +69,21 @@ exit 0
     );
     write_executable(
         &directory.path().join("cargo"),
-        r#"#!/bin/sh
+        r#"#!/usr/bin/env bash
 printf '%s cargo %s\n' "${COMPOSE_PROJECT_NAME:-missing}" "$*" >> "$LIFECYCLE_LOG"
+if [ "${FAKE_CARGO_LEADER_EXIT_TREE:-0}" = 1 ]; then
+  (
+    trap '' TERM
+    sleep "${FAKE_LATE_CONTAINER_DELAY:-0.5}"
+    printf '%s late-container-created\n' "${COMPOSE_PROJECT_NAME:-missing}" >> "$LIFECYCLE_LOG"
+  ) &
+  grandchild=$!
+  disown "$grandchild"
+  pgid="$(ps -o pgid= -p $$ | tr -d ' ')"
+  printf '%s\n' "$pgid" > "$CARGO_PGID_FILE"
+  printf '%s cargo-leader-exit leader=%s grandchild=%s pgid=%s\n' "${COMPOSE_PROJECT_NAME:-missing}" "$$" "$grandchild" "$pgid" >> "$LIFECYCLE_LOG"
+  exit 0
+fi
 if [ "${FAKE_CARGO_TREE:-0}" = 1 ]; then
   trap '' TERM
   (
@@ -115,9 +136,9 @@ fn assert_owned_cleanup(log: &str) {
     let down = log.find(" down ").expect("cleanup down was attempted");
     let container_scan = log
         .find(&format!(
-            "docker ps -aq --filter ancestor=pingora-chp-oracle:{project}"
+            "docker ps -aq --filter label=io.openrusty.chp-differential.run={project}"
         ))
-        .expect("unique-image oracle containers were discovered");
+        .expect("run-owned oracle containers were discovered");
     let container_remove = log
         .find(&format!("docker rm -f {project}-oracle-container"))
         .expect("unique-image oracle container was removed");
@@ -136,6 +157,21 @@ fn assert_owned_cleanup(log: &str) {
         image > container_remove,
         "image must follow container removal: {log}"
     );
+}
+
+#[test]
+fn differential_script_uses_only_run_labels_for_dynamic_oracle_cleanup() {
+    let script = std::fs::read_to_string("scripts/test-differential.sh")
+        .expect("read standalone differential script");
+    assert!(script
+        .contains("export CHP_ORACLE_RUN_LABEL=\"io.openrusty.chp-differential.run=$project\""));
+    assert!(script.contains("--filter \"label=$CHP_ORACLE_RUN_LABEL\""));
+    assert!(!script.contains("--filter \"ancestor="));
+
+    let oracle = std::fs::read_to_string("tests/support/oracle.rs")
+        .expect("read differential oracle support");
+    assert!(oracle.contains("CHP_ORACLE_RUN_LABEL must be a unique run ownership label"));
+    assert!(oracle.contains("command.args([\"--label\", &owner_label])"));
 }
 
 #[test]
@@ -196,6 +232,34 @@ fn differential_script_cleans_its_image_on_signal_interruption() {
     assert!(
         !log.contains("group-live-at-container-scan"),
         "container scan ran before the cargo process group terminated: {log}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn differential_script_reaps_successful_leaders_surviving_process_groups_before_cleanup() {
+    let tools = fake_tool_directory();
+    let log = tools.path().join("leader-success.log");
+    let status = script_command(&tools, &log)
+        .env("FAKE_CARGO_LEADER_EXIT_TREE", "1")
+        .status()
+        .expect("run differential script with successful cargo leader");
+    assert!(status.success());
+    std::thread::sleep(std::time::Duration::from_millis(600));
+
+    let log = std::fs::read_to_string(log).expect("read leader-success lifecycle log");
+    assert!(
+        log.contains(" cargo-leader-exit "),
+        "leader did not exit early: {log}"
+    );
+    assert_owned_cleanup(&log);
+    assert!(
+        !log.contains("late-container-created"),
+        "successful cargo descendant survived cleanup: {log}"
+    );
+    assert!(
+        !log.contains("group-live-at-container-scan"),
+        "cleanup scanned before the successful cargo group exited: {log}"
     );
 }
 
@@ -289,11 +353,24 @@ fn concurrent_differential_scripts_use_unique_projects_and_cleanup_each() {
         assert!(
             log.lines().any(|line| {
                 line.starts_with(&project)
+                    && line.contains(&format!(
+                        "docker ps -aq --filter label=io.openrusty.chp-differential.run={project}"
+                    ))
+            }),
+            "project {project} did not filter its shared-image containers by owner: {log}"
+        );
+        assert!(
+            log.lines().any(|line| {
+                line.starts_with(&project)
                     && line.contains(&format!("docker image rm pingora-chp-oracle:{project}"))
             }),
             "project {project} did not remove only its unique image: {log}"
         );
     }
+    assert!(
+        !log.contains("ancestor-filter-used"),
+        "shared image identity triggered unsafe cross-run cleanup: {log}"
+    );
 }
 
 #[test]

@@ -1012,3 +1012,33 @@ the final resource/process audit passed. The release build compiles the fixed
 clock environment lookup out behind `cfg(debug_assertions)`, so release clocks
 remain native. The sole warning remains the established vendored Pingora
 OpenSSL deprecation.
+
+### Task 11 fourth acceptance-fix closure (2026-07-13)
+
+The final cleanup review was reproduced against live code: dynamic oracle
+containers had no run label, standalone cleanup used image ancestry, and the
+finite value `18446744073709551616` reached saturating float-to-`u64`
+conversion. Focused regressions failed before implementation and passed after
+the narrow fixes.
+
+Each standalone run now exports a strict immutable owner label and every
+dynamic oracle launch applies it. Cleanup filters only by the exact owner;
+concurrent fake runs model separate tags sharing one image identity and prove
+that neither run discovers or removes the other's containers. A source guard
+prevents ancestor filtering from returning. Missing and malformed owner labels
+fail closed.
+
+A new fake Cargo mode spawns and disowns a TERM-resistant late-container
+grandchild in Cargo's process group, then exits zero without waiting. The
+existing post-reap group check correctly escalates TERM to KILL, verifies the
+group is gone, and only then performs Compose down, label scanning, and image
+removal. The prior signal and early-stage interruption cases remain green.
+
+Final correctly provisioned results were standalone Node 20 differential
+`35/35`, differential lifecycle `9/9`, proxy `74/74`, TLS/Unix `22/22`,
+WebSocket `4/4`, and `PROPTEST_CASES=256 cargo test --all-targets
+--all-features -- --nocapture` `389/389` with a separately rebuilt/probed
+oracle and Docker-assigned Redis. `PROPTEST_CASES=512` route properties passed
+`11/11`. Formatting, Bash/Node syntax, warnings-denied Clippy, debug and release
+checks, whitespace/diff validation, and final resource/process cleanup passed.
+Only the established vendored Pingora OpenSSL deprecation was emitted.

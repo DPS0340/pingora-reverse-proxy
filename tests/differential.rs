@@ -14,8 +14,8 @@ use tower::ServiceExt;
 use oracle::{
     assert_equal_with_diagnostics_for_test, compare_metric_deltas_for_test,
     compare_metric_expositions, observation_for_context_test, observation_for_test,
-    route_body_for_test, CapturedProcess, EndpointMapping, LaunchLock, ObservationContext,
-    ObservationSide, OraclePair, PortLease,
+    oracle_run_owner_label_is_valid_for_test, route_body_for_test, CapturedProcess,
+    EndpointMapping, LaunchLock, ObservationContext, ObservationSide, OraclePair, PortLease,
 };
 use support::{read_text, request, test_api, StatusCode};
 
@@ -46,6 +46,24 @@ const CHP_METRIC_FAMILIES: &[(&str, &str)] = &[
     ("requests_proxy", "counter"),
     ("requests_api", "counter"),
 ];
+
+#[test]
+fn oracle_owner_label_is_required_and_strictly_shaped() {
+    assert!(oracle_run_owner_label_is_valid_for_test(Some(
+        "io.openrusty.chp-differential.run=chp-diff-123-456"
+    )));
+    for invalid in [
+        None,
+        Some(""),
+        Some("io.openrusty.chp-differential.run="),
+        Some("io.openrusty.chp-differential.run=other-run"),
+        Some("io.openrusty.chp-differential.run=chp-diff-bad=value"),
+        Some("io.openrusty.chp-differential.run=chp-diff-bad\nlabel"),
+        Some("other.label=chp-diff-123-456"),
+    ] {
+        assert!(!oracle_run_owner_label_is_valid_for_test(invalid));
+    }
+}
 
 fn comparator_mappings() -> Vec<EndpointMapping> {
     vec![
@@ -391,7 +409,7 @@ fn metric_comparator_rejects_invalid_summary_structure_even_on_both_sides() {
     ];
     mutations.push(EXACT_METRICS.replacen(
         "find_target_for_req_count 3",
-        &format!("find_target_for_req_count {}", "9".repeat(400)),
+        "find_target_for_req_count 18446744073709551616",
         1,
     ));
     for value in ["NaN", "+Inf", "-Inf"] {
