@@ -903,3 +903,72 @@ disposable Redis and the verified Node 20 oracle image. The dedicated
 Clippy, all-target/all-feature checking, whitespace validation, final diff
 review, and process/container cleanup passed. The sole emitted warning remains
 the established vendored Pingora OpenSSL deprecation.
+
+### Task 11 second acceptance-fix closure (2026-07-13)
+
+The second acceptance wave replaced recursive normalization with explicit
+generic, echo, route-mutation, and route-table observation schemas. Unknown
+JSON metadata and nested `target`, `host`, and `last_activity` fields remain
+semantic; duplicate header values retain order. Route preparation rewrites
+only a root harness target sentinel and supplies a fixed valid activity input.
+Focused adversarials prove endpoint-like user data and activity differences
+fail comparison.
+
+The metric oracle now removes the Node/process runtime allowlist only from CHP,
+rejects it from Rust, and enforces exactly seven unique quantiles with finite,
+nonnegative, nondecreasing values. Summary sums are finite/nonnegative and
+counts are integer and nondecreasing; exact metadata, labels, and counter/count
+deltas remain strict. WebSocket coverage asserts exact two-phase activity and
+one request increment, while the body-bearing unavailable-upstream contract
+asserts zero activity.
+
+The standalone lifecycle removes image-scoped oracle containers after Compose
+down and then removes only its unique image on build/up/probe/cargo failures,
+success, and signal interruption. Concurrent fake runs prove distinct project,
+container, and image ownership. Raw stderr is retained as a bounded tail and
+redacted only after assembly, including paths and explicitly supplied secrets
+split across reads. Central ordinary assertion diagnostics include both CHP
+and Rust tails.
+
+TLS comparison now performs real CA and `openrusty.org` hostname validation
+against a runtime-generated CA-signed `CA:FALSE` server identity. Wrong CA,
+wrong hostname, absent mTLS identity, and untrusted mTLS identity are rejected
+by both sides. The Node-major validator is pure and deterministic; the image
+uses the upstream 5.3.0 lock with `npm ci`, verifies the lock SHA-256 and npm
+tarball SHA-512, and remains pinned to Node `20.20.2`.
+
+Final correctly provisioned results were Docker Node 20 differential `32/32`,
+script lifecycle `5/5`, proxy `74/74`, TLS/Unix `22/22`, WebSocket `4/4`, and
+`PROPTEST_CASES=256 cargo test --all-targets --all-features` `382/382` with a
+disposable Redis and verified oracle image. `PROPTEST_CASES=512` route
+properties passed `11/11`. Formatting, warnings-denied Clippy, complete check,
+whitespace validation, review, and resource cleanup passed. The only emitted
+warning remains the established vendored Pingora OpenSSL deprecation.
+
+### Task 11 non-ephemeral handoff verification closure (2026-07-13)
+
+The final continuation began with the literal standalone differential gate.
+Its uniquely tagged Node oracle built and the complete differential suite passed
+`33/33`; the prior bind failure did not recur, so no further handoff redesign
+was made. The suite includes the non-ephemeral port lease and cross-process
+launch-barrier contracts alongside strict observation-role, nested user-field,
+duplicate/non-UTF-8 header, metric-family/metadata/label/value/summary, launcher
+source/package/Node-major, bounded-redaction, TLS/mTLS negative, and ordinary
+diagnostic adversarials.
+
+Focused verification passed differential script lifecycle `5/5`, proxy
+`74/74`, TLS/Unix `22/22`, and WebSocket `4/4`. A new uniquely tagged oracle was
+then runtime-verified as Node `v20.20.2`,
+`configurable-http-proxy@5.3.0`, and source `/opt/chp-5.3.0`. With that exact
+image and disposable Redis on Docker-assigned host port `33268`,
+`PROPTEST_CASES=256 cargo test --all-targets --all-features -- --nocapture`
+passed `383/383`: library `67`, binary `0`, API `34`, config `27`, differential
+`33`, differential script `5`, proxy `74`, routes `11`, store `106`, TLS/Unix
+`22`, and WebSocket `4`. `PROPTEST_CASES=512 cargo test --test route_properties
+-- --nocapture` passed `11/11`.
+
+Formatting, warnings-denied all-target/all-feature Clippy, complete
+all-target/all-feature checking, whitespace validation, final diff/status
+review, and removal of all `chp-diff` images, containers, networks, and related
+processes passed. The only emitted warning remains the established vendored
+Pingora OpenSSL deprecation.

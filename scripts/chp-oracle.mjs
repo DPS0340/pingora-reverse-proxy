@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
+import { validateNodeMajor } from "./chp-runtime.mjs";
 
 const expectedVersion = "5.3.0";
 const requestedSource = process.env.CHP_SOURCE_DIR || "/opt/chp-5.3.0";
@@ -32,10 +33,7 @@ if (
   );
 }
 
-const nodeMajor = Number.parseInt(process.versions.node.split(".", 1)[0], 10);
-if (nodeMajor !== 20) {
-  throw new Error(`CHP oracle requires Node 20, got ${process.version}`);
-}
+validateNodeMajor(process.version);
 
 if (process.argv[2] === "--runtime-probe") {
   process.stdout.write(

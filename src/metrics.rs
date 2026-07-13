@@ -176,12 +176,22 @@ impl Metrics {
 
     /// Render the CHP 5.3.0 metric families using its exact names and labels.
     pub fn render_prometheus(&self) -> String {
+        self.render_prometheus_with_snapshot_hook_impl(|| {})
+    }
+
+    #[cfg(test)]
+    fn render_prometheus_with_snapshot_hook(&self, hook: impl FnOnce()) -> String {
+        self.render_prometheus_with_snapshot_hook_impl(hook)
+    }
+
+    fn render_prometheus_with_snapshot_hook_impl(&self, hook: impl FnOnce()) -> String {
         let snapshot = self.snapshot();
         let mut find_target = self
             .find_target_for_req
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .snapshot();
+        hook();
         let mut last_activity = self
             .last_activity_updating
             .lock()
@@ -278,14 +288,13 @@ fn render_summary(body: &mut String, name: &str, help: &str, summary: &SummarySn
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc;
-    use std::sync::Arc;
+    use std::sync::{mpsc, Arc, Barrier};
     use std::time::Duration;
 
     use super::Metrics;
 
     #[test]
-    fn rendering_does_not_hold_one_summary_lock_while_waiting_for_another() {
+    fn rendering_releases_first_summary_lock_before_snapshotting_second() {
         let metrics = Arc::new(Metrics::new());
         metrics.record_find_target(Duration::from_millis(10));
         metrics.record_last_activity_update(Duration::from_millis(20));
@@ -294,8 +303,19 @@ mod tests {
             .last_activity_updating
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (snapshotted, observed_snapshot) = mpsc::channel();
+        let resume = Arc::new(Barrier::new(2));
+        let render_resume = Arc::clone(&resume);
         let rendering = Arc::clone(&metrics);
-        let render_thread = std::thread::spawn(move || rendering.render_prometheus());
+        let render_thread = std::thread::spawn(move || {
+            rendering.render_prometheus_with_snapshot_hook(|| {
+                snapshotted.send(()).expect("report first snapshot");
+                render_resume.wait();
+            })
+        });
+        observed_snapshot
+            .recv_timeout(Duration::from_secs(1))
+            .expect("renderer did not pause after first snapshot");
 
         let (recorded, observed) = mpsc::channel();
         let recording = Arc::clone(&metrics);
@@ -303,15 +323,14 @@ mod tests {
             recording.record_find_target(Duration::from_millis(30));
             recorded.send(()).expect("report completed observation");
         });
-        let completed_without_other_summary = observed.recv_timeout(Duration::from_millis(200));
+        observed
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first summary mutex remained held after snapshot hook");
 
+        resume.wait();
         drop(last_activity);
         let _ = render_thread.join().expect("renderer thread");
         record_thread.join().expect("observer thread");
-        assert!(
-            completed_without_other_summary.is_ok(),
-            "rendering held the find-target mutex while blocked on last-activity"
-        );
     }
 
     #[test]

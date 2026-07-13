@@ -12,14 +12,15 @@ use serde_json::json;
 use tower::ServiceExt;
 
 use oracle::{
-    compare_metric_expositions, observation_for_test, CapturedProcess, EndpointMapping, LaunchLock,
-    ObservationSide, OraclePair, PortLease,
+    assert_equal_with_diagnostics_for_test, compare_metric_expositions,
+    observation_for_context_test, observation_for_test, route_body_for_test, CapturedProcess,
+    EndpointMapping, LaunchLock, ObservationContext, ObservationSide, OraclePair, PortLease,
 };
 use support::{read_text, request, test_api, StatusCode};
 
 /// The complete normalization allowlist for differential observations:
 ///
-/// - HTTP `Date` values;
+/// - HTTP `Date` header values;
 /// - server-generated connection/framing headers (`Connection`, `Keep-Alive`,
 ///   `Transfer-Encoding`, and `Content-Length`);
 /// - listener/client addresses and ports allocated ephemerally by the harness.
@@ -28,7 +29,7 @@ use support::{read_text, request, test_api, StatusCode};
 /// JSON metadata, bodies, metric family/label names, and TLS outcomes are never
 /// normalized.
 const NORMALIZATION_ALLOWLIST: &[&str] = &[
-    "Date values",
+    "HTTP Date header values",
     "server-generated connection/framing headers",
     "ephemeral addresses",
 ];
@@ -57,21 +58,24 @@ fn comparator_mappings() -> Vec<EndpointMapping> {
 #[test]
 fn comparator_keeps_endpoint_roles_distinct_and_rejects_swaps() {
     let mappings = comparator_mappings();
-    let chp = observation_for_test(
+    let chp = observation_for_context_test(
+        ObservationContext::RouteMutation,
         ObservationSide::Chp,
         200,
         &[],
         br#"{"target":"http://127.0.0.1:11001/base"}"#,
         &mappings,
     );
-    let matching_rust = observation_for_test(
+    let matching_rust = observation_for_context_test(
+        ObservationContext::RouteMutation,
         ObservationSide::Rust,
         200,
         &[],
         br#"{"target":"http://127.0.0.1:21001/base"}"#,
         &mappings,
     );
-    let swapped_rust = observation_for_test(
+    let swapped_rust = observation_for_context_test(
+        ObservationContext::RouteMutation,
         ObservationSide::Rust,
         200,
         &[],
@@ -100,6 +104,22 @@ fn comparator_preserves_duplicate_and_non_utf8_semantic_headers() {
         &mappings,
     );
     assert_ne!(duplicated, collapsed);
+
+    let ordered = observation_for_test(
+        ObservationSide::Chp,
+        200,
+        &[("x-semantic", b"one"), ("x-semantic", b"two")],
+        b"ok",
+        &mappings,
+    );
+    let reversed = observation_for_test(
+        ObservationSide::Rust,
+        200,
+        &[("x-semantic", b"two"), ("x-semantic", b"one")],
+        b"ok",
+        &mappings,
+    );
+    assert_ne!(ordered, reversed, "duplicate header order is semantic");
 
     let non_utf8_a = observation_for_test(
         ObservationSide::Chp,
@@ -142,6 +162,112 @@ fn comparator_never_rewrites_user_body_path_query_or_target_suffixes() {
     }
 }
 
+#[test]
+fn comparator_rejects_nested_user_fields_even_when_they_look_structural() {
+    let mappings = comparator_mappings();
+    let chp = r#"{
+        "metadata": {
+            "target": "http://127.0.0.1:11004/private",
+            "host": "127.0.0.1:11001",
+            "last_activity": "2025-01-01T00:00:00Z"
+        }
+    }"#;
+    let rust = br#"{
+        "metadata": {
+            "target": "http://127.0.0.1:21004/private",
+            "host": "127.0.0.1:21001",
+            "last_activity": "2026-01-01T00:00:00Z"
+        }
+    }"#;
+    assert_ne!(
+        observation_for_test(ObservationSide::Chp, 200, &[], chp.as_bytes(), &mappings),
+        observation_for_test(ObservationSide::Rust, 200, &[], rust, &mappings),
+        "unknown metadata must never be normalized recursively"
+    );
+}
+
+#[test]
+fn route_mutation_preparation_rewrites_only_the_root_target_sentinel() {
+    let prepared = route_body_for_test(
+        json!({
+            "target": "http://oracle-echo.invalid/base",
+            "metadata": {
+                "target": "http://oracle-echo.invalid/user-data",
+                "host": "oracle-echo.invalid",
+                "last_activity": "2024-02-03T04:05:06Z"
+            }
+        }),
+        ObservationSide::Chp,
+        43210,
+    );
+    assert_eq!(prepared["target"], "http://host.docker.internal:43210/base");
+    assert_eq!(
+        prepared["metadata"]["target"],
+        "http://oracle-echo.invalid/user-data"
+    );
+    assert_eq!(prepared["metadata"]["host"], "oracle-echo.invalid");
+    assert_eq!(
+        prepared["metadata"]["last_activity"],
+        "2024-02-03T04:05:06Z"
+    );
+    assert_eq!(prepared["last_activity"], "2000-01-01T00:00:00.000Z");
+
+    let user_target = route_body_for_test(
+        json!({ "target": "http://example.test/oracle-echo.invalid/user-data" }),
+        ObservationSide::Chp,
+        43210,
+    );
+    assert_eq!(
+        user_target["target"],
+        "http://example.test/oracle-echo.invalid/user-data"
+    );
+}
+
+#[test]
+fn route_table_context_normalizes_only_direct_route_targets() {
+    let mappings = comparator_mappings();
+    let chp = r#"{
+        "/route": {
+            "target": "http://127.0.0.1:11004/base",
+            "last_activity": "2000-01-01T00:00:00.000Z",
+            "metadata": {"target": "http://127.0.0.1:11004/user"}
+        }
+    }"#;
+    let matching_rust = r#"{
+        "/route": {
+            "target": "http://127.0.0.1:21004/base",
+            "last_activity": "2000-01-01T00:00:00.000Z",
+            "metadata": {"target": "http://127.0.0.1:11004/user"}
+        }
+    }"#;
+    let nested_target_changed =
+        matching_rust.replace("127.0.0.1:11004/user", "127.0.0.1:21004/user");
+    let last_activity_changed =
+        matching_rust.replace("2000-01-01T00:00:00.000Z", "2001-01-01T00:00:00.000Z");
+    let observe = |side, body: &[u8]| {
+        observation_for_context_test(
+            ObservationContext::RouteTable,
+            side,
+            200,
+            &[],
+            body,
+            &mappings,
+        )
+    };
+    assert_eq!(
+        observe(ObservationSide::Chp, chp.as_bytes()),
+        observe(ObservationSide::Rust, matching_rust.as_bytes())
+    );
+    assert_ne!(
+        observe(ObservationSide::Chp, chp.as_bytes()),
+        observe(ObservationSide::Rust, nested_target_changed.as_bytes())
+    );
+    assert_ne!(
+        observe(ObservationSide::Chp, chp.as_bytes()),
+        observe(ObservationSide::Rust, last_activity_changed.as_bytes())
+    );
+}
+
 const EXACT_METRICS: &str = "# HELP api_route_get Count of API route get requests\n# TYPE api_route_get counter\napi_route_get 1\n\n# HELP api_route_add Count of API route add requests\n# TYPE api_route_add counter\napi_route_add 2\n\n# HELP api_route_delete Count of API route delete requests\n# TYPE api_route_delete counter\napi_route_delete 1\n\n# HELP find_target_for_req Summary of find target requests\n# TYPE find_target_for_req summary\nfind_target_for_req{quantile=\"0.01\"} 0.1\nfind_target_for_req{quantile=\"0.05\"} 0.1\nfind_target_for_req{quantile=\"0.5\"} 0.2\nfind_target_for_req{quantile=\"0.9\"} 0.3\nfind_target_for_req{quantile=\"0.95\"} 0.3\nfind_target_for_req{quantile=\"0.99\"} 0.3\nfind_target_for_req{quantile=\"0.999\"} 0.3\nfind_target_for_req_sum 0.6\nfind_target_for_req_count 3\n\n# HELP last_activity_updating Summary of last activity updating requests\n# TYPE last_activity_updating summary\nlast_activity_updating{quantile=\"0.01\"} 0.1\nlast_activity_updating{quantile=\"0.05\"} 0.1\nlast_activity_updating{quantile=\"0.5\"} 0.1\nlast_activity_updating{quantile=\"0.9\"} 0.1\nlast_activity_updating{quantile=\"0.95\"} 0.1\nlast_activity_updating{quantile=\"0.99\"} 0.1\nlast_activity_updating{quantile=\"0.999\"} 0.1\nlast_activity_updating_sum 0.1\nlast_activity_updating_count 1\n\n# HELP requests_ws Count of websocket requests\n# TYPE requests_ws counter\nrequests_ws 1\n\n# HELP requests_web Count of web requests\n# TYPE requests_web counter\nrequests_web 2\n\n# HELP requests_proxy Count of proxy requests\n# TYPE requests_proxy counter\nrequests_proxy{status=\"200\"} 1\nrequests_proxy{status=\"503\"} 2\n\n# HELP requests_api Count of API requests\n# TYPE requests_api counter\nrequests_api{status=\"200\"} 3\nrequests_api{status=\"201\"} 2\n";
 
 #[test]
@@ -167,6 +293,65 @@ fn metric_comparator_rejects_unexpected_families_help_types_labels_and_values() 
             compare_metric_expositions(EXACT_METRICS, &changed).is_err(),
             "metric comparator accepted a semantic mutation"
         );
+    }
+}
+
+#[test]
+fn metric_comparator_rejects_runtime_families_from_rust_only() {
+    let runtime = "\n# HELP process_cpu_seconds_total CPU\n# TYPE process_cpu_seconds_total counter\nprocess_cpu_seconds_total 1\n";
+    assert!(
+        compare_metric_expositions(&(EXACT_METRICS.to_owned() + runtime), EXACT_METRICS).is_ok()
+    );
+    assert!(
+        compare_metric_expositions(EXACT_METRICS, &(EXACT_METRICS.to_owned() + runtime)).is_err(),
+        "the CHP-only runtime allowlist must not apply to Rust"
+    );
+}
+
+#[test]
+fn metric_comparator_rejects_invalid_summary_structure_even_on_both_sides() {
+    let mutations = [
+        EXACT_METRICS.replacen(
+            "find_target_for_req{quantile=\"0.01\"} 0.1\n",
+            "",
+            1,
+        ),
+        EXACT_METRICS.replacen(
+            "find_target_for_req{quantile=\"0.01\"} 0.1",
+            "find_target_for_req{quantile=\"0.01\"} 0.1\nfind_target_for_req{quantile=\"0.01\"} 0.1",
+            1,
+        ),
+        EXACT_METRICS.replacen(
+            "find_target_for_req{quantile=\"0.5\"} 0.2",
+            "find_target_for_req{quantile=\"0.5\"} -0.2",
+            1,
+        ),
+        EXACT_METRICS.replacen(
+            "find_target_for_req{quantile=\"0.9\"} 0.3",
+            "find_target_for_req{quantile=\"0.9\"} 0.05",
+            1,
+        ),
+        EXACT_METRICS.replacen("find_target_for_req_sum 0.6", "find_target_for_req_sum -0.6", 1),
+        EXACT_METRICS.replacen("find_target_for_req_count 3", "find_target_for_req_count 3.5", 1),
+        EXACT_METRICS.replacen(
+            "find_target_for_req{quantile=\"0.5\"} 0.2",
+            "find_target_for_req{quantile=\"0.5\",unexpected=\"x\"} 0.2",
+            1,
+        ),
+    ];
+    for invalid in mutations {
+        assert!(
+            compare_metric_expositions(&invalid, &invalid).is_err(),
+            "accepted an invalid summary on both sides"
+        );
+    }
+    for value in ["NaN", "+Inf", "-Inf"] {
+        let invalid = EXACT_METRICS.replacen(
+            "find_target_for_req_sum 0.6",
+            &format!("find_target_for_req_sum {value}"),
+            1,
+        );
+        assert!(compare_metric_expositions(&invalid, &invalid).is_err());
     }
 }
 
@@ -267,6 +452,21 @@ fn oracle_launcher_rejects_the_host_wrong_node_major() {
 }
 
 #[test]
+fn node_major_validator_is_deterministic_without_using_the_host_runtime() {
+    let output = std::process::Command::new("node")
+        .args([
+            "--input-type=module",
+            "--eval",
+            "import { validateNodeMajor } from './scripts/chp-runtime.mjs'; validateNodeMajor('v21.99.0');",
+        ])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("run pure Node-major validator");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("requires Node 20, got v21.99.0"));
+}
+
+#[test]
 fn oracle_port_lease_holds_the_listener_until_child_launch() {
     let lease = PortLease::new();
     let port = lease.port();
@@ -274,6 +474,15 @@ fn oracle_port_lease_holds_the_listener_until_child_launch() {
     drop(lease);
     std::net::TcpListener::bind(("127.0.0.1", port))
         .expect("released differential port can be bound again");
+}
+
+#[test]
+fn oracle_port_lease_uses_non_ephemeral_handoff_ports() {
+    let lease = PortLease::new();
+    assert!(
+        (20_000..30_000).contains(&lease.port()),
+        "listener handoff ports must not be reusable as ephemeral client source ports"
+    );
 }
 
 #[test]
@@ -364,6 +573,68 @@ fn captured_process_stderr_tail_is_live_bounded_and_redacted() {
         );
         std::thread::yield_now();
     }
+}
+
+#[test]
+fn captured_process_redacts_a_workspace_path_split_across_pipe_reads() {
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let split = workspace.len() / 2;
+    let mut command = std::process::Command::new("sh");
+    command
+        .arg("-c")
+        .arg("printf '%s' \"$1\" >&2; sleep 0.05; printf '%s\\n' \"$2\" >&2; sleep 0.2")
+        .arg("stderr-split")
+        .arg(&workspace[..split])
+        .arg(&workspace[split..]);
+    let process = CapturedProcess::spawn(command);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let tail = process.stderr_tail();
+    assert!(!tail.contains(workspace), "split workspace leaked: {tail}");
+    assert!(
+        tail.contains("<workspace>"),
+        "assembled tail was not redacted: {tail}"
+    );
+    assert!(tail.len() <= 64 * 1024);
+
+    let secret = "task11-split-super-secret";
+    let mut command = std::process::Command::new("sh");
+    command
+        .arg("-c")
+        .arg("printf '%s' \"$1\" >&2; sleep 0.05; printf '%s\\n' \"$2\" >&2; sleep 0.2")
+        .arg("stderr-secret-split")
+        .arg(&secret[..10])
+        .arg(&secret[10..])
+        .env("CONFIGPROXY_AUTH_TOKEN", secret);
+    let process = CapturedProcess::spawn(command);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let tail = process.stderr_tail();
+    assert!(!tail.contains(secret), "split secret leaked: {tail}");
+    assert!(
+        tail.contains("<redacted>"),
+        "assembled secret was not redacted: {tail}"
+    );
+}
+
+#[test]
+fn ordinary_assertion_diagnostics_include_both_bounded_redacted_tails() {
+    let panic = std::panic::catch_unwind(|| {
+        assert_equal_with_diagnostics_for_test(
+            "HTTP response",
+            &"chp-value",
+            &"rust-value",
+            "chp-tail",
+            "rust-tail",
+        );
+    })
+    .expect_err("mismatched ordinary assertion should panic");
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .expect("diagnostic panic text");
+    assert!(message.contains("HTTP response"));
+    assert!(message.contains("CHP stderr tail=chp-tail"));
+    assert!(message.contains("Rust stderr tail=rust-tail"));
 }
 
 #[test]
@@ -569,7 +840,6 @@ async fn chp_and_rust_agree_on_api_crud_and_encoded_unicode_route() {
     .await;
     pair.assert_same_http("/user/%E7%A7%80%E6%A8%B9/tree?x=%2F")
         .await;
-    pair.assert_same_route_tables().await;
     pair.post_route(
         "/user/%E7%A7%80%E6%A8%B9",
         json!({
@@ -581,7 +851,6 @@ async fn chp_and_rust_agree_on_api_crud_and_encoded_unicode_route() {
     .await;
     pair.assert_same_http("/user/%E7%A7%80%E6%A8%B9/tree?x=%2F")
         .await;
-    pair.assert_same_route_tables().await;
     pair.delete_route("/user/%E7%A7%80%E6%A8%B9").await;
     pair.assert_same_route_tables().await;
 }
@@ -658,7 +927,7 @@ async fn chp_and_rust_agree_on_health_errors_and_metric_schema() {
     drop(unavailable);
     pair.post_route(
         "/unavailable",
-        json!({ "target": format!("http://{target}") }),
+        json!({ "target": pair.host_target(&format!("http://{target}")) }),
     )
     .await;
     pair.assert_same_http("/unavailable").await;
@@ -677,7 +946,7 @@ async fn chp_and_rust_agree_on_custom_404_and_503_errors() {
     drop(unavailable);
     pair.post_route(
         "/unavailable",
-        json!({ "target": format!("http://{target}") }),
+        json!({ "target": pair.host_target(&format!("http://{target}")) }),
     )
     .await;
     pair.assert_same_http("/unavailable?next=%2Ftree").await;
@@ -687,8 +956,11 @@ async fn chp_and_rust_agree_on_custom_404_and_503_errors() {
 async fn chp_and_rust_agree_on_websocket_upgrade_and_messages() {
     let websocket = WebSocketFixture::start().await;
     let pair = OraclePair::start().await;
-    pair.post_route("/channels", json!({ "target": websocket.target() }))
-        .await;
+    pair.post_route(
+        "/channels",
+        json!({ "target": pair.host_target(&websocket.target()) }),
+    )
+    .await;
     pair.assert_same_websocket("/channels/kernel?token=a%2Fb", b"task11-websocket")
         .await;
     pair.assert_same_metrics().await;
@@ -696,8 +968,11 @@ async fn chp_and_rust_agree_on_websocket_upgrade_and_messages() {
 
 #[tokio::test]
 async fn chp_and_rust_agree_on_public_tls() {
-    let server_cert = fixture_path("vendor/pingora-core-0.8.1/examples/keys/server/cert.pem");
-    let server_key = fixture_path("vendor/pingora-core-0.8.1/examples/keys/server/key.pem");
+    let server = tls_server_identity();
+    let server_cert = server.certificate.clone();
+    let server_root = server.root.clone();
+    let server_key = server.key.clone();
+    let wrong_root = fixture_path("vendor/pingora-core-0.8.1/examples/keys/client-ca/cert.pem");
     let pair = OraclePair::start_with_args(&[
         "--ssl-cert".to_owned(),
         server_cert.display().to_string(),
@@ -705,16 +980,22 @@ async fn chp_and_rust_agree_on_public_tls() {
         server_key.display().to_string(),
     ])
     .await;
-    pair.assert_same_tls_health(&server_cert).await;
+    pair.assert_same_tls_health(&server_root, &wrong_root).await;
 }
 
 #[tokio::test]
 async fn chp_and_rust_agree_on_public_mutual_tls() {
-    let server_cert = fixture_path("vendor/pingora-core-0.8.1/examples/keys/server/cert.pem");
-    let server_key = fixture_path("vendor/pingora-core-0.8.1/examples/keys/server/key.pem");
+    let server = tls_server_identity();
+    let server_cert = server.certificate.clone();
+    let server_root = server.root.clone();
+    let server_key = server.key.clone();
     let client_ca = fixture_path("vendor/pingora-core-0.8.1/examples/keys/client-ca/cert.pem");
     let client_cert = fixture_path("vendor/pingora-core-0.8.1/examples/keys/clients/cert-1.pem");
     let client_key = fixture_path("vendor/pingora-core-0.8.1/examples/keys/clients/key-1.pem");
+    let untrusted_client_cert =
+        fixture_path("vendor/pingora-core-0.8.1/examples/keys/clients/invalid-cert.pem");
+    let untrusted_client_key =
+        fixture_path("vendor/pingora-core-0.8.1/examples/keys/clients/invalid-key.pem");
     let pair = OraclePair::start_with_args(&[
         "--ssl-cert".to_owned(),
         server_cert.display().to_string(),
@@ -726,12 +1007,108 @@ async fn chp_and_rust_agree_on_public_mutual_tls() {
         "--ssl-reject-unauthorized".to_owned(),
     ])
     .await;
-    pair.assert_same_mutual_tls_health(&server_cert, &client_cert, &client_key)
-        .await;
+    pair.assert_same_mutual_tls_health(
+        &server_root,
+        &client_cert,
+        &client_key,
+        &untrusted_client_cert,
+        &untrusted_client_key,
+    )
+    .await;
 }
 
 fn fixture_path(relative: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
+}
+
+struct TlsServerIdentity {
+    certificate: std::path::PathBuf,
+    root: std::path::PathBuf,
+    key: std::path::PathBuf,
+    _directory: tempfile::TempDir,
+}
+
+fn tls_server_identity() -> TlsServerIdentity {
+    let target = fixture_path("target");
+    std::fs::create_dir_all(&target).expect("create target directory for TLS fixture");
+    let directory = tempfile::Builder::new()
+        .prefix("chp-differential-tls-")
+        .tempdir_in(target)
+        .expect("create mounted TLS fixture directory");
+    let ca_cert = directory.path().join("ca.pem");
+    let ca_key = directory.path().join("ca.key");
+    let server_csr = directory.path().join("server.csr");
+    let server_cert = directory.path().join("server.pem");
+    let server_key = directory.path().join("server.key");
+    let extensions = directory.path().join("server.ext");
+    std::fs::write(
+        &extensions,
+        "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:openrusty.org\n",
+    )
+    .expect("write TLS server extensions");
+    for arguments in [
+        vec![
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "2",
+            "-subj",
+            "/CN=Task 11 Test CA",
+            "-keyout",
+            ca_key.to_str().unwrap(),
+            "-out",
+            ca_cert.to_str().unwrap(),
+        ],
+        vec![
+            "req",
+            "-new",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-subj",
+            "/CN=openrusty.org",
+            "-keyout",
+            server_key.to_str().unwrap(),
+            "-out",
+            server_csr.to_str().unwrap(),
+        ],
+        vec![
+            "x509",
+            "-req",
+            "-in",
+            server_csr.to_str().unwrap(),
+            "-CA",
+            ca_cert.to_str().unwrap(),
+            "-CAkey",
+            ca_key.to_str().unwrap(),
+            "-CAcreateserial",
+            "-days",
+            "2",
+            "-extfile",
+            extensions.to_str().unwrap(),
+            "-out",
+            server_cert.to_str().unwrap(),
+        ],
+    ] {
+        let output = std::process::Command::new("openssl")
+            .args(arguments)
+            .output()
+            .expect("run openssl for TLS fixture");
+        assert!(
+            output.status.success(),
+            "openssl fixture generation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    TlsServerIdentity {
+        certificate: server_cert,
+        root: ca_cert,
+        key: server_key,
+        _directory: directory,
+    }
 }
 
 #[cfg(unix)]
@@ -741,6 +1118,7 @@ async fn chp_and_rust_agree_on_unix_public_api_and_metrics_sockets() {
     pair.post_route("/unix", json!({ "target": pair.echo_target() }))
         .await;
     pair.assert_same_unix_http("/unix/tree?x=%2F").await;
+    pair.delete_route("/unix").await;
     pair.assert_same_route_tables().await;
     pair.assert_same_metrics().await;
 }

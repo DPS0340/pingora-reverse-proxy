@@ -8,13 +8,16 @@ services:
         RUN mkdir -p /opt/chp-5.3.0
         WORKDIR /opt/chp-5.3.0
         RUN npm pack configurable-http-proxy@5.3.0 \
+            && echo "e5abb83b5d9d10514758d9bd63b1319b4e9361cd429cc3afbe9b4f4d4f37570ecdcfd8f48d4a90430283475c53e7682a5fe5fa0fc52e3bbe7875075491e058b9  configurable-http-proxy-5.3.0.tgz" | sha512sum -c - \
             && tar -xzf configurable-http-proxy-5.3.0.tgz --strip-components=1 \
             && rm configurable-http-proxy-5.3.0.tgz \
-            && npm install --omit=dev \
+            && node -e "fetch('https://raw.githubusercontent.com/jupyterhub/configurable-http-proxy/5.3.0/package-lock.json').then(r=>{if(!r.ok)throw new Error(String(r.status));return r.arrayBuffer()}).then(b=>require('fs').writeFileSync('package-lock.json',Buffer.from(b)))" \
+            && echo "e55dd25c47058ab05cdcba58b59f4009f49b2fe16f329aa528bf2c233e337cb2  package-lock.json" | sha256sum -c - \
+            && npm ci --omit=dev \
             && test "$(node --print "require('./package.json').name")" = "configurable-http-proxy" \
             && test "$(node --print "require('./package.json').version")" = "5.3.0" \
             && test "$(node --print "process.versions.node.split('.')[0]")" = "20"
-        COPY scripts/chp-oracle.mjs /usr/local/bin/chp-oracle.mjs
+        COPY scripts/chp-oracle.mjs scripts/chp-runtime.mjs /usr/local/bin/
     command: ["node", "/usr/local/bin/chp-oracle.mjs", "--runtime-probe"]
 
   redis:

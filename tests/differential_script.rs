@@ -18,6 +18,16 @@ fn fake_tool_directory() -> tempfile::TempDir {
         r#"#!/bin/sh
 if [ "${1:-}" = compose ]; then exit 1; fi
 printf '%s docker %s\n' "${COMPOSE_PROJECT_NAME:-missing}" "$*" >> "$LIFECYCLE_LOG"
+if [ "${1:-}" = ps ]; then
+  printf '%s-oracle-container\n' "${COMPOSE_PROJECT_NAME:-missing}"
+  exit 0
+fi
+case " $* " in
+  *" run "*)
+    if [ "${FAIL_RUNTIME_PROBE:-0}" = 1 ]; then exit 24; fi
+    printf '%s\n' '{"node":"v20.20.2","package":"configurable-http-proxy@5.3.0","source":"/opt/chp-5.3.0"}'
+    ;;
+esac
 exit 0
 "#,
     );
@@ -26,6 +36,9 @@ exit 0
         r#"#!/bin/sh
 printf '%s compose %s\n' "${COMPOSE_PROJECT_NAME:-missing}" "$*" >> "$LIFECYCLE_LOG"
 case " $* " in
+  *" build chp "*)
+    if [ "${FAIL_BUILD:-0}" = 1 ]; then exit 21; fi
+    ;;
   *" up "*)
     if [ "${FAIL_COMPOSE_UP:-0}" = 1 ]; then exit 23; fi
     ;;
@@ -39,6 +52,7 @@ exit 0
         r#"#!/bin/sh
 printf '%s cargo %s\n' "${COMPOSE_PROJECT_NAME:-missing}" "$*" >> "$LIFECYCLE_LOG"
 sleep "${FAKE_CARGO_SLEEP:-0}"
+if [ "${FAIL_CARGO:-0}" = 1 ]; then exit 25; fi
 exit 0
 "#,
     );
@@ -56,28 +70,96 @@ fn script_command(tools: &tempfile::TempDir, log: &std::path::Path) -> Command {
         .arg("scripts/test-differential.sh")
         .env("PATH", path)
         .env("LIFECYCLE_LOG", log)
-        .env("DIFFERENTIAL_SKIP_RUNTIME_PROBE", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     command
 }
 
-#[test]
-fn differential_script_cleans_partial_compose_failure() {
-    let tools = fake_tool_directory();
-    let log = tools.path().join("lifecycle.log");
-    let status = script_command(&tools, &log)
-        .env("FAIL_COMPOSE_UP", "1")
-        .status()
-        .expect("run differential script");
-    assert_eq!(status.code(), Some(23));
-    let log = std::fs::read_to_string(log).expect("read lifecycle log");
-    let up = log.find(" up ").expect("compose up was attempted");
+fn assert_owned_cleanup(log: &str) {
+    let project = log
+        .lines()
+        .find_map(|line| {
+            line.split_once(' ')
+                .map(|(project, _)| project)
+                .filter(|project| project.starts_with("chp-diff-"))
+        })
+        .expect("lifecycle project");
     let down = log.find(" down ").expect("cleanup down was attempted");
+    let container_scan = log
+        .find(&format!(
+            "docker ps -aq --filter ancestor=pingora-chp-oracle:{project}"
+        ))
+        .expect("unique-image oracle containers were discovered");
+    let container_remove = log
+        .find(&format!("docker rm -f {project}-oracle-container"))
+        .expect("unique-image oracle container was removed");
+    let image = log
+        .find(&format!("docker image rm pingora-chp-oracle:{project}"))
+        .expect("unique oracle image was removed");
     assert!(
-        down > up,
-        "cleanup must run after the injected partial failure"
+        container_scan > down,
+        "container scan must follow compose down: {log}"
     );
+    assert!(
+        container_remove > container_scan,
+        "container removal must follow scan: {log}"
+    );
+    assert!(
+        image > container_remove,
+        "image must follow container removal: {log}"
+    );
+}
+
+#[test]
+fn differential_script_cleans_its_image_at_every_failure_stage_and_success() {
+    let tools = fake_tool_directory();
+    for (index, failure, expected) in [
+        (0, Some("FAIL_BUILD"), 21),
+        (1, Some("FAIL_COMPOSE_UP"), 23),
+        (2, Some("FAIL_RUNTIME_PROBE"), 24),
+        (3, Some("FAIL_CARGO"), 25),
+        (4, None, 0),
+    ] {
+        let log = tools.path().join(format!("lifecycle-{index}.log"));
+        let mut command = script_command(&tools, &log);
+        if let Some(failure) = failure {
+            command.env(failure, "1");
+        }
+        let status = command.status().expect("run differential lifecycle stage");
+        assert_eq!(status.code(), Some(expected), "stage {failure:?}");
+        let log = std::fs::read_to_string(log).expect("read lifecycle log");
+        assert_owned_cleanup(&log);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn differential_script_cleans_its_image_on_signal_interruption() {
+    let tools = fake_tool_directory();
+    let log = tools.path().join("signal.log");
+    let mut child = script_command(&tools, &log)
+        .env("FAKE_CARGO_SLEEP", "10")
+        .spawn()
+        .expect("spawn differential script for signal");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains(" cargo ")
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cargo stage not reached"
+        );
+        std::thread::yield_now();
+    }
+    let killed = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(killed, 0);
+    assert_eq!(child.wait().expect("signal script exit").code(), Some(143));
+    let log = std::fs::read_to_string(log).expect("read signal lifecycle log");
+    assert_owned_cleanup(&log);
 }
 
 #[test]
@@ -112,6 +194,13 @@ fn concurrent_differential_scripts_use_unique_projects_and_cleanup_each() {
                 .any(|line| line.starts_with(&project) && line.contains(" down ")),
             "project {project} was not cleaned: {log}"
         );
+        assert!(
+            log.lines().any(|line| {
+                line.starts_with(&project)
+                    && line.contains(&format!("docker image rm pingora-chp-oracle:{project}"))
+            }),
+            "project {project} did not remove only its unique image: {log}"
+        );
     }
 }
 
@@ -119,4 +208,12 @@ fn concurrent_differential_scripts_use_unique_projects_and_cleanup_each() {
 fn just_recipe_executes_the_standalone_differential_script() {
     let justfile = std::fs::read_to_string("justfile").expect("read justfile");
     assert!(justfile.contains("./scripts/test-differential.sh"));
+}
+
+#[test]
+fn oracle_image_uses_upstream_lock_and_validates_packed_source_integrity() {
+    let compose = std::fs::read_to_string("compose.test.yml").expect("read compose fixture");
+    assert!(compose.contains("npm ci --omit=dev"));
+    assert!(compose.contains("e55dd25c47058ab05cdcba58b59f4009f49b2fe16f329aa528bf2c233e337cb2"));
+    assert!(compose.contains("e5abb83b5d9d10514758d9bd63b1319b4e9361cd429cc3afbe9b4f4d4f37570ecdcfd8f48d4a90430283475c53e7682a5fe5fa0fc52e3bbe7875075491e058b9"));
 }

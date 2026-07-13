@@ -1675,7 +1675,7 @@ async fn network_redirect_request_and_response_body_traffic_records_activity_lik
 
 #[tokio::test]
 #[serial_test::serial]
-async fn network_unavailable_upstream_is_503_without_activity_and_health_wins() {
+async fn network_unavailable_upstream_activity_depends_on_request_body_and_health_wins() {
     let mut unavailable = ReservedPort::new();
     let target = format!("http://{}", unavailable.release());
     let harness = ProxyHarness::start(
@@ -1693,6 +1693,30 @@ async fn network_unavailable_upstream_is_503_without_activity_and_health_wins() 
     assert_eq!(response.headers()[CONTENT_TYPE], "text/html");
     assert_eq!(response.text().await.unwrap(), CHP_503_HTML);
     tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(harness.route("/missing").last_activity, before_missing);
+
+    let activity_count = || {
+        harness
+            .metrics
+            .render_prometheus()
+            .lines()
+            .find_map(|line| line.strip_prefix("last_activity_updating_count "))
+            .expect("last-activity summary count")
+            .parse::<u64>()
+            .expect("numeric last-activity summary count")
+    };
+    let count_before_body = activity_count();
+    let response = harness
+        .request(
+            reqwest::Client::new()
+                .post(harness.url("/missing/body"))
+                .body("semantic request body"),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.text().await.unwrap(), CHP_503_HTML);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(activity_count(), count_before_body);
     assert_eq!(harness.route("/missing").last_activity, before_missing);
 
     let response = harness

@@ -99,6 +99,14 @@ pub(crate) enum ObservationSide {
     Rust,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ObservationContext {
+    Generic,
+    EchoResponse,
+    RouteMutation,
+    RouteTable,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct EndpointMapping {
     role: String,
@@ -147,7 +155,26 @@ pub(crate) fn observation_for_test(
     body: &[u8],
     mappings: &[EndpointMapping],
 ) -> HttpObservation {
+    observation_for_context_test(
+        ObservationContext::Generic,
+        side,
+        status,
+        headers,
+        body,
+        mappings,
+    )
+}
+
+pub(crate) fn observation_for_context_test(
+    context: ObservationContext,
+    side: ObservationSide,
+    status: u16,
+    headers: &[(&str, &[u8])],
+    body: &[u8],
+    mappings: &[EndpointMapping],
+) -> HttpObservation {
     observation_from_parts(
+        context,
         side,
         status,
         headers
@@ -159,6 +186,7 @@ pub(crate) fn observation_for_test(
 }
 
 fn observation_from_parts(
+    context: ObservationContext,
     side: ObservationSide,
     status: u16,
     headers: impl IntoIterator<Item = (String, Vec<u8>)>,
@@ -176,13 +204,9 @@ fn observation_from_parts(
         }
         semantic_headers.entry(name).or_default().push(value);
     }
-    for values in semantic_headers.values_mut() {
-        values.sort();
-    }
-
     let body = match serde_json::from_slice(body) {
         Ok(mut value) => {
-            normalize_json(&mut value, None, side, mappings);
+            normalize_json(&mut value, context, side, mappings);
             ObservedBody::Json(value)
         }
         Err(_) => ObservedBody::Bytes(body.to_vec()),
@@ -196,45 +220,53 @@ fn observation_from_parts(
 
 fn normalize_json(
     value: &mut Value,
-    key: Option<&str>,
+    context: ObservationContext,
     side: ObservationSide,
     mappings: &[EndpointMapping],
 ) {
-    match value {
-        Value::Object(object) => {
-            for (child_key, child) in object {
-                normalize_json(child, Some(child_key), side, mappings);
+    match (context, value) {
+        (ObservationContext::Generic, _) => {}
+        (ObservationContext::RouteMutation, Value::Object(route)) => {
+            normalize_route_target(route, side, mappings);
+        }
+        (ObservationContext::RouteTable, Value::Object(routes)) => {
+            for route in routes.values_mut() {
+                if let Value::Object(route) = route {
+                    normalize_route_target(route, side, mappings);
+                }
             }
         }
-        Value::Array(values) => {
-            for child in values {
-                normalize_json(child, key, side, mappings);
+        (ObservationContext::EchoResponse, Value::Object(echo)) => {
+            if let Some(Value::String(host)) = echo.get_mut("host") {
+                *host = normalize_structural_url_or_authority(host, side, mappings);
             }
-        }
-        Value::String(text) if key == Some("last_activity") => {
-            if chrono::DateTime::parse_from_rfc3339(text).is_ok() {
-                *text = "<date>".to_owned();
+            if let Some(Value::String(port)) = echo.get_mut("x_forwarded_port") {
+                if let Some(mapping) = mappings.iter().find(|mapping| {
+                    mapping
+                        .address(side)
+                        .rsplit_once(':')
+                        .is_some_and(|(_, expected)| expected == port)
+                }) {
+                    *port = format!("{}-port", mapping.token());
+                }
             }
-        }
-        Value::String(text) if key == Some("target") || key == Some("host") => {
-            *text = normalize_structural_url_or_authority(text, side, mappings);
-        }
-        Value::String(text) if key == Some("x_forwarded_port") => {
-            if let Some(mapping) = mappings.iter().find(|mapping| {
-                mapping
-                    .address(side)
-                    .rsplit_once(':')
-                    .is_some_and(|(_, port)| port == text)
-            }) {
-                *text = format!("{}-port", mapping.token());
+            if let Some(Value::String(address)) = echo.get_mut("x_forwarded_for") {
+                if address.parse::<std::net::IpAddr>().is_ok() {
+                    *address = "<client-address>".to_owned();
+                }
             }
-        }
-        Value::String(text)
-            if key == Some("x_forwarded_for") && text.parse::<std::net::IpAddr>().is_ok() =>
-        {
-            *text = "<client-address>".to_owned();
         }
         _ => {}
+    }
+}
+
+fn normalize_route_target(
+    route: &mut serde_json::Map<String, Value>,
+    side: ObservationSide,
+    mappings: &[EndpointMapping],
+) {
+    if let Some(Value::String(target)) = route.get_mut("target") {
+        *target = normalize_structural_url_or_authority(target, side, mappings);
     }
 }
 
@@ -287,8 +319,8 @@ type CounterValues = BTreeMap<MetricKey, u64>;
 type RawHttpObservation = (u16, Vec<(String, Vec<u8>)>, Vec<u8>);
 
 pub(crate) fn compare_metric_expositions(left: &str, right: &str) -> Result<(), String> {
-    let left = parse_metrics(left)?;
-    let right = parse_metrics(right)?;
+    let left = parse_metrics(left, MetricSource::Chp)?;
+    let right = parse_metrics(right, MetricSource::Rust)?;
     for (name, kind, _) in METRIC_FAMILIES {
         let left_family = left.get(*name).ok_or_else(|| format!("missing {name}"))?;
         let right_family = right.get(*name).ok_or_else(|| format!("missing {name}"))?;
@@ -297,8 +329,12 @@ pub(crate) fn compare_metric_expositions(left: &str, right: &str) -> Result<(), 
         }
         if *kind == "summary" {
             compare_summary(name, left_family, right_family)?;
-        } else if left_family.samples != right_family.samples {
-            return Err(format!("counter samples differ for {name}"));
+        } else {
+            let left_values = counter_samples(left_family)?;
+            let right_values = counter_samples(right_family)?;
+            if left_values != right_values {
+                return Err(format!("counter samples differ for {name}"));
+            }
         }
     }
     Ok(())
@@ -310,10 +346,10 @@ fn compare_metric_deltas(
     right_before: &str,
     right_after: &str,
 ) -> Result<(), String> {
-    let left_before = parse_metrics(left_before)?;
-    let left_after = parse_metrics(left_after)?;
-    let right_before = parse_metrics(right_before)?;
-    let right_after = parse_metrics(right_after)?;
+    let left_before = parse_metrics(left_before, MetricSource::Chp)?;
+    let left_after = parse_metrics(left_after, MetricSource::Chp)?;
+    let right_before = parse_metrics(right_before, MetricSource::Rust)?;
+    let right_after = parse_metrics(right_after, MetricSource::Rust)?;
     for (name, kind, _) in METRIC_FAMILIES {
         let left = left_after
             .get(*name)
@@ -397,7 +433,16 @@ fn scalar_delta(before: &MetricFamily, after: &MetricFamily, name: &str) -> Resu
         .ok_or_else(|| format!("{name} decreased"))
 }
 
-fn parse_metrics(exposition: &str) -> Result<BTreeMap<String, MetricFamily>, String> {
+#[derive(Clone, Copy)]
+enum MetricSource {
+    Chp,
+    Rust,
+}
+
+fn parse_metrics(
+    exposition: &str,
+    source: MetricSource,
+) -> Result<BTreeMap<String, MetricFamily>, String> {
     let expected: BTreeMap<_, _> = METRIC_FAMILIES
         .iter()
         .map(|(name, kind, help)| (*name, (*kind, *help)))
@@ -411,7 +456,7 @@ fn parse_metrics(exposition: &str) -> Result<BTreeMap<String, MetricFamily>, Str
             let (name, help) = rest
                 .split_once(' ')
                 .ok_or_else(|| format!("malformed HELP: {line}"))?;
-            if is_chp_runtime_metric(name) {
+            if matches!(source, MetricSource::Chp) && is_chp_runtime_metric(name) {
                 continue;
             }
             if !expected.contains_key(name)
@@ -425,7 +470,7 @@ fn parse_metrics(exposition: &str) -> Result<BTreeMap<String, MetricFamily>, Str
             let (name, kind) = rest
                 .split_once(' ')
                 .ok_or_else(|| format!("malformed TYPE: {line}"))?;
-            if is_chp_runtime_metric(name) {
+            if matches!(source, MetricSource::Chp) && is_chp_runtime_metric(name) {
                 continue;
             }
             if !expected.contains_key(name)
@@ -441,15 +486,15 @@ fn parse_metrics(exposition: &str) -> Result<BTreeMap<String, MetricFamily>, Str
         let (sample, value) = line
             .split_once(' ')
             .ok_or_else(|| format!("malformed sample: {line}"))?;
+        let (sample_name, labels) = parse_sample_name(sample)?;
+        if matches!(source, MetricSource::Chp) && is_chp_runtime_metric(&sample_name) {
+            continue;
+        }
         let value = value
             .parse::<f64>()
             .map_err(|_| format!("non-numeric sample: {line}"))?;
         if !value.is_finite() {
             return Err(format!("non-finite sample: {line}"));
-        }
-        let (sample_name, labels) = parse_sample_name(sample)?;
-        if is_chp_runtime_metric(&sample_name) {
-            continue;
         }
         let family_name = owning_family(&sample_name)
             .ok_or_else(|| format!("unexpected metric sample {sample_name}"))?;
@@ -578,20 +623,46 @@ fn compare_summary_structure(
     left: &MetricFamily,
     right: &MetricFamily,
 ) -> Result<(), String> {
-    let quantiles = |family: &MetricFamily| -> Result<Vec<String>, String> {
+    let quantiles = |family: &MetricFamily| -> Result<Vec<f64>, String> {
         let samples = family
             .samples
             .get(name)
             .ok_or_else(|| format!("missing {name} quantiles"))?;
-        Ok(samples
+        let mut by_quantile = BTreeMap::new();
+        for sample in samples {
+            let quantile = sample
+                .labels
+                .get("quantile")
+                .ok_or_else(|| format!("missing {name} quantile label"))?;
+            if sample.value < 0.0
+                || by_quantile
+                    .insert(quantile.as_str(), sample.value)
+                    .is_some()
+            {
+                return Err(format!("invalid or duplicate {name} quantile {quantile}"));
+            }
+        }
+        if by_quantile.len() != SUMMARY_QUANTILES.len()
+            || SUMMARY_QUANTILES
+                .iter()
+                .any(|quantile| !by_quantile.contains_key(quantile))
+        {
+            return Err(format!(
+                "{name} must contain each expected quantile exactly once"
+            ));
+        }
+        let values: Vec<_> = SUMMARY_QUANTILES
             .iter()
-            .map(|sample| sample.labels["quantile"].clone())
-            .collect())
+            .map(|quantile| by_quantile[quantile])
+            .collect();
+        if values.windows(2).any(|values| values[0] > values[1]) {
+            return Err(format!("{name} quantile values decreased"));
+        }
+        Ok(values)
     };
-    if quantiles(left)? != quantiles(right)? {
-        return Err(format!("summary quantiles differ for {name}"));
-    }
+    let _ = (quantiles(left)?, quantiles(right)?);
     let sum_name = format!("{name}_sum");
+    let count_name = format!("{name}_count");
     for family in [left, right] {
         let sums = family
             .samples
@@ -600,23 +671,79 @@ fn compare_summary_structure(
         if sums.len() != 1 || sums[0].value < 0.0 {
             return Err(format!("invalid summary sum for {name}"));
         }
+        let counts = family
+            .samples
+            .get(&count_name)
+            .ok_or_else(|| format!("missing summary count for {name}"))?;
+        if counts.len() != 1 || counts[0].value < 0.0 || counts[0].value.fract() != 0.0 {
+            return Err(format!("invalid summary count for {name}"));
+        }
     }
     Ok(())
 }
 
 const STDERR_TAIL_CAPACITY: usize = 64 * 1024;
 static ORACLE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static PORT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const PORT_HANDOFF_START: u16 = 20_000;
+const PORT_HANDOFF_END: u16 = 30_000;
+
+fn diagnostic_panic<T: std::fmt::Debug + PartialEq>(
+    scenario: &str,
+    chp: &T,
+    rust: &T,
+    chp_tail: &str,
+    rust_tail: &str,
+) {
+    if chp != rust {
+        panic!(
+            "{scenario} differs: CHP={chp:?} Rust={rust:?}; CHP stderr tail={}; Rust stderr tail={}",
+            bounded_redacted_tail(chp_tail),
+            bounded_redacted_tail(rust_tail)
+        );
+    }
+}
+
+fn bounded_redacted_tail(tail: &str) -> String {
+    let redacted = redact_stderr(tail.as_bytes(), &[]);
+    let start = redacted.len().saturating_sub(STDERR_TAIL_CAPACITY);
+    String::from_utf8_lossy(&redacted[start..]).into_owned()
+}
+
+pub(crate) fn assert_equal_with_diagnostics_for_test<T: std::fmt::Debug + PartialEq>(
+    scenario: &str,
+    chp: &T,
+    rust: &T,
+    chp_tail: &str,
+    rust_tail: &str,
+) {
+    diagnostic_panic(scenario, chp, rust, chp_tail, rust_tail);
+}
 
 #[allow(dead_code)]
 pub(crate) struct CapturedProcess {
     child: Child,
     stderr: Arc<Mutex<Vec<u8>>>,
     stderr_thread: Option<JoinHandle<()>>,
+    redactions: Vec<Vec<u8>>,
 }
 
 #[allow(dead_code)]
 impl CapturedProcess {
     pub(crate) fn spawn(mut command: Command) -> Self {
+        let redactions = command
+            .get_envs()
+            .filter_map(|(name, value)| {
+                let name = name.to_string_lossy().to_ascii_uppercase();
+                let sensitive = ["TOKEN", "PASSPHRASE", "SECRET"]
+                    .iter()
+                    .any(|marker| name.contains(marker));
+                sensitive
+                    .then(|| value.map(|value| value.to_string_lossy().as_bytes().to_vec()))
+                    .flatten()
+                    .filter(|value| !value.is_empty())
+            })
+            .collect();
         command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -636,11 +763,10 @@ impl CapturedProcess {
                 if count == 0 {
                     break;
                 }
-                let redacted = redact_stderr(&chunk[..count]);
                 let mut tail = captured
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                tail.extend_from_slice(&redacted);
+                tail.extend_from_slice(&chunk[..count]);
                 if tail.len() > STDERR_TAIL_CAPACITY {
                     let excess = tail.len() - STDERR_TAIL_CAPACITY;
                     tail.drain(..excess);
@@ -651,6 +777,7 @@ impl CapturedProcess {
             child,
             stderr,
             stderr_thread: Some(stderr_thread),
+            redactions,
         }
     }
 
@@ -662,13 +789,12 @@ impl CapturedProcess {
     }
 
     pub(crate) fn stderr_tail(&self) -> String {
-        String::from_utf8_lossy(
-            &self
-                .stderr
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        )
-        .into_owned()
+        let tail = self
+            .stderr
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        String::from_utf8_lossy(&redact_stderr(&tail, &self.redactions)).into_owned()
     }
 
     fn join_stderr(&mut self) {
@@ -693,11 +819,15 @@ impl Drop for CapturedProcess {
     }
 }
 
-fn redact_stderr(bytes: &[u8]) -> Vec<u8> {
+fn redact_stderr(bytes: &[u8], secrets: &[Vec<u8>]) -> Vec<u8> {
     let text = String::from_utf8_lossy(bytes);
     let workspace = env!("CARGO_MANIFEST_DIR");
-    text.replace(workspace, "<workspace>")
-        .bytes()
+    let mut text = text.replace(workspace, "<workspace>");
+    for secret in secrets {
+        let secret = String::from_utf8_lossy(secret);
+        text = text.replace(secret.as_ref(), "<redacted>");
+    }
+    text.bytes()
         .filter(|byte| *byte == b'\n' || *byte == b'\t' || !byte.is_ascii_control())
         .collect()
 }
@@ -710,9 +840,15 @@ pub(crate) struct PortLease {
 #[allow(dead_code)]
 impl PortLease {
     pub(crate) fn new() -> Self {
-        Self {
-            listener: StdTcpListener::bind(("127.0.0.1", 0)).expect("reserve differential port"),
+        let range = u64::from(PORT_HANDOFF_END - PORT_HANDOFF_START);
+        for _ in 0..range {
+            let offset = PORT_SEQUENCE.fetch_add(1, Ordering::Relaxed) % range;
+            let port = PORT_HANDOFF_START + offset as u16;
+            if let Ok(listener) = StdTcpListener::bind(("127.0.0.1", port)) {
+                return Self { listener };
+            }
         }
+        panic!("no differential handoff port available");
     }
 
     pub(crate) fn port(&self) -> u16 {
@@ -894,6 +1030,28 @@ pub(crate) struct OraclePair {
 }
 
 impl OraclePair {
+    fn assert_equal<T: std::fmt::Debug + PartialEq>(&self, scenario: &str, chp: &T, rust: &T) {
+        diagnostic_panic(
+            scenario,
+            chp,
+            rust,
+            &self.chp.process.stderr_tail(),
+            &self.rust.stderr_tail(),
+        );
+    }
+
+    fn fail(&self, scenario: &str, detail: impl std::fmt::Display) -> ! {
+        panic!(
+            "{scenario}: {detail}; CHP stderr tail={}; Rust stderr tail={}",
+            self.chp.process.stderr_tail(),
+            self.rust.stderr_tail()
+        )
+    }
+
+    fn expect<T, E: std::fmt::Debug>(&self, scenario: &str, result: Result<T, E>) -> T {
+        result.unwrap_or_else(|error| self.fail(scenario, format!("{error:?}")))
+    }
+
     pub(crate) async fn start() -> Self {
         Self::start_with_args(&[]).await
     }
@@ -1106,6 +1264,15 @@ impl OraclePair {
         "http://oracle-echo.invalid".to_owned()
     }
 
+    pub(crate) fn host_target(&self, target: &str) -> String {
+        let mut target = url::Url::parse(target).expect("harness target URL");
+        assert_eq!(target.host_str(), Some("127.0.0.1"));
+        target
+            .set_host(Some("oracle-host.invalid"))
+            .expect("harness target sentinel host");
+        target.to_string()
+    }
+
     pub(crate) async fn post_route(&self, route: &str, body: Value) {
         let chp_body = self.body_for_side(body.clone(), ObservationSide::Chp);
         let rust_body = self.body_for_side(body, ObservationSide::Rust);
@@ -1117,7 +1284,7 @@ impl OraclePair {
                 "POST",
                 &format!("/api/routes{route}"),
                 Some(&serde_json::to_vec(&chp_body).unwrap()),
-                ObservationSide::Chp,
+                (ObservationContext::RouteMutation, ObservationSide::Chp),
                 &self.mappings,
             )
             .await;
@@ -1126,78 +1293,114 @@ impl OraclePair {
                 "POST",
                 &format!("/api/routes{route}"),
                 Some(&serde_json::to_vec(&rust_body).unwrap()),
-                ObservationSide::Rust,
+                (ObservationContext::RouteMutation, ObservationSide::Rust),
                 &self.mappings,
             )
             .await;
-            assert_eq!(chp, rust, "CHP/Rust Unix route POST differs");
+            self.assert_equal("route mutation response", &chp, &rust);
             return;
         }
-        let chp = self
-            .client
-            .post(format!("{}/api/routes{route}", self.chp_api))
-            .json(&chp_body)
-            .send()
-            .await
-            .expect("CHP route POST");
-        let rust = self
-            .client
-            .post(format!("{}/api/routes{route}", self.rust_api))
-            .json(&rust_body)
-            .send()
-            .await
-            .expect("Rust route POST");
-        self.assert_same_response(chp, rust, "route POST").await;
+        let chp = self.expect(
+            "CHP route mutation request",
+            self.client
+                .post(format!("{}/api/routes{route}", self.chp_api))
+                .json(&chp_body)
+                .send()
+                .await,
+        );
+        let rust = self.expect(
+            "Rust route mutation request",
+            self.client
+                .post(format!("{}/api/routes{route}", self.rust_api))
+                .json(&rust_body)
+                .send()
+                .await,
+        );
+        self.assert_same_response(chp, rust, "route POST", ObservationContext::RouteMutation)
+            .await;
     }
 
     pub(crate) async fn delete_route(&self, route: &str) {
-        let chp = self
-            .client
-            .delete(format!("{}/api/routes{route}", self.chp_api))
-            .send()
-            .await
-            .expect("CHP route DELETE");
-        let rust = self
-            .client
-            .delete(format!("{}/api/routes{route}", self.rust_api))
-            .send()
-            .await
-            .expect("Rust route DELETE");
-        self.assert_same_response(chp, rust, "route DELETE").await;
+        #[cfg(unix)]
+        if let Some(unix) = &self.unix {
+            let chp = docker_unix_observation(
+                &self.chp.name,
+                &unix.chp_api,
+                "DELETE",
+                &format!("/api/routes{route}"),
+                None,
+                (ObservationContext::Generic, ObservationSide::Chp),
+                &self.mappings,
+            )
+            .await;
+            let rust = unix_observation(
+                &unix.rust_api,
+                "DELETE",
+                &format!("/api/routes{route}"),
+                None,
+                (ObservationContext::Generic, ObservationSide::Rust),
+                &self.mappings,
+            )
+            .await;
+            self.assert_equal("Unix route delete response", &chp, &rust);
+            return;
+        }
+        let chp = self.expect(
+            "CHP route delete request",
+            self.client
+                .delete(format!("{}/api/routes{route}", self.chp_api))
+                .send()
+                .await,
+        );
+        let rust = self.expect(
+            "Rust route delete request",
+            self.client
+                .delete(format!("{}/api/routes{route}", self.rust_api))
+                .send()
+                .await,
+        );
+        self.assert_same_response(chp, rust, "route DELETE", ObservationContext::Generic)
+            .await;
     }
 
     pub(crate) async fn assert_same_http(&self, path: &str) {
-        let chp = self
-            .client
-            .get(format!("{}{path}", self.chp_public))
-            .send()
-            .await
-            .expect("CHP public request");
-        let rust = self
-            .client
-            .get(format!("{}{path}", self.rust_public))
-            .send()
-            .await
-            .expect("Rust public request");
-        self.assert_same_response(chp, rust, path).await;
+        let chp = self.expect(
+            "CHP HTTP request",
+            self.client
+                .get(format!("{}{path}", self.chp_public))
+                .send()
+                .await,
+        );
+        let rust = self.expect(
+            "Rust HTTP request",
+            self.client
+                .get(format!("{}{path}", self.rust_public))
+                .send()
+                .await,
+        );
+        self.assert_same_response(chp, rust, path, ObservationContext::EchoResponse)
+            .await;
     }
 
     pub(crate) async fn assert_same_http_with_host(&self, path: &str, host: &str) {
-        let chp = self
-            .client
-            .get(format!("{}{path}", self.chp_public))
-            .header(HOST, host)
-            .send()
-            .await
-            .expect("CHP public host request");
-        let rust = self
-            .client
-            .get(format!("{}{path}", self.rust_public))
-            .header(HOST, host)
-            .send()
-            .await
-            .expect("Rust public host request");
-        self.assert_same_response(chp, rust, path).await;
+        let chp = self.expect(
+            "CHP host-routed HTTP request",
+            self.client
+                .get(format!("{}{path}", self.chp_public))
+                .header(HOST, host)
+                .send()
+                .await,
+        );
+        let rust = self.expect(
+            "Rust host-routed HTTP request",
+            self.client
+                .get(format!("{}{path}", self.rust_public))
+                .header(HOST, host)
+                .send()
+                .await,
+        );
+        self.assert_same_response(chp, rust, path, ObservationContext::EchoResponse)
+            .await;
     }
 
     pub(crate) async fn assert_same_metrics(&self) {
@@ -1213,49 +1416,36 @@ impl OraclePair {
                 &self.metric_baseline_rust,
                 &String::from_utf8_lossy(&rust),
             )
-            .unwrap_or_else(|error| {
-                panic!(
-                    "CHP/Rust Unix metric deltas differ: {error}; CHP stderr tail={}; Rust stderr tail={}",
-                    self.chp.process.stderr_tail(),
-                    self.rust.stderr_tail()
-                )
-            });
+            .unwrap_or_else(|error| self.fail("Unix metrics assertion", error));
             return;
         }
-        let chp = self
-            .client
-            .get(format!("{}/metrics", self.chp_metrics))
-            .send()
-            .await
-            .expect("CHP metrics request")
-            .text()
-            .await
-            .expect("CHP metrics text");
-        let rust = self
-            .client
-            .get(format!("{}/metrics", self.rust_metrics))
-            .send()
-            .await
-            .expect("Rust metrics request")
-            .text()
-            .await
-            .expect("Rust metrics text");
+        let chp_response = self.expect(
+            "CHP metrics request",
+            self.client
+                .get(format!("{}/metrics", self.chp_metrics))
+                .send()
+                .await,
+        );
+        let chp = self.expect("CHP metrics body", chp_response.text().await);
+        let rust_response = self.expect(
+            "Rust metrics request",
+            self.client
+                .get(format!("{}/metrics", self.rust_metrics))
+                .send()
+                .await,
+        );
+        let rust = self.expect("Rust metrics body", rust_response.text().await);
         compare_metric_deltas(
             &self.metric_baseline_chp,
             &chp,
             &self.metric_baseline_rust,
             &rust,
         )
-        .unwrap_or_else(|error| {
-            panic!(
-                "CHP/Rust metric deltas differ: {error}; CHP stderr tail={}; Rust stderr tail={}",
-                self.chp.process.stderr_tail(),
-                self.rust.stderr_tail()
-            )
-        });
+        .unwrap_or_else(|error| self.fail("metrics assertion", error));
     }
 
     pub(crate) async fn assert_same_websocket(&self, path: &str, payload: &[u8]) {
+        let (chp_before, rust_before) = self.metric_texts().await;
         let chp = websocket_observation(
             &format!(
                 "ws://{}{}",
@@ -1274,7 +1464,58 @@ impl OraclePair {
             payload,
         )
         .await;
-        assert_eq!(chp, rust, "CHP/Rust websocket observations differ");
+        self.assert_equal("WebSocket observation", &chp, &rust);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let (chp_after, rust_after) = self.metric_texts().await;
+            let deltas = [
+                metric_integer_delta(
+                    &chp_before,
+                    &chp_after,
+                    MetricSource::Chp,
+                    "last_activity_updating_count",
+                ),
+                metric_integer_delta(
+                    &rust_before,
+                    &rust_after,
+                    MetricSource::Rust,
+                    "last_activity_updating_count",
+                ),
+                metric_integer_delta(&chp_before, &chp_after, MetricSource::Chp, "requests_ws"),
+                metric_integer_delta(&rust_before, &rust_after, MetricSource::Rust, "requests_ws"),
+            ];
+            if deltas == [Ok(2), Ok(2), Ok(1), Ok(1)] {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                self.fail(
+                    "WebSocket metric phases",
+                    format!("expected activity [2,2] and request [1,1], got {deltas:?}"),
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn metric_texts(&self) -> (String, String) {
+        let chp_response = self.expect(
+            "CHP metric phase request",
+            self.client
+                .get(format!("{}/metrics", self.chp_metrics))
+                .send()
+                .await,
+        );
+        let chp = self.expect("CHP metric phase body", chp_response.text().await);
+        let rust_response = self.expect(
+            "Rust metric phase request",
+            self.client
+                .get(format!("{}/metrics", self.rust_metrics))
+                .send()
+                .await,
+        );
+        let rust = self.expect("Rust metric phase body", rust_response.text().await);
+        (chp, rust)
     }
 
     #[cfg(unix)]
@@ -1286,7 +1527,7 @@ impl OraclePair {
             "GET",
             path,
             None,
-            ObservationSide::Chp,
+            (ObservationContext::EchoResponse, ObservationSide::Chp),
             &self.mappings,
         )
         .await;
@@ -1295,31 +1536,65 @@ impl OraclePair {
             "GET",
             path,
             None,
-            ObservationSide::Rust,
+            (ObservationContext::EchoResponse, ObservationSide::Rust),
             &self.mappings,
         )
         .await;
-        assert_eq!(chp, rust, "CHP/Rust Unix public response differs");
+        self.assert_equal("Unix HTTP response", &chp, &rust);
     }
 
-    pub(crate) async fn assert_same_tls_health(&self, server_certificate: &std::path::Path) {
-        let chp = tls_client(server_certificate, self.chp_public_port, None)
+    pub(crate) async fn assert_same_tls_health(
+        &self,
+        server_certificate: &std::path::Path,
+        wrong_root: &std::path::Path,
+    ) {
+        let chp_result = tls_client(server_certificate, self.chp_public_port, None)
             .get(format!(
                 "https://openrusty.org:{}/_chp_healthz",
                 self.chp_public_port
             ))
             .send()
-            .await
-            .expect("CHP TLS health");
-        let rust = tls_client(server_certificate, self.rust_public_port, None)
+            .await;
+        let chp = self.expect("CHP TLS health", chp_result);
+        let rust_result = tls_client(server_certificate, self.rust_public_port, None)
             .get(format!(
                 "https://openrusty.org:{}/_chp_healthz",
                 self.rust_public_port
             ))
             .send()
-            .await
-            .expect("Rust TLS health");
-        self.assert_same_response(chp, rust, "TLS health").await;
+            .await;
+        let rust = self.expect("Rust TLS health", rust_result);
+        self.assert_same_response(chp, rust, "TLS health", ObservationContext::Generic)
+            .await;
+
+        for (name, root, host) in [
+            ("wrong server CA", wrong_root, "openrusty.org"),
+            ("wrong server hostname", server_certificate, "localhost"),
+        ] {
+            let chp_rejected = tls_client(root, self.chp_public_port, None)
+                .get(format!(
+                    "https://{host}:{}/_chp_healthz",
+                    self.chp_public_port
+                ))
+                .send()
+                .await
+                .is_err();
+            let rust_rejected = tls_client(root, self.rust_public_port, None)
+                .get(format!(
+                    "https://{host}:{}/_chp_healthz",
+                    self.rust_public_port
+                ))
+                .send()
+                .await
+                .is_err();
+            self.assert_equal(name, &chp_rejected, &rust_rejected);
+            if !chp_rejected {
+                self.fail(
+                    name,
+                    "both implementations accepted an invalid server identity",
+                );
+            }
+        }
     }
 
     pub(crate) async fn assert_same_mutual_tls_health(
@@ -1327,28 +1602,30 @@ impl OraclePair {
         server_certificate: &std::path::Path,
         client_certificate: &std::path::Path,
         client_key: &std::path::Path,
+        untrusted_client_certificate: &std::path::Path,
+        untrusted_client_key: &std::path::Path,
     ) {
         let mut identity = std::fs::read(client_certificate).expect("read client certificate");
         identity.extend_from_slice(&std::fs::read(client_key).expect("read client key"));
         let chp_client = tls_client(server_certificate, self.chp_public_port, Some(&identity));
         let rust_client = tls_client(server_certificate, self.rust_public_port, Some(&identity));
-        let chp = chp_client
+        let chp_result = chp_client
             .get(format!(
                 "https://openrusty.org:{}/_chp_healthz",
                 self.chp_public_port
             ))
             .send()
-            .await
-            .expect("CHP mutual TLS health");
-        let rust = rust_client
+            .await;
+        let chp = self.expect("CHP mutual TLS health", chp_result);
+        let rust_result = rust_client
             .get(format!(
                 "https://openrusty.org:{}/_chp_healthz",
                 self.rust_public_port
             ))
             .send()
-            .await
-            .expect("Rust mutual TLS health");
-        self.assert_same_response(chp, rust, "mutual TLS health")
+            .await;
+        let rust = self.expect("Rust mutual TLS health", rust_result);
+        self.assert_same_response(chp, rust, "mutual TLS health", ObservationContext::Generic)
             .await;
         let chp_rejected = tls_client(server_certificate, self.chp_public_port, None)
             .get(format!(
@@ -1366,8 +1643,47 @@ impl OraclePair {
             .send()
             .await
             .is_err();
-        assert!(chp_rejected, "CHP accepted a client without mTLS identity");
-        assert_eq!(chp_rejected, rust_rejected, "mTLS rejection differs");
+        self.assert_equal("missing mTLS identity", &chp_rejected, &rust_rejected);
+        if !chp_rejected {
+            self.fail("missing mTLS identity", "both implementations accepted it");
+        }
+
+        let mut untrusted_identity =
+            std::fs::read(untrusted_client_certificate).expect("read untrusted client certificate");
+        untrusted_identity.extend_from_slice(
+            &std::fs::read(untrusted_client_key).expect("read untrusted client key"),
+        );
+        let chp_untrusted = tls_client(
+            server_certificate,
+            self.chp_public_port,
+            Some(&untrusted_identity),
+        )
+        .get(format!(
+            "https://openrusty.org:{}/_chp_healthz",
+            self.chp_public_port
+        ))
+        .send()
+        .await
+        .is_err();
+        let rust_untrusted = tls_client(
+            server_certificate,
+            self.rust_public_port,
+            Some(&untrusted_identity),
+        )
+        .get(format!(
+            "https://openrusty.org:{}/_chp_healthz",
+            self.rust_public_port
+        ))
+        .send()
+        .await
+        .is_err();
+        self.assert_equal("untrusted mTLS identity", &chp_untrusted, &rust_untrusted);
+        if !chp_untrusted {
+            self.fail(
+                "untrusted mTLS identity",
+                "both implementations accepted it",
+            );
+        }
     }
 
     pub(crate) async fn assert_same_route_tables(&self) {
@@ -1379,7 +1695,7 @@ impl OraclePair {
                 "GET",
                 "/api/routes",
                 None,
-                ObservationSide::Chp,
+                (ObservationContext::RouteTable, ObservationSide::Chp),
                 &self.mappings,
             )
             .await;
@@ -1388,26 +1704,29 @@ impl OraclePair {
                 "GET",
                 "/api/routes",
                 None,
-                ObservationSide::Rust,
+                (ObservationContext::RouteTable, ObservationSide::Rust),
                 &self.mappings,
             )
             .await;
-            assert_eq!(chp, rust, "CHP/Rust Unix route tables differ");
+            self.assert_equal("Unix route table", &chp, &rust);
             return;
         }
-        let chp = self
-            .client
-            .get(format!("{}/api/routes", self.chp_api))
-            .send()
-            .await
-            .expect("CHP route table");
-        let rust = self
-            .client
-            .get(format!("{}/api/routes", self.rust_api))
-            .send()
-            .await
-            .expect("Rust route table");
-        self.assert_same_response(chp, rust, "route tables").await;
+        let chp = self.expect(
+            "CHP route table request",
+            self.client
+                .get(format!("{}/api/routes", self.chp_api))
+                .send()
+                .await,
+        );
+        let rust = self.expect(
+            "Rust route table request",
+            self.client
+                .get(format!("{}/api/routes", self.rust_api))
+                .send()
+                .await,
+        );
+        self.assert_same_response(chp, rust, "route tables", ObservationContext::RouteTable)
+            .await;
     }
 
     async fn assert_same_response(
@@ -1415,14 +1734,15 @@ impl OraclePair {
         chp: reqwest::Response,
         rust: reqwest::Response,
         scenario: &str,
+        context: ObservationContext,
     ) {
-        let chp = observe(chp, ObservationSide::Chp, &self.mappings).await;
-        let rust = observe(rust, ObservationSide::Rust, &self.mappings).await;
-        assert_eq!(chp, rust, "CHP/Rust mismatch for {scenario}");
+        let chp = observe(chp, context, ObservationSide::Chp, &self.mappings).await;
+        let rust = observe(rust, context, ObservationSide::Rust, &self.mappings).await;
+        self.assert_equal(scenario, &chp, &rust);
     }
 
     fn body_for_side(&self, mut body: Value, side: ObservationSide) -> Value {
-        transform_targets(&mut body, side, self.echo.port);
+        prepare_route_body(&mut body, side, self.echo.port);
         body
     }
 }
@@ -1450,33 +1770,70 @@ fn dockerize_loopback(arg: &str) -> String {
     arg.replace("127.0.0.1", "host.docker.internal")
 }
 
-fn transform_targets(value: &mut Value, side: ObservationSide, echo_port: u16) {
-    match value {
-        Value::Object(object) => {
-            for (key, child) in object {
-                if key == "target" {
-                    if let Value::String(target) = child {
-                        let echo = match side {
-                            ObservationSide::Chp => {
-                                format!("host.docker.internal:{echo_port}")
-                            }
-                            ObservationSide::Rust => format!("127.0.0.1:{echo_port}"),
-                        };
-                        *target = target.replace("oracle-echo.invalid", &echo);
-                        if side == ObservationSide::Chp {
-                            *target = dockerize_loopback(target);
-                        }
-                    }
-                } else {
-                    transform_targets(child, side, echo_port);
-                }
-            }
+fn prepare_route_body(value: &mut Value, side: ObservationSide, echo_port: u16) {
+    let Value::Object(route) = value else {
+        return;
+    };
+    route
+        .entry("last_activity")
+        .or_insert_with(|| Value::String("2000-01-01T00:00:00.000Z".to_owned()));
+    if let Some(Value::String(target)) = route.get_mut("target") {
+        let Ok(mut parsed) = url::Url::parse(target) else {
+            return;
+        };
+        let echo_sentinel = parsed.host_str() == Some("oracle-echo.invalid");
+        if !echo_sentinel && parsed.host_str() != Some("oracle-host.invalid") {
+            return;
         }
-        Value::Array(values) => values
-            .iter_mut()
-            .for_each(|child| transform_targets(child, side, echo_port)),
-        _ => {}
+        let host = match side {
+            ObservationSide::Chp => "host.docker.internal",
+            ObservationSide::Rust => "127.0.0.1",
+        };
+        parsed.set_host(Some(host)).expect("valid oracle echo host");
+        if echo_sentinel {
+            parsed
+                .set_port(Some(echo_port))
+                .expect("oracle echo URL accepts a port");
+        }
+        *target = parsed.to_string();
     }
+}
+
+pub(crate) fn route_body_for_test(
+    mut value: Value,
+    side: ObservationSide,
+    echo_port: u16,
+) -> Value {
+    prepare_route_body(&mut value, side, echo_port);
+    value
+}
+
+fn metric_integer_delta(
+    before: &str,
+    after: &str,
+    source: MetricSource,
+    sample_name: &str,
+) -> Result<u64, String> {
+    let sample = |exposition: &str| -> Result<u64, String> {
+        let families = parse_metrics(exposition, source)?;
+        let family_name = owning_family(sample_name)
+            .ok_or_else(|| format!("no owning family for {sample_name}"))?;
+        let samples = families[family_name]
+            .samples
+            .get(sample_name)
+            .ok_or_else(|| format!("missing {sample_name}"))?;
+        if samples.len() != 1
+            || !samples[0].labels.is_empty()
+            || samples[0].value < 0.0
+            || samples[0].value.fract() != 0.0
+        {
+            return Err(format!("invalid integer sample {sample_name}"));
+        }
+        Ok(samples[0].value as u64)
+    };
+    sample(after)?
+        .checked_sub(sample(before)?)
+        .ok_or_else(|| format!("{sample_name} decreased"))
 }
 
 async fn spawn_docker_oracle(
@@ -1572,10 +1929,18 @@ async fn wait_tcp_ready(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         if chp.process.exited() {
-            panic!("CHP readiness exit: {}", chp.process.stderr_tail());
+            panic!(
+                "CHP readiness exit; CHP stderr tail={}; Rust stderr tail={}",
+                chp.process.stderr_tail(),
+                rust.stderr_tail()
+            );
         }
         if rust.exited() {
-            panic!("Rust readiness exit: {}", rust.stderr_tail());
+            panic!(
+                "Rust readiness exit; CHP stderr tail={}; Rust stderr tail={}",
+                chp.process.stderr_tail(),
+                rust.stderr_tail()
+            );
         }
         let mut ready = true;
         for url in [
@@ -1611,10 +1976,18 @@ async fn wait_unix_ready(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         if chp.process.exited() {
-            panic!("CHP Unix exit: {}", chp.process.stderr_tail());
+            panic!(
+                "CHP Unix readiness exit; CHP stderr tail={}; Rust stderr tail={}",
+                chp.process.stderr_tail(),
+                rust.stderr_tail()
+            );
         }
         if rust.exited() {
-            panic!("Rust Unix exit: {}", rust.stderr_tail());
+            panic!(
+                "Rust Unix readiness exit; CHP stderr tail={}; Rust stderr tail={}",
+                chp.process.stderr_tail(),
+                rust.stderr_tail()
+            );
         }
         let mut ready = chp_paths
             .into_iter()
@@ -1654,6 +2027,7 @@ fn docker_unix_ready(container: &str, socket: &std::path::Path) -> bool {
 
 async fn observe(
     response: reqwest::Response,
+    context: ObservationContext,
     side: ObservationSide,
     mappings: &[EndpointMapping],
 ) -> HttpObservation {
@@ -1665,7 +2039,7 @@ async fn observe(
         }
     }
     let body = response.bytes().await.expect("read differential response");
-    observation_from_parts(side, status, headers, &body, mappings)
+    observation_from_parts(context, side, status, headers, &body, mappings)
 }
 
 #[cfg(unix)]
@@ -1674,9 +2048,10 @@ async fn unix_observation(
     method: &str,
     path: &str,
     body: Option<&[u8]>,
-    side: ObservationSide,
+    observation: (ObservationContext, ObservationSide),
     mappings: &[EndpointMapping],
 ) -> HttpObservation {
+    let (context, side) = observation;
     let response = unix_raw_response(socket, method, path, body).await;
     let mut raw_headers = [httparse::EMPTY_HEADER; 64];
     let mut parsed = httparse::Response::new(&mut raw_headers);
@@ -1699,7 +2074,7 @@ async fn unix_observation(
     } else {
         response[offset..].to_vec()
     };
-    observation_from_parts(side, status, headers, &body, mappings)
+    observation_from_parts(context, side, status, headers, &body, mappings)
 }
 
 #[cfg(unix)]
@@ -1709,11 +2084,12 @@ async fn docker_unix_observation(
     method: &str,
     path: &str,
     body: Option<&[u8]>,
-    side: ObservationSide,
+    observation: (ObservationContext, ObservationSide),
     mappings: &[EndpointMapping],
 ) -> HttpObservation {
+    let (context, side) = observation;
     let (status, headers, body) = docker_unix_http(container, socket, method, path, body).await;
-    observation_from_parts(side, status, headers, &body, mappings)
+    observation_from_parts(context, side, status, headers, &body, mappings)
 }
 
 #[cfg(unix)]
@@ -1891,7 +2267,6 @@ fn tls_client(root: &std::path::Path, port: u16, identity: Option<&[u8]>) -> req
         .timeout(Duration::from_secs(3))
         .redirect(reqwest::redirect::Policy::none())
         .add_root_certificate(root)
-        .danger_accept_invalid_certs(true)
         .resolve(
             "openrusty.org",
             std::net::SocketAddr::from(([127, 0, 0, 1], port)),

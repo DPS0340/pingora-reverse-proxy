@@ -42,7 +42,6 @@ pub struct RequestContext {
     pub resolved_route_key: Option<RouteKey>,
     pub original_uri: Uri,
     pub original_host: Option<HeaderValue>,
-    pub activity_eligible: bool,
     pub error_classification: Option<ProxyErrorClass>,
     upstream_route: Option<UpstreamRoute>,
     request_activity_published: bool,
@@ -56,7 +55,6 @@ impl Default for RequestContext {
             resolved_route_key: None,
             original_uri: Uri::from_static("/"),
             original_host: None,
-            activity_eligible: false,
             error_classification: None,
             upstream_route: None,
             request_activity_published: false,
@@ -428,7 +426,6 @@ impl ProxyHttp for ChpProxy {
                 upstream_response.remove_header(&LOCATION);
             }
         }
-        ctx.activity_eligible = upstream_response.status.as_u16() < 300;
         if records_proxy_response_status(upstream_response.status.as_u16()) {
             self.metrics
                 .record_proxy_request(upstream_response.status.as_u16());
@@ -546,7 +543,6 @@ impl ProxyHttp for ChpProxy {
             && session
                 .response_written()
                 .is_some_and(|response| response.status.as_u16() < 300);
-        ctx.activity_eligible |= successful;
         if ctx.claim_http_completion_activity(successful, session.is_upgrade_req()) {
             self.publish_activity(ctx);
         }
