@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::fmt;
+use std::io;
+use std::path::{Path as StdPath, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{OriginalUri, Path, State};
@@ -10,11 +13,13 @@ use axum::response::Response;
 use axum::routing::{get, patch, put};
 use axum::Router;
 use chrono::{DateTime, SecondsFormat, Utc};
+use futures_util::stream;
 use pingora_reverse_proxy::route::RouteData;
-use serde::Deserialize;
+use serde::de::{self, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
 
 pub const HEALTH: &str = "health";
 pub const SNAPSHOT: &str = "snapshot";
@@ -22,13 +27,53 @@ pub const PUT: &str = "put";
 pub const ACTIVITY: &str = "activity";
 pub const DELETE: &str = "delete";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum Fault {
     ServerError,
+    ServerErrorGate(FaultGate),
     ClientError,
     Timeout,
     LoseReply,
     MalformedBody,
+    MissingProtocol,
+    WrongProtocol,
+    WrongContentType,
+    WrongSuccessStatus,
+    TruncatedBody,
+    OversizedBody,
+    OversizedHeaders,
+    TooManyHeaders,
+    NonEmptyNoContent,
+    NonEmptyNotFound,
+    RawBody(Vec<u8>),
+}
+
+#[derive(Clone, Debug)]
+pub struct FaultGate {
+    arrived: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+
+impl FaultGate {
+    pub fn new() -> Self {
+        Self {
+            arrived: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+        }
+    }
+
+    pub async fn wait_until_arrived(&self) {
+        self.arrived.acquire().await.unwrap().forget();
+    }
+
+    pub fn release(&self) {
+        self.release.add_permits(1);
+    }
+
+    async fn block_response(&self) {
+        self.arrived.add_permits(1);
+        self.release.acquire().await.unwrap().forget();
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -43,6 +88,9 @@ struct FixtureControls {
     faults: HashMap<&'static str, VecDeque<Fault>>,
     health_body: Option<Vec<u8>>,
     health_protocol: Option<String>,
+    health_content_type: Option<String>,
+    snapshot_body: Option<Vec<u8>>,
+    snapshot_content_type: Option<String>,
 }
 
 struct FixtureState {
@@ -50,12 +98,17 @@ struct FixtureState {
     controls: Mutex<FixtureControls>,
     requests: Mutex<Vec<RecordedRequest>>,
     bearer_token: Option<String>,
+    commits: AtomicUsize,
+    commit_notify: Notify,
+    durable_path: PathBuf,
 }
 
 pub struct SidecarFixture {
     base_url: String,
     state: Arc<FixtureState>,
     task: Option<tokio::task::JoinHandle<()>>,
+    durable_path: PathBuf,
+    durable_dir: Option<tempfile::TempDir>,
 }
 
 impl SidecarFixture {
@@ -64,21 +117,25 @@ impl SidecarFixture {
     }
 
     pub async fn start_with_token(token: Option<&str>) -> Self {
-        let state = Arc::new(FixtureState {
-            routes: RwLock::new(BTreeMap::new()),
-            controls: Mutex::new(FixtureControls::default()),
-            requests: Mutex::new(Vec::new()),
-            bearer_token: token.map(str::to_owned),
-        });
-        Self::serve(state).await
+        let durable_dir = tempfile::tempdir().unwrap();
+        let durable_path = durable_dir.path().join("routes.json");
+        std::fs::write(&durable_path, b"{}").unwrap();
+        let state = load_state(&durable_path, token.map(str::to_owned));
+        Self::serve(state, durable_dir, durable_path).await
     }
 
-    async fn serve(state: Arc<FixtureState>) -> Self {
+    async fn serve(
+        state: Arc<FixtureState>,
+        durable_dir: tempfile::TempDir,
+        durable_path: PathBuf,
+    ) -> Self {
         let app = Router::new()
             .route("/v1/health", get(health))
             .route("/v1/routes", get(snapshot))
             .route("/v1/routes/{key}", put(put_route).delete(delete_route))
             .route("/v1/routes/{key}/activity", patch(update_activity))
+            .fallback(not_found)
+            .method_not_allowed_fallback(method_not_allowed)
             .with_state(Arc::clone(&state));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -89,6 +146,8 @@ impl SidecarFixture {
             base_url: format!("http://{address}/"),
             state,
             task: Some(task),
+            durable_path,
+            durable_dir: Some(durable_dir),
         }
     }
 
@@ -119,6 +178,18 @@ impl SidecarFixture {
         self.state.controls.lock().await.health_protocol = Some(protocol.to_owned());
     }
 
+    pub async fn set_health_content_type(&self, content_type: &str) {
+        self.state.controls.lock().await.health_content_type = Some(content_type.to_owned());
+    }
+
+    pub async fn set_raw_snapshot_body(&self, body: &[u8]) {
+        self.state.controls.lock().await.snapshot_body = Some(body.to_vec());
+    }
+
+    pub async fn set_snapshot_content_type(&self, content_type: &str) {
+        self.state.controls.lock().await.snapshot_content_type = Some(content_type.to_owned());
+    }
+
     pub async fn requests(&self) -> Vec<RecordedRequest> {
         self.state.requests.lock().await.clone()
     }
@@ -135,14 +206,68 @@ impl SidecarFixture {
         self.state.routes.read().await.clone()
     }
 
+    pub fn state_identity(&self) -> usize {
+        Arc::as_ptr(&self.state) as usize
+    }
+
+    pub fn durable_path(&self) -> Option<&StdPath> {
+        Some(&self.durable_path)
+    }
+
+    pub async fn wait_for_commits(&self, expected: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let notified = self.state.commit_notify.notified();
+                if self.state.commits.load(Ordering::Acquire) >= expected {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
     pub async fn restart(&mut self) {
         if let Some(task) = self.task.take() {
             task.abort();
+            let _ = task.await;
         }
-        let mut replacement = Self::serve(Arc::clone(&self.state)).await;
+        let token = self.state.bearer_token.clone();
+        let state = load_state(&self.durable_path, token);
+        let durable_dir = self.durable_dir.take().unwrap();
+        let mut replacement = Self::serve(state, durable_dir, self.durable_path.clone()).await;
         self.base_url = replacement.base_url.clone();
+        self.state = Arc::clone(&replacement.state);
         self.task = replacement.task.take();
+        self.durable_path = replacement.durable_path.clone();
+        self.durable_dir = replacement.durable_dir.take();
     }
+}
+
+fn load_state(durable_path: &StdPath, bearer_token: Option<String>) -> Arc<FixtureState> {
+    let bytes = std::fs::read(durable_path).unwrap();
+    let routes = serde_json::from_slice(&bytes).unwrap();
+    Arc::new(FixtureState {
+        routes: RwLock::new(routes),
+        controls: Mutex::new(FixtureControls::default()),
+        requests: Mutex::new(Vec::new()),
+        bearer_token,
+        commits: AtomicUsize::new(0),
+        commit_notify: Notify::new(),
+        durable_path: durable_path.to_owned(),
+    })
+}
+
+fn persist_routes(state: &FixtureState, routes: &BTreeMap<String, RouteData>) -> Result<(), ()> {
+    let encoded: BTreeMap<_, _> = routes
+        .iter()
+        .map(|(key, route)| (key, route_value(route)))
+        .collect();
+    let body = serde_json::to_vec(&encoded).map_err(|_| ())?;
+    let temporary = state.durable_path.with_extension("json.tmp");
+    std::fs::write(&temporary, body).map_err(|_| ())?;
+    std::fs::rename(temporary, &state.durable_path).map_err(|_| ())
 }
 
 impl Drop for SidecarFixture {
@@ -184,6 +309,112 @@ fn json_response(status: StatusCode, body: &impl serde::Serialize) -> Response {
     response
 }
 
+async fn not_found() -> Response {
+    protocol_response(StatusCode::NOT_FOUND, Body::empty())
+}
+
+async fn method_not_allowed() -> Response {
+    protocol_response(StatusCode::METHOD_NOT_ALLOWED, Body::empty())
+}
+
+fn postcommit_response(fault: Option<&Fault>, mut response: Response) -> Response {
+    match fault {
+        Some(Fault::MalformedBody) => json_response(StatusCode::OK, &json!({"broken": true})),
+        Some(Fault::MissingProtocol) => {
+            response.headers_mut().remove("x-store-protocol");
+            response
+        }
+        Some(Fault::WrongProtocol) => {
+            response.headers_mut().insert(
+                "x-store-protocol",
+                HeaderValue::from_static("wrong-version"),
+            );
+            response
+        }
+        Some(Fault::WrongContentType) => {
+            response
+                .headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+            response
+        }
+        Some(Fault::WrongSuccessStatus) => {
+            *response.status_mut() = StatusCode::FOUND;
+            response
+        }
+        Some(Fault::TruncatedBody) => {
+            *response.status_mut() = StatusCode::OK;
+            response
+                .headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            *response.body_mut() = Body::from_stream(stream::iter([
+                Ok::<_, io::Error>(Bytes::from_static(b"{\"target\":\"secret")),
+                Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated")),
+            ]));
+            response
+        }
+        Some(Fault::OversizedBody) => {
+            *response.status_mut() = StatusCode::OK;
+            response
+                .headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            *response.body_mut() = Body::from(vec![b'x'; 4 * 1024 * 1024 + 1]);
+            response
+        }
+        Some(Fault::OversizedHeaders) => {
+            let value = HeaderValue::from_bytes(&vec![b'x'; 2_048]).unwrap();
+            for index in 0..20 {
+                let name: axum::http::HeaderName = format!("x-padding-{index}").parse().unwrap();
+                response.headers_mut().insert(name, value.clone());
+            }
+            response
+        }
+        Some(Fault::TooManyHeaders) => {
+            for index in 0..65 {
+                let name: axum::http::HeaderName = format!("x-count-{index}").parse().unwrap();
+                response
+                    .headers_mut()
+                    .insert(name, HeaderValue::from_static("x"));
+            }
+            response
+        }
+        Some(Fault::NonEmptyNoContent) => {
+            *response.status_mut() = StatusCode::NO_CONTENT;
+            response.headers_mut().remove(CONTENT_TYPE);
+            response
+                .headers_mut()
+                .insert("content-length", HeaderValue::from_static("11"));
+            *response.body_mut() = Body::from("secret-body");
+            response
+        }
+        Some(Fault::NonEmptyNotFound) => {
+            *response.status_mut() = StatusCode::NOT_FOUND;
+            *response.body_mut() = Body::from("secret-body");
+            response
+        }
+        Some(Fault::RawBody(body)) => {
+            *response.status_mut() = StatusCode::OK;
+            response
+                .headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            *response.body_mut() = Body::from(body.clone());
+            response
+        }
+        Some(
+            Fault::ServerError
+            | Fault::ServerErrorGate(_)
+            | Fault::ClientError
+            | Fault::Timeout
+            | Fault::LoseReply,
+        )
+        | None => response,
+    }
+}
+
+fn record_commit(state: &FixtureState) {
+    state.commits.fetch_add(1, Ordering::Release);
+    state.commit_notify.notify_waiters();
+}
+
 async fn authorize_and_record(
     state: &FixtureState,
     method: Method,
@@ -192,14 +423,28 @@ async fn authorize_and_record(
     body: &[u8],
 ) -> Option<Response> {
     state.requests.lock().await.push(RecordedRequest {
-        method,
+        method: method.clone(),
         path: uri.path().to_owned(),
         body: body.to_vec(),
     });
     if headers
-        .get("x-store-protocol")
-        .and_then(|value| value.to_str().ok())
-        != Some("v1")
+        .get_all("x-store-protocol")
+        .iter()
+        .map(|value| value.to_str().ok())
+        .collect::<Vec<_>>()
+        .as_slice()
+        != [Some("v1")]
+    {
+        return Some(protocol_response(StatusCode::BAD_REQUEST, Body::empty()));
+    }
+    if matches!(method, Method::PUT | Method::PATCH)
+        && headers
+            .get_all(CONTENT_TYPE)
+            .iter()
+            .map(|value| value.to_str().ok())
+            .collect::<Vec<_>>()
+            .as_slice()
+            != [Some("application/json")]
     {
         return Some(protocol_response(StatusCode::BAD_REQUEST, Body::empty()));
     }
@@ -233,12 +478,45 @@ async fn precommit_fault(state: &FixtureState, operation: &'static str) -> Optio
             Body::empty(),
         )),
         Some(Fault::ClientError) => Some(protocol_response(StatusCode::BAD_REQUEST, Body::empty())),
-        Some(Fault::Timeout) => {
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            None
+        Some(Fault::ServerErrorGate(gate)) => {
+            gate.block_response().await;
+            Some(protocol_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Body::empty(),
+            ))
         }
+        Some(Fault::Timeout) => std::future::pending::<Option<Response>>().await,
         Some(Fault::MalformedBody) => Some(json_response(StatusCode::OK, &json!({"broken": true}))),
-        Some(Fault::LoseReply) => None,
+        Some(
+            fault @ (Fault::WrongContentType
+            | Fault::OversizedBody
+            | Fault::OversizedHeaders
+            | Fault::TooManyHeaders),
+        ) => {
+            let response = if operation == HEALTH {
+                json_response(StatusCode::OK, &json!({"version": "v1", "status": "ok"}))
+            } else {
+                json_response(StatusCode::OK, &json!({}))
+            };
+            Some(postcommit_response(Some(&fault), response))
+        }
+        Some(
+            Fault::LoseReply
+            | Fault::MissingProtocol
+            | Fault::WrongProtocol
+            | Fault::WrongSuccessStatus
+            | Fault::NonEmptyNoContent
+            | Fault::NonEmptyNotFound
+            | Fault::RawBody(_),
+        ) => None,
+        Some(Fault::TruncatedBody) => {
+            let response = if operation == HEALTH {
+                json_response(StatusCode::OK, &json!({"version": "v1", "status": "ok"}))
+            } else {
+                json_response(StatusCode::OK, &json!({}))
+            };
+            Some(postcommit_response(Some(&Fault::TruncatedBody), response))
+        }
         None => None,
     }
 }
@@ -260,6 +538,7 @@ async fn health(
         .clone()
         .unwrap_or_else(|| serde_json::to_vec(&json!({"version": "v1", "status": "ok"})).unwrap());
     let protocol = controls.health_protocol.clone();
+    let content_type = controls.health_content_type.clone();
     drop(controls);
     let mut response = protocol_response(StatusCode::OK, Body::from(body));
     if let Some(protocol) = protocol {
@@ -268,9 +547,10 @@ async fn health(
             HeaderValue::from_str(&protocol).unwrap(),
         );
     }
-    response
-        .headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_str(content_type.as_deref().unwrap_or("application/json")).unwrap(),
+    );
     response
 }
 
@@ -292,16 +572,29 @@ async fn snapshot(
         .iter()
         .map(|(key, route)| (key.clone(), route_value(route)))
         .collect();
-    json_response(StatusCode::OK, &routes)
+    let controls = state.controls.lock().await;
+    let body = controls
+        .snapshot_body
+        .clone()
+        .unwrap_or_else(|| serde_json::to_vec(&routes).unwrap());
+    let content_type = controls.snapshot_content_type.clone();
+    drop(controls);
+    let mut response = protocol_response(StatusCode::OK, Body::from(body));
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_str(content_type.as_deref().unwrap_or("application/json")).unwrap(),
+    );
+    response
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PutEnvelope {
     version: String,
     operation: String,
-    route: RouteData,
+    route: StrictRouteData,
     #[serde(rename = "activityFloor")]
-    activity_floor: Option<String>,
+    activity_floor: String,
 }
 
 async fn put_route(
@@ -315,23 +608,44 @@ async fn put_route(
         return response;
     }
     let fault = next_fault(&state, PUT).await;
-    match fault {
+    match fault.as_ref() {
         Some(Fault::ServerError) => {
             return protocol_response(StatusCode::INTERNAL_SERVER_ERROR, Body::empty())
+        }
+        Some(Fault::ServerErrorGate(gate)) => {
+            gate.block_response().await;
+            return protocol_response(StatusCode::INTERNAL_SERVER_ERROR, Body::empty());
         }
         Some(Fault::ClientError) => {
             return protocol_response(StatusCode::BAD_REQUEST, Body::empty())
         }
-        Some(Fault::Timeout) => tokio::time::sleep(Duration::from_secs(30)).await,
-        Some(Fault::MalformedBody) => {
-            return json_response(StatusCode::OK, &json!({"broken": true}))
-        }
-        Some(Fault::LoseReply) | None => {}
+        Some(Fault::Timeout) => std::future::pending::<()>().await,
+        Some(
+            Fault::LoseReply
+            | Fault::MalformedBody
+            | Fault::MissingProtocol
+            | Fault::WrongProtocol
+            | Fault::WrongContentType
+            | Fault::WrongSuccessStatus
+            | Fault::TruncatedBody
+            | Fault::OversizedBody
+            | Fault::OversizedHeaders
+            | Fault::TooManyHeaders
+            | Fault::NonEmptyNoContent
+            | Fault::NonEmptyNotFound
+            | Fault::RawBody(_),
+        )
+        | None => {}
     }
-    let Ok(mut envelope) = serde_json::from_slice::<PutEnvelope>(&body) else {
+    let Ok(envelope) = serde_json::from_slice::<PutEnvelope>(&body) else {
+        return protocol_response(StatusCode::BAD_REQUEST, Body::empty());
+    };
+    let mut route = envelope.route.0;
+    let Ok(floor) = strict_timestamp(&envelope.activity_floor) else {
         return protocol_response(StatusCode::BAD_REQUEST, Body::empty());
     };
     if envelope.version != "v1"
+        || !route_key.starts_with('/')
         || !matches!(
             envelope.operation.as_str(),
             "add" | "put" | "put_preserving_activity"
@@ -340,38 +654,35 @@ async fn put_route(
         return protocol_response(StatusCode::BAD_REQUEST, Body::empty());
     }
     let mut routes = state.routes.write().await;
+    let mut next = routes.clone();
     match envelope.operation.as_str() {
-        "add" => {
-            envelope.route.last_activity = envelope
-                .route
-                .last_activity
-                .max(parse_floor(envelope.activity_floor.as_deref()));
-        }
-        "put_preserving_activity" => {
-            envelope.route.last_activity = envelope
-                .route
-                .last_activity
-                .max(parse_floor(envelope.activity_floor.as_deref()));
+        "add" | "put_preserving_activity" => {
+            route.last_activity = route.last_activity.max(floor);
+            if let Some(existing) = next.get(&route_key) {
+                route.last_activity = route.last_activity.max(existing.last_activity);
+            }
         }
         "put" => {}
-        _ => unreachable!(),
+        _ => return protocol_response(StatusCode::BAD_REQUEST, Body::empty()),
     }
-    routes.insert(route_key, envelope.route);
+    next.insert(route_key, route);
+    if persist_routes(&state, &next).is_err() {
+        return protocol_response(StatusCode::INTERNAL_SERVER_ERROR, Body::empty());
+    }
+    *routes = next;
     drop(routes);
-    if fault == Some(Fault::LoseReply) {
+    record_commit(&state);
+    if matches!(fault, Some(Fault::LoseReply)) {
         std::future::pending::<()>().await;
     }
-    protocol_response(StatusCode::NO_CONTENT, Body::empty())
-}
-
-fn parse_floor(floor: Option<&str>) -> DateTime<Utc> {
-    floor
-        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-        .map(|value| value.with_timezone(&Utc))
-        .unwrap_or(DateTime::<Utc>::MIN_UTC)
+    postcommit_response(
+        fault.as_ref(),
+        protocol_response(StatusCode::NO_CONTENT, Body::empty()),
+    )
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ActivityEnvelope {
     version: String,
     #[serde(rename = "lastActivity")]
@@ -390,35 +701,62 @@ async fn update_activity(
         return response;
     }
     let fault = next_fault(&state, ACTIVITY).await;
-    match fault {
+    match fault.as_ref() {
         Some(Fault::ServerError) => {
             return protocol_response(StatusCode::INTERNAL_SERVER_ERROR, Body::empty())
+        }
+        Some(Fault::ServerErrorGate(gate)) => {
+            gate.block_response().await;
+            return protocol_response(StatusCode::INTERNAL_SERVER_ERROR, Body::empty());
         }
         Some(Fault::ClientError) => {
             return protocol_response(StatusCode::BAD_REQUEST, Body::empty())
         }
-        Some(Fault::Timeout) => tokio::time::sleep(Duration::from_secs(30)).await,
-        Some(Fault::MalformedBody) => {
-            return json_response(StatusCode::OK, &json!({"broken": true}))
-        }
-        Some(Fault::LoseReply) | None => {}
+        Some(Fault::Timeout) => std::future::pending::<()>().await,
+        Some(
+            Fault::LoseReply
+            | Fault::MalformedBody
+            | Fault::MissingProtocol
+            | Fault::WrongProtocol
+            | Fault::WrongContentType
+            | Fault::WrongSuccessStatus
+            | Fault::TruncatedBody
+            | Fault::OversizedBody
+            | Fault::OversizedHeaders
+            | Fault::TooManyHeaders
+            | Fault::NonEmptyNoContent
+            | Fault::NonEmptyNotFound
+            | Fault::RawBody(_),
+        )
+        | None => {}
     }
     let Ok(envelope) = serde_json::from_slice::<ActivityEnvelope>(&body) else {
         return protocol_response(StatusCode::BAD_REQUEST, Body::empty());
     };
-    let Ok(at) = DateTime::parse_from_rfc3339(&envelope.last_activity) else {
+    let Ok(at) = strict_timestamp(&envelope.last_activity) else {
         return protocol_response(StatusCode::BAD_REQUEST, Body::empty());
     };
     if envelope.version != "v1" {
         return protocol_response(StatusCode::BAD_REQUEST, Body::empty());
     }
-    if let Some(route) = state.routes.write().await.get_mut(&route_key) {
-        route.last_activity = at.with_timezone(&Utc);
+    let mut routes = state.routes.write().await;
+    let mut next = routes.clone();
+    if let Some(route) = next.get_mut(&route_key) {
+        route.last_activity = at;
     }
-    if fault == Some(Fault::LoseReply) {
+    if persist_routes(&state, &next).is_err() {
+        return protocol_response(StatusCode::INTERNAL_SERVER_ERROR, Body::empty());
+    }
+    *routes = next;
+    drop(routes);
+    record_commit(&state);
+    if matches!(fault, Some(Fault::LoseReply)) {
         std::future::pending::<()>().await;
     }
-    protocol_response(StatusCode::NO_CONTENT, Body::empty())
+    postcommit_response(
+        fault.as_ref(),
+        protocol_response(StatusCode::NO_CONTENT, Body::empty()),
+    )
 }
 
 async fn delete_route(
@@ -431,27 +769,52 @@ async fn delete_route(
         return response;
     }
     let fault = next_fault(&state, DELETE).await;
-    match fault {
+    match fault.as_ref() {
         Some(Fault::ServerError) => {
             return protocol_response(StatusCode::INTERNAL_SERVER_ERROR, Body::empty())
+        }
+        Some(Fault::ServerErrorGate(gate)) => {
+            gate.block_response().await;
+            return protocol_response(StatusCode::INTERNAL_SERVER_ERROR, Body::empty());
         }
         Some(Fault::ClientError) => {
             return protocol_response(StatusCode::BAD_REQUEST, Body::empty())
         }
-        Some(Fault::Timeout) => tokio::time::sleep(Duration::from_secs(30)).await,
-        Some(Fault::MalformedBody) => {
-            return json_response(StatusCode::OK, &json!({"broken": true}))
-        }
-        Some(Fault::LoseReply) | None => {}
+        Some(Fault::Timeout) => std::future::pending::<()>().await,
+        Some(
+            Fault::LoseReply
+            | Fault::MalformedBody
+            | Fault::MissingProtocol
+            | Fault::WrongProtocol
+            | Fault::WrongContentType
+            | Fault::WrongSuccessStatus
+            | Fault::TruncatedBody
+            | Fault::OversizedBody
+            | Fault::OversizedHeaders
+            | Fault::TooManyHeaders
+            | Fault::NonEmptyNoContent
+            | Fault::NonEmptyNotFound
+            | Fault::RawBody(_),
+        )
+        | None => {}
     }
-    let prior = state.routes.write().await.remove(&route_key);
-    if fault == Some(Fault::LoseReply) {
+    let mut routes = state.routes.write().await;
+    let mut next = routes.clone();
+    let prior = next.remove(&route_key);
+    if persist_routes(&state, &next).is_err() {
+        return protocol_response(StatusCode::INTERNAL_SERVER_ERROR, Body::empty());
+    }
+    *routes = next;
+    drop(routes);
+    record_commit(&state);
+    if matches!(fault, Some(Fault::LoseReply)) {
         std::future::pending::<()>().await;
     }
-    match prior {
+    let response = match prior {
         Some(route) => json_response(StatusCode::OK, &route_value(&route)),
         None => protocol_response(StatusCode::NOT_FOUND, Body::empty()),
-    }
+    };
+    postcommit_response(fault.as_ref(), response)
 }
 
 pub fn chp_timestamp(value: DateTime<Utc>) -> String {
@@ -465,4 +828,73 @@ fn route_value(route: &RouteData) -> Value {
         Value::String(chp_timestamp(route.last_activity)),
     );
     encoded
+}
+
+fn strict_timestamp(raw: &str) -> Result<DateTime<Utc>, ()> {
+    let parsed = DateTime::parse_from_rfc3339(raw)
+        .map_err(|_| ())?
+        .with_timezone(&Utc);
+    (chp_timestamp(parsed) == raw).then_some(parsed).ok_or(())
+}
+
+struct StrictRouteData(RouteData);
+
+impl<'de> Deserialize<'de> for StrictRouteData {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(StrictRouteVisitor)
+    }
+}
+
+struct StrictRouteVisitor;
+
+impl<'de> Visitor<'de> for StrictRouteVisitor {
+    type Value = StrictRouteData;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a route object with unique fields")
+    }
+
+    fn visit_map<A>(self, mut fields: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut target = None;
+        let mut last_activity = None;
+        let mut extra = serde_json::Map::new();
+        while let Some(field) = fields.next_key::<String>()? {
+            match field.as_str() {
+                "target" => {
+                    if target.is_some() {
+                        return Err(de::Error::duplicate_field("target"));
+                    }
+                    target = Some(fields.next_value::<String>()?);
+                }
+                "last_activity" => {
+                    if last_activity.is_some() {
+                        return Err(de::Error::duplicate_field("last_activity"));
+                    }
+                    let raw = fields.next_value::<String>()?;
+                    last_activity = Some(
+                        strict_timestamp(&raw)
+                            .map_err(|_| de::Error::custom("noncanonical timestamp"))?,
+                    );
+                }
+                _ => {
+                    if extra.contains_key(&field) {
+                        return Err(de::Error::custom("duplicate metadata field"));
+                    }
+                    extra.insert(field, fields.next_value::<Value>()?);
+                }
+            }
+        }
+        Ok(StrictRouteData(RouteData {
+            target: target.ok_or_else(|| de::Error::missing_field("target"))?,
+            last_activity: last_activity
+                .ok_or_else(|| de::Error::missing_field("last_activity"))?,
+            extra,
+        }))
+    }
 }

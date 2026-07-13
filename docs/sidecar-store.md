@@ -19,9 +19,22 @@ Every request and every response, including errors, carries:
 X-Store-Protocol: v1
 ```
 
-A missing or different response header is a protocol failure. JSON requests
-and successful JSON responses use `Content-Type: application/json`. Response
-bodies are limited to 4 MiB.
+A missing, repeated, or different response header is a protocol failure. PUT
+and PATCH requests require the single exact value `Content-Type:
+application/json`; parameters such as `charset` are rejected. Successful JSON
+responses use that same single exact value. Valid 204 and 404 acknowledgments
+have neither a content type nor a body. A nonzero or repeated `Content-Length`,
+or any `Transfer-Encoding`, makes an otherwise empty acknowledgment unusable;
+the client checks framing because HTTP libraries may suppress illegal 204 body
+bytes before exposing the response body.
+
+Serialized mutation requests are limited to 1 MiB before dispatch. Responses
+are limited to 64 header values, 32 KiB of aggregate header name/value bytes,
+and a 4 MiB body. The client uses HTTP/1 only and enforces the documented
+header limits immediately after receipt. The pinned reqwest/hyper HTTP/1 parser
+also has its own finite parser bounds; reqwest does not expose a supported
+client-builder API for configuring a pre-allocation header-byte cap, so this
+protocol does not claim one.
 
 An optional configured credential is sent on every request as:
 
@@ -46,10 +59,12 @@ A route value contains the normalized fields plus arbitrary CHP metadata:
 }
 ```
 
-`target` and `last_activity` are required. Every other member is unknown
-metadata and must round-trip unchanged. Timestamps are UTC RFC 3339 strings
-with the CHP field name and fixed nanosecond precision; this preserves the full
-Store timestamp while remaining valid CHP JSON.
+`target` and `last_activity` are required and may occur exactly once. Every
+other member is unique unknown metadata and must round-trip unchanged. Duplicate
+route or metadata fields are invalid. Timestamps use the exact canonical UTC
+shape produced by `...sssssssssZ`: nine fractional digits and a trailing `Z`.
+Offsets and variable fractional precision are rejected by parse plus canonical
+re-serialization equality.
 
 For single-route endpoints, the normalized route key is encoded as exactly one
 RFC 3986 path segment. Only `A-Z a-z 0-9 - . _ ~` remain literal; every other
@@ -95,9 +110,11 @@ Content-Type: application/json
 ```
 
 The response is one JSON object from normalized route keys to complete route
-values and represents one consistent snapshot. Invalid keys, duplicate keys
-after normalization, malformed values, or an oversized body are corrupt data;
-no partial snapshot may be published.
+values and represents one consistent snapshot. The decoder detects duplicate
+top-level keys before a JSON map can overwrite them and applies the same strict
+duplicate/type/timestamp decoder to every record. Invalid keys, duplicate keys,
+malformed values, or an oversized body are corrupt data; no partial snapshot
+may be published.
 
 ### Atomic route PUT
 
@@ -126,13 +143,15 @@ The versioned envelope has four members:
 - `version`: exactly `v1`.
 - `operation`: exactly `add`, `put`, or `put_preserving_activity`.
 - `route`: one complete route value.
-- `activityFloor`: a timestamp or `null`.
+- `activityFloor`: one valid canonical timestamp; null and omission are invalid.
 
-For `put`, the sidecar atomically stores `route` exactly and ignores a null
-floor. For `add` and `put_preserving_activity`, it atomically stores the same
-route except that `last_activity` is the maximum of `route.last_activity` and
-`activityFloor`. The client supplies the complete final candidate and returns
-that same record after the acknowledged 204. Repeating an identical envelope
+For `put`, the sidecar atomically stores `route` exactly. For `add` and
+`put_preserving_activity`, it atomically stores the same route except that
+`last_activity` is the maximum of the candidate, the incoming floor, and the
+existing persisted activity. When no preserving floor exists, the client sends
+the exact `put` operation with the candidate timestamp as the valid envelope
+floor. The client supplies the complete logical candidate and returns its
+latest locally known floor after the acknowledged 204. Repeating an envelope
 is idempotent.
 
 Validation and the activity-floor maximum happen before the single atomic map
@@ -176,8 +195,8 @@ Content-Type: application/json
 
 The lookup, removal, and capture of the prior value are one atomic operation.
 An existing route returns its exact prior record with 200. An absent route
-returns 404 with an empty body. A malformed 200 is corrupt data and must not be
-published by the registry.
+returns 404 with no content type and an empty body. The 200 body uses the same
+strict duplicate/type/timestamp route decoder as snapshots.
 
 ## Deadlines and retries
 
@@ -195,12 +214,19 @@ Mutation retries have a stronger server prerequisite:
 
 > A v1 sidecar MUST return 5xx only when the mutation did not commit.
 
-This pre-commit guarantee permits bounded 5xx retry. PUT and PATCH retries reuse
-the byte-for-byte identical serialized payload, so their acknowledged result is
-idempotent. DELETE may retry a returned 5xx because the guarantee proves the
-delete did not commit. A transport error or body/reply loss on any mutation is
-never retried, because reqwest cannot prove whether dispatch reached the commit
-point.
+This pre-commit guarantee permits bounded 5xx retry. PATCH retries reuse the
+byte-for-byte identical payload. A logical PUT/add retry re-samples the activity
+floor immediately before every attempt and reserializes the envelope; all
+fields remain identical except that `activityFloor` may advance monotonically.
+DELETE may retry a returned 5xx because the guarantee proves the delete did not
+commit. A transport error or body/reply loss on any mutation is never retried,
+because reqwest cannot prove whether dispatch reached the commit point.
+
+The executable fixture decodes PUT envelopes and nested route objects directly
+from raw JSON, before any `Value` map can collapse duplicate members. Its
+durable temp-file state is reconstructed into a new server state on restart;
+the retry-floor tests restart and reload to prove the last attempted floor was
+persisted.
 
 ## Consistency, indeterminate outcomes, and recovery
 
@@ -208,24 +234,31 @@ The sidecar must linearize each mutation and return a snapshot from one
 consistent point. Independent writers must implement the same atomic rules.
 The protocol has no ownership inference, operation marker, or corrective GET.
 
-Any mutation transport/reply loss is `StoreError::Indeterminate`, even if a
-later GET appears to show the requested value or absence. `RouteRegistry`
-terminally seals mutation admission and all cached serving on that error;
-readiness and management/data-plane reads fail closed. Recovery requires an
-authoritative `GET /v1/routes` into a new registry/process after the sidecar is
-reachable. The poisoned registry is never unsealed in place.
+After a mutation may have committed, success requires the complete exact
+acknowledgment: status, protocol header, content type/body shape, response
+headers, and bounded readable body. A missing/wrong protocol header, unexpected
+1xx/2xx/3xx status, invalid content type, nonempty 204/404, malformed DELETE
+200, truncated read, oversized headers/body, or body-read failure is
+`StoreError::Indeterminate`. This remains true even if a later GET appears to
+show the requested value or absence. `RouteRegistry` terminally seals mutation
+admission and all cached serving on that error; readiness and
+management/data-plane reads fail closed. Recovery requires an authoritative
+`GET /v1/routes` into a new registry/process after the sidecar is reachable.
+The poisoned registry is never unsealed in place.
 
 ## Error mapping
 
 | Wire or validation result | Store result | Retry |
 | --- | --- | --- |
-| Expected 200/204/404 | Success described above | No |
-| 401 or any other 4xx | `StoreError::Backend` | No |
-| 5xx exhausted | `StoreError::Backend` (v1 proves no commit) | Bounded |
-| GET transport/body loss | `StoreError::Backend` after exhaustion | Bounded |
-| Mutation transport/body/reply loss | `StoreError::Indeterminate` | Never |
-| Malformed snapshot or DELETE 200 | `StoreError::CorruptData` | No |
-| Protocol/header/version/status mismatch | `StoreError::Backend` | No |
+| Exact GET 200 or mutation 200/204/404 acknowledgment | Success described above | No |
+| Mutation 4xx other than DELETE 404 | `StoreError::Backend` (v1 proves rejection/no commit) | No |
+| Mutation 5xx exhausted | `StoreError::Backend` (v1 proves pre-commit) | Bounded |
+| GET transport/body-read loss | `StoreError::Backend` after exhaustion | Bounded |
+| Oversized snapshot body | `StoreError::CorruptData` | No |
+| Other GET protocol/header/content/status failure | `StoreError::Backend` | No |
+| Malformed snapshot record/key/JSON | `StoreError::CorruptData` | No |
+| Any unusable reply after mutation may commit | `StoreError::Indeterminate` | Never |
+| Oversized outgoing mutation body before dispatch | `StoreError::Backend` | No |
 
 All mappings use fixed operation labels and exclude credentials, URLs, response
 bodies, and route targets.
