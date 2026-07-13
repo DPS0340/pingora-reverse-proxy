@@ -823,13 +823,19 @@ root attackers remain excluded from the enforceable boundary.
 The focused safe-parent, ancestor, ACL, umask, PID, acquisition, and staging
 group passed `20/20` rounds across 21 named contracts (`420/420` executions).
 The prior raw-FD/private-namespace eight-contract group passed `20/20` rounds
-(`160/160`). The complete 61-test library harness passed `100/100` runs under
-default parallel scheduling (`6,100/6,100`), including its isolated mode-000
-child contracts. Focused TLS/Unix and WebSocket suites passed `22/22` and
-`4/4`.
+(`160/160`). The final ACL closure additionally exercised both the Apple errno
+classifier and a real extended-ACL directory for `20/20` rounds each. A direct
+macOS probe confirmed that an existing ACL-free directory is reported as
+`NULL/ENOENT`, while a directory with an extended ACL returns a non-null ACL.
+Only Apple `ENOENT`/`ENOATTR` and Linux/Android `NODATA` are therefore treated as
+definitive absence; `ENOTSUP`/`NOTSUP` fail closed.
 
-`PROPTEST_CASES=256 cargo test --all-targets --all-features` passed `272/272`:
-library `61`, binary `0`, API `33`, config `27`, proxy `69`, routes `11`, store
+The complete 62-test library harness passed `100/100` runs under default
+parallel scheduling (`6,200/6,200`), including its isolated mode-000 child
+contracts. Focused TLS/Unix and WebSocket suites passed `22/22` and `4/4`.
+
+`PROPTEST_CASES=256 cargo test --all-targets --all-features` passed `273/273`:
+library `62`, binary `0`, API `33`, config `27`, proxy `69`, routes `11`, store
 `45`, TLS/Unix `22`, and WebSocket `4`. `PROPTEST_CASES=512 cargo test --test
 route_properties` passed `11/11`. Formatting, warnings-denied Clippy, complete
 checking, whitespace validation, vendor comparison, and final diff review

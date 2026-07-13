@@ -474,6 +474,14 @@ fn authenticate_child_identity(
 }
 
 #[cfg(target_vendor = "apple")]
+fn apple_acl_error_is_definitively_absent(error: libc::c_int) -> bool {
+    // acl_get_fd_np(ACL_TYPE_EXTENDED) reports an existing ACL-free directory
+    // as NULL/ENOENT on Apple platforms. ENOTSUP still means that authority
+    // could not be inspected and must fail closed.
+    error == libc::ENOENT || error == libc::ENOATTR
+}
+
+#[cfg(target_vendor = "apple")]
 fn authenticate_directory_acl(directory: &File) -> io::Result<()> {
     use std::ffi::c_void;
     use std::ptr;
@@ -491,7 +499,7 @@ fn authenticate_directory_acl(directory: &File) -> io::Result<()> {
     if acl.is_null() {
         let error = io::Error::last_os_error();
         return match error.raw_os_error() {
-            Some(libc::ENOENT | libc::ENOATTR | libc::ENOTSUP) => Ok(()),
+            Some(error) if apple_acl_error_is_definitively_absent(error) => Ok(()),
             _ => Err(error),
         };
     }
@@ -513,14 +521,18 @@ fn authenticate_directory_acl(directory: &File) -> io::Result<()> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
+fn posix_acl_xattr_error_is_definitively_absent(error: rustix::io::Errno) -> bool {
+    error == rustix::io::Errno::NODATA
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn authenticate_directory_acl(directory: &File) -> io::Result<()> {
     for name in ["system.posix_acl_access", "system.posix_acl_default"] {
         match rustix::fs::fgetxattr(directory, name, Vec::new()) {
             Ok(_) | Err(rustix::io::Errno::RANGE) => {
                 return Err(io::Error::other("boundary directory has a POSIX ACL"));
             }
-            Err(error)
-                if error == rustix::io::Errno::NODATA || error == rustix::io::Errno::NOTSUP => {}
+            Err(error) if posix_acl_xattr_error_is_definitively_absent(error) => {}
             Err(error) => return Err(io::Error::from_raw_os_error(error.raw_os_error())),
         }
     }
@@ -1373,6 +1385,27 @@ mod tests {
         assert!(!boundary_mode_is_safe(0o1777, euid + 1, euid));
         assert!(!boundary_mode_is_safe(0o777, euid, euid));
         assert!(!boundary_mode_is_safe(0o777, 0, euid));
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn apple_acl_classifier_accepts_only_definitive_absence() {
+        assert!(super::apple_acl_error_is_definitively_absent(libc::ENOATTR));
+        assert!(super::apple_acl_error_is_definitively_absent(libc::ENOENT));
+        assert!(!super::apple_acl_error_is_definitively_absent(
+            libc::ENOTSUP
+        ));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn posix_acl_classifier_accepts_only_definitive_absence() {
+        assert!(super::posix_acl_xattr_error_is_definitively_absent(
+            rustix::io::Errno::NODATA
+        ));
+        assert!(!super::posix_acl_xattr_error_is_definitively_absent(
+            rustix::io::Errno::NOTSUP
+        ));
     }
 
     #[cfg(unix)]
