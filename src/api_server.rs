@@ -1499,7 +1499,7 @@ pub(crate) async fn wait_for_shutdown(shutdown: &mut ShutdownWatch) {
     }
 }
 
-/// Minimal Task 8 metrics surface backed by the process-shared counters.
+/// CHP-compatible metrics surface backed by the process-shared counters.
 pub fn metrics_router(metrics: Arc<Metrics>) -> Router {
     Router::new()
         .route("/metrics", get(render_metrics))
@@ -1507,16 +1507,10 @@ pub fn metrics_router(metrics: Arc<Metrics>) -> Router {
 }
 
 async fn render_metrics(State(metrics): State<Arc<Metrics>>) -> Response {
-    let snapshot = metrics.snapshot();
-    let mut body = String::new();
-    for (status, count) in snapshot.requests_api {
-        if count != 0 {
-            body.push_str(&format!("requests_api{{status=\"{status}\"}} {count}\n"));
-        }
-    }
+    let body = metrics.render_prometheus();
     Response::builder()
         .status(StatusCode::OK)
-        .header("content-type", "text/plain; charset=utf-8")
+        .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
         .body(Body::from(body))
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }

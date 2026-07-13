@@ -197,9 +197,13 @@ async fn post_route(state: ApiState, key: RouteKey, request: Request) -> Respons
         return text(StatusCode::BAD_REQUEST, "Must specify 'target' as string");
     };
     object.remove("last_activity");
+    let activity_update_started = std::time::Instant::now();
     if let Err(error) = state.registry.add(key, target, object).await {
         return mutation_failure(&state, error);
     }
+    state
+        .metrics
+        .record_last_activity_update(activity_update_started.elapsed());
 
     state.metrics.record_api_route_add();
     empty(StatusCode::CREATED)

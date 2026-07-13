@@ -24,6 +24,18 @@ use serial_test::serial;
 const IO_TIMEOUT: Duration = Duration::from_secs(3);
 const PROCESS_EXIT_TIMEOUT: Duration = Duration::from_secs(15);
 const ACTIVE_DRAIN_HOLD: Duration = Duration::from_millis(1_500);
+const CHP_503_HTML: &str = "<!doctype html>\n<html>\n  <head>\n    <meta charset=\"utf-8\" />\n    <title>503: Proxy Target Missing</title>\n  </head>\n\n  <body>\n    <h1>503: Proxy Target Missing</h1>\n    <p>The upstream service is unavailable</p>\n    <hr />\n    <p>configurable-http-proxy</p>\n  </body>\n</html>\n";
+const CHP_METRIC_FAMILIES: &[(&str, &str)] = &[
+    ("api_route_get", "counter"),
+    ("api_route_add", "counter"),
+    ("api_route_delete", "counter"),
+    ("find_target_for_req", "summary"),
+    ("last_activity_updating", "summary"),
+    ("requests_ws", "counter"),
+    ("requests_web", "counter"),
+    ("requests_proxy", "counter"),
+    ("requests_api", "counter"),
+];
 
 fn reserve_port() -> u16 {
     StdTcpListener::bind(("127.0.0.1", 0))
@@ -258,6 +270,26 @@ fn assert_http(response: &[u8], status: &str, body: &[u8]) {
         "unexpected response headers: {headers}"
     );
     assert_eq!(&response[delimiter + 4..], body);
+}
+
+fn assert_chp_metrics_http(response: &[u8]) {
+    let delimiter = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("HTTP response delimiter");
+    let headers = std::str::from_utf8(&response[..delimiter]).expect("HTTP headers are UTF-8");
+    assert!(
+        headers.starts_with("HTTP/1.1 200 OK"),
+        "unexpected response headers: {headers}"
+    );
+    let body = std::str::from_utf8(&response[delimiter + 4..]).expect("metrics body is UTF-8");
+    for (family, kind) in CHP_METRIC_FAMILIES {
+        assert!(
+            body.contains(&format!("# TYPE {family} {kind}\n")),
+            "missing CHP metric family {family}:\n{body}"
+        );
+    }
+    assert!(body.contains("requests_api{status=\"200\"} 1\n"));
 }
 
 fn signed_certificate(
@@ -520,14 +552,10 @@ fn public_api_and_metrics_tcp_listeners_serve_exact_contracts() {
         "200 OK",
         b"{}",
     );
-    assert_http(
-        &tcp_http(
-            metrics,
-            b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-        ),
-        "200 OK",
-        b"requests_api{status=\"200\"} 1\n",
-    );
+    assert_chp_metrics_http(&tcp_http(
+        metrics,
+        b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    ));
 }
 
 async fn wait_https_response(
@@ -1058,7 +1086,7 @@ async fn upstream_private_ca_is_rejected_when_not_configured() {
     assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         response.text().await.expect("untrusted upstream body"),
-        "Service Unavailable"
+        CHP_503_HTML
     );
     let deadline = Instant::now() + IO_TIMEOUT;
     while !upstream_thread.is_finished() {
@@ -1425,14 +1453,10 @@ fn public_api_and_metrics_unix_sockets_serve_and_are_cleaned_up() {
         "200 OK",
         b"{}",
     );
-    assert_http(
-        &unix_http(
-            &metrics,
-            b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-        ),
-        "200 OK",
-        b"requests_api{status=\"200\"} 1\n",
-    );
+    assert_chp_metrics_http(&unix_http(
+        &metrics,
+        b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    ));
     binary.assert_running("proxy exited after Unix requests");
     unsafe {
         libc::kill(binary.child.id() as libc::pid_t, libc::SIGTERM);

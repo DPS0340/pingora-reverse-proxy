@@ -40,6 +40,8 @@ const MAX_UNIX_WIRE_BYTES: usize = MAX_ERROR_HEADER_BYTES + MAX_ERROR_BODY_BYTES
 const MAX_RESOLVED_ADDRESSES: usize = 16;
 const RESOLVER_QUEUE_CAPACITY: usize = 8;
 const RESOLVER_CACHE_TTL: Duration = Duration::from_secs(30);
+const CHP_404_HTML: &[u8] = b"<!doctype html>\n<html>\n  <head>\n    <meta charset=\"utf-8\" />\n    <title>404: Not Found</title>\n  </head>\n\n  <body>\n    <h1>404: Not Found</h1>\n    <p>No service is registered at this URL</p>\n    <hr />\n    <p>configurable-http-proxy</p>\n  </body>\n</html>\n";
+const CHP_503_HTML: &[u8] = b"<!doctype html>\n<html>\n  <head>\n    <meta charset=\"utf-8\" />\n    <title>503: Proxy Target Missing</title>\n  </head>\n\n  <body>\n    <h1>503: Proxy Target Missing</h1>\n    <p>The upstream service is unavailable</p>\n    <hr />\n    <p>configurable-http-proxy</p>\n  </body>\n</html>\n";
 
 /// Classification used to select the public HTTP status without exposing an
 /// internal error or target URL to clients and logs.
@@ -578,6 +580,17 @@ impl ProxyErrorRenderer {
                     };
                 }
             }
+        } else {
+            let body = match status {
+                StatusCode::NOT_FOUND => CHP_404_HTML,
+                StatusCode::SERVICE_UNAVAILABLE => CHP_503_HTML,
+                _ => return reason_phrase(status),
+            };
+            return RenderedError {
+                body: Bytes::from_static(body),
+                content_type: Some(HeaderValue::from_static("text/html")),
+                content_encoding: None,
+            };
         }
         reason_phrase(status)
     }

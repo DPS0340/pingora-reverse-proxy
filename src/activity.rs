@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, Notify};
@@ -141,9 +142,13 @@ impl ActivityWriter {
 
     /// Observe activity at a caller-supplied timestamp.
     pub fn record_at(&self, key: &RouteKey, at: DateTime<Utc>) {
+        let started = Instant::now();
         if !self.registry.observe_activity(key, at) {
             return;
         }
+        self.state
+            .metrics
+            .record_last_activity_update(started.elapsed());
         let mut pending = self
             .state
             .pending
@@ -253,5 +258,9 @@ impl ActivityWriter {
             }
             notified.await;
         }
+    }
+
+    pub(crate) fn metrics(&self) -> Arc<Metrics> {
+        Arc::clone(&self.state.metrics)
     }
 }

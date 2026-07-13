@@ -1,11 +1,64 @@
 services:
+  chp:
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM node:20-bookworm-slim
+        RUN mkdir -p /opt/chp-5.3.0
+        WORKDIR /opt/chp-5.3.0
+        RUN npm pack configurable-http-proxy@5.3.0 \
+            && tar -xzf configurable-http-proxy-5.3.0.tgz --strip-components=1 \
+            && rm configurable-http-proxy-5.3.0.tgz \
+            && npm install --omit=dev \
+            && test "$(node --print "require('./package.json').version")" = "5.3.0"
+        COPY scripts/chp-oracle.mjs /usr/local/bin/chp-oracle.mjs
+    command:
+      - node
+      - /usr/local/bin/chp-oracle.mjs
+      - --ip
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --api-ip
+      - 0.0.0.0
+      - --api-port
+      - "8001"
+      - --metrics-ip
+      - 0.0.0.0
+      - --metrics-port
+      - "8002"
+      - --log-level
+      - error
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:8001/api/routes').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 1s
+      timeout: 1s
+      retries: 20
+
   redis:
     image: redis:7-alpine
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     ports:
-      - "127.0.0.1:6379:6379"
+      - "127.0.0.1:16380:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 1s
+      retries: 20
+
+  sidecar:
+    image: python:3.13-alpine
+    command: ["python", "-m", "http.server", "8080"]
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/', timeout=1)
       interval: 1s
       timeout: 1s
       retries: 20

@@ -1,7 +1,7 @@
 //! Functional Pingora HTTP data plane.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -17,6 +17,7 @@ use crate::activity::ActivityWriter;
 use crate::api_server::TrafficLifecycle;
 use crate::config::{AppConfig, ProxyOptions};
 use crate::errors::{ErrorRendererBuildError, ProxyErrorClass, ProxyErrorRenderer};
+use crate::metrics::Metrics;
 use crate::route::RouteKey;
 use crate::route_table::{ConsistencyStatus, RouteRegistry};
 use crate::store::StoreError;
@@ -26,6 +27,14 @@ use crate::upstream::{
 };
 
 const HEALTH_PATH: &str = "/_chp_healthz";
+
+fn records_proxy_response_status(status: u16) -> bool {
+    status != StatusCode::SWITCHING_PROTOCOLS.as_u16()
+}
+
+fn forwarded_client_address(address: Option<std::net::IpAddr>) -> String {
+    address.map_or_else(|| "undefined".to_owned(), |address| address.to_string())
+}
 
 /// Per-request state shared across Pingora's proxy phases.
 #[derive(Debug)]
@@ -87,6 +96,7 @@ pub struct ChpProxy {
     tls: TlsClientConfig,
     errors: ProxyErrorRenderer,
     activity: ActivityWriter,
+    metrics: Arc<Metrics>,
     downstream_protocol: &'static str,
     traffic: Arc<TrafficLifecycle>,
 }
@@ -132,12 +142,14 @@ impl ChpProxy {
                 .await
                 .map_err(ProxyBuildError::DefaultRoute)?;
         }
+        let metrics = activity.metrics();
         Ok(Self {
             registry,
             options: config.proxy.clone(),
             tls,
             errors,
             activity,
+            metrics,
             downstream_protocol: if config.public_tls.is_some() {
                 "https"
             } else {
@@ -251,8 +263,19 @@ impl ProxyHttp for ChpProxy {
             return Ok(true);
         }
 
-        let Some(route) = self.route_for_request(session, ctx)? else {
+        if session.is_upgrade_req() {
+            self.metrics.record_ws_request();
+        } else {
+            self.metrics.record_web_request();
+        }
+
+        let lookup_started = Instant::now();
+        let route = self.route_for_request(session, ctx);
+        self.metrics.record_find_target(lookup_started.elapsed());
+        let Some(route) = route? else {
             ctx.error_classification = Some(ProxyErrorClass::RouteMiss);
+            self.metrics
+                .record_proxy_request(StatusCode::NOT_FOUND.as_u16());
             self.errors
                 .respond(session, StatusCode::NOT_FOUND, &original)
                 .await?;
@@ -307,20 +330,26 @@ impl ProxyHttp for ChpProxy {
             .as_downstream()
             .client_addr()
             .and_then(|address| address.as_inet())
-            .map(|address| address.ip().to_string())
-            .unwrap_or_default();
-        let port = session
-            .as_downstream()
-            .server_addr()
-            .and_then(|address| address.as_inet())
-            .map_or(
-                if self.downstream_protocol == "https" {
-                    443
-                } else {
-                    80
-                },
-                |address| address.port(),
-            );
+            .map(|address| address.ip());
+        let client_address = forwarded_client_address(client_address);
+        let default_port = if self.downstream_protocol == "https" {
+            443
+        } else {
+            80
+        };
+        let port = match ctx.original_host.as_ref() {
+            Some(host) => host
+                .to_str()
+                .ok()
+                .and_then(|host| host.parse::<http::uri::Authority>().ok())
+                .and_then(|authority| authority.port_u16())
+                .unwrap_or(default_port),
+            None => session
+                .as_downstream()
+                .server_addr()
+                .and_then(|address| address.as_inet())
+                .map_or(default_port, |address| address.port()),
+        };
         apply_forwarded_headers(
             &mut headers,
             &ForwardedContext {
@@ -374,6 +403,10 @@ impl ProxyHttp for ChpProxy {
             }
         }
         ctx.activity_eligible = upstream_response.status.as_u16() < 300;
+        if records_proxy_response_status(upstream_response.status.as_u16()) {
+            self.metrics
+                .record_proxy_request(upstream_response.status.as_u16());
+        }
         if ctx.stream_data_seen {
             self.publish_activity_if_eligible(ctx);
         }
@@ -466,6 +499,7 @@ impl ProxyHttp for ChpProxy {
             }
         });
         let status = classification.status();
+        self.metrics.record_proxy_request(status.as_u16());
         if session.is_upgrade_req() {
             let _ = Self::send_empty(session, status).await;
             return FailToProxy {
@@ -560,6 +594,22 @@ mod tests {
         let mut context = RequestContext::default();
         context.traffic_admission = Some(Arc::clone(traffic));
         context
+    }
+
+    #[test]
+    fn chp_proxy_response_metric_excludes_websocket_switching_protocols() {
+        assert!(!super::records_proxy_response_status(101));
+        assert!(super::records_proxy_response_status(200));
+        assert!(super::records_proxy_response_status(503));
+    }
+
+    #[test]
+    fn chp_uds_forwarded_client_address_is_undefined() {
+        assert_eq!(super::forwarded_client_address(None), "undefined");
+        assert_eq!(
+            super::forwarded_client_address(Some("127.0.0.1".parse().unwrap())),
+            "127.0.0.1"
+        );
     }
 
     #[tokio::test]

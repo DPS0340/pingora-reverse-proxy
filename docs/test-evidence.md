@@ -847,3 +847,30 @@ files on each side with only the established three vendor deltas:
 `src/listeners/l4.rs`, `src/listeners/mod.rs`, and
 `src/services/listening.rs`. No vendor target, Task 9 work, or unrelated change
 was added.
+
+### Task 11 CHP differential compatibility gate (2026-07-13)
+
+The pinned CHP 5.3.0 oracle now covers API CRUD and encoded Unicode routes,
+longest and host route selection, every path-option combination, redirects,
+health, exact default and custom 404/503 responses, metrics, WebSockets, TLS,
+mTLS, and public/API/metrics Unix sockets. The normalization allowlist remains
+limited to Date values, server-generated connection/framing headers, and
+ephemeral listener/client addresses. All 12 differential scenarios pass with
+zero unexplained differences.
+
+The required focused regression passed first (`1/1`), followed by the complete
+proxy (`73/73`), differential (`12/12`), TLS/Unix (`22/22`), and WebSocket
+(`4/4`) contract suites. The `just test-differential` artifact was then
+verified with no host `CHP_SOURCE_DIR`: it built the pinned Compose service,
+copied its exact `/opt/chp-5.3.0` tree into a temporary host directory, passed
+`12/12`, and removed the temporary source, three services, and network.
+
+With disposable Redis healthy at `redis://127.0.0.1:16380/`,
+`PROPTEST_CASES=256 cargo test --all-targets --all-features -- --nocapture`
+passed `353/353`: library `64`, binary `0`, API `34`, config `27`, differential
+`12`, proxy `73`, routes `11`, store `106`, TLS/Unix `22`, and WebSocket `4`.
+`PROPTEST_CASES=512 cargo test --test route_properties -- --nocapture` passed
+`11/11`. Formatting, warnings-denied Clippy with `--no-deps`, complete
+all-target/all-feature checking, whitespace validation, artifact review, and
+process/container cleanup all passed. The sole build warning remains the
+established vendored OpenSSL deprecation.

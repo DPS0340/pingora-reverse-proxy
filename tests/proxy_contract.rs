@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use clap::Parser;
-use http::header::{CONNECTION, HOST, LOCATION, UPGRADE};
+use http::header::{CONNECTION, CONTENT_TYPE, HOST, LOCATION, UPGRADE};
 use http::{HeaderMap, HeaderValue, Request, Response, StatusCode, Uri};
 use openssl::asn1::Asn1Time;
 use openssl::bn::{BigNum, MsbOption};
@@ -54,6 +54,8 @@ use pingora_reverse_proxy::upstream::{
 };
 
 const RAW_NETWORK_TIMEOUT: Duration = Duration::from_secs(3);
+const CHP_404_HTML: &str = "<!doctype html>\n<html>\n  <head>\n    <meta charset=\"utf-8\" />\n    <title>404: Not Found</title>\n  </head>\n\n  <body>\n    <h1>404: Not Found</h1>\n    <p>No service is registered at this URL</p>\n    <hr />\n    <p>configurable-http-proxy</p>\n  </body>\n</html>\n";
+const CHP_503_HTML: &str = "<!doctype html>\n<html>\n  <head>\n    <meta charset=\"utf-8\" />\n    <title>503: Proxy Target Missing</title>\n  </head>\n\n  <body>\n    <h1>503: Proxy Target Missing</h1>\n    <p>The upstream service is unavailable</p>\n    <hr />\n    <p>configurable-http-proxy</p>\n  </body>\n</html>\n";
 
 async fn timed_accept(
     listener: &tokio::net::TcpListener,
@@ -369,6 +371,7 @@ struct ProxyHarness {
     store: Arc<dyn Store>,
     registry: Arc<RouteRegistry>,
     activity: ActivityWriter,
+    metrics: Arc<Metrics>,
     base_url: String,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -410,7 +413,9 @@ impl ProxyHarness {
                     .await
                     .unwrap();
             }
-            let activity = ActivityWriter::start(Arc::clone(&registry), 1);
+            let metrics = Arc::new(Metrics::new());
+            let activity =
+                ActivityWriter::start_with_metrics(Arc::clone(&registry), 1, Arc::clone(&metrics));
             let proxy = ChpProxy::from_config(Arc::clone(&registry), &config, activity.clone())
                 .await
                 .unwrap();
@@ -435,6 +440,7 @@ impl ProxyHarness {
                         store,
                         registry,
                         activity,
+                        metrics,
                         base_url,
                         stop,
                         thread: Some(thread),
@@ -1127,7 +1133,8 @@ async fn network_binary_without_route_returns_404() {
     let proxy = ProxyProcess::start(&[]).await;
     let response = proxy.get("/missing").await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    assert_eq!(response.text().await.unwrap(), "Not Found");
+    assert_eq!(response.headers()[CONTENT_TYPE], "text/html");
+    assert_eq!(response.text().await.unwrap(), CHP_404_HTML);
 }
 
 #[tokio::test]
@@ -1304,6 +1311,24 @@ async fn network_request_body_is_forwarded_incrementally_before_downstream_compl
     timed_join(upstream, "incremental upstream task did not join").await;
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn network_x_forwarded_port_uses_host_default_when_host_omits_port() {
+    let echo = EchoServer::start().await;
+    let harness = ProxyHarness::start(&[], &[("/host-port", echo.target(""))]).await;
+
+    let response = harness
+        .request(
+            reqwest::Client::new()
+                .get(harness.url("/host-port/tree"))
+                .header(HOST, "example.test"),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["x_forwarded_port"], "80");
+}
+
 async fn read_raw_response(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
     let mut response = Vec::new();
     let deadline = tokio::time::Instant::now() + RAW_NETWORK_TIMEOUT;
@@ -1437,6 +1462,38 @@ async fn network_host_routing_selects_the_host_prefixed_route() {
         )
         .await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn network_auto_rewrite_preserves_upstream_port_when_host_omits_port() {
+    let upstream = EchoServer::start().await;
+    let harness = ProxyHarness::start(
+        &[
+            "--auto-rewrite".to_owned(),
+            "--protocol-rewrite".to_owned(),
+            "https".to_owned(),
+        ],
+        &[("/redirect", upstream.target(""))],
+    )
+    .await;
+    let upstream_port = upstream.address.port();
+
+    let response = harness
+        .request(
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap()
+                .get(harness.url("/redirect"))
+                .header(HOST, "example.test"),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(
+        response.headers()[LOCATION],
+        format!("https://example.test:{upstream_port}/next")
+    );
 }
 
 #[tokio::test]
@@ -1576,6 +1633,8 @@ async fn network_unavailable_upstream_is_503_without_activity_and_health_wins() 
         .request(reqwest::Client::new().get(harness.url("/missing/path")))
         .await;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()[CONTENT_TYPE], "text/html");
+    assert_eq!(response.text().await.unwrap(), CHP_503_HTML);
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(harness.route("/missing").last_activity, before_missing);
 
@@ -1588,6 +1647,33 @@ async fn network_unavailable_upstream_is_503_without_activity_and_health_wins() 
         serde_json::json!({"status":"OK"})
     );
     assert_eq!(harness.route("/_chp_healthz").last_activity, before_health);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn network_metrics_count_web_requests_proxy_statuses_and_route_lookups() {
+    let mut unavailable = ReservedPort::new();
+    let target = format!("http://{}", unavailable.release());
+    let harness = ProxyHarness::start(&[], &[("/unavailable", target)]).await;
+
+    assert_eq!(
+        harness.get("/missing").await.status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        harness.get("/unavailable").await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(harness.get("/_chp_healthz").await.status(), StatusCode::OK);
+
+    let snapshot = harness.metrics.snapshot();
+    assert_eq!(snapshot.requests_web, 2);
+    assert_eq!(snapshot.requests_proxy.get(&404), Some(&1));
+    assert_eq!(snapshot.requests_proxy.get(&503), Some(&1));
+    assert!(harness
+        .metrics
+        .render_prometheus()
+        .contains("find_target_for_req_count 2\n"));
 }
 
 #[tokio::test]

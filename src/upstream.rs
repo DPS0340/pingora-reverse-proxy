@@ -419,9 +419,11 @@ pub fn rewrite_location<B, R>(
             parsed
                 .set_host(Some(host_name(host)))
                 .map_err(|_| ProxyRequestError::InvalidLocation)?;
-            parsed
-                .set_port(host_port(host))
-                .map_err(|_| ProxyRequestError::InvalidLocation)?;
+            if let Some(port) = host_port(host) {
+                parsed
+                    .set_port(Some(port))
+                    .map_err(|_| ProxyRequestError::InvalidLocation)?;
+            }
         }
     }
     if let Some(protocol) = &options.protocol_rewrite {
