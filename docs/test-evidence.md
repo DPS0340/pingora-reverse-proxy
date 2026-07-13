@@ -698,3 +698,44 @@ byte-identical; only `listeners/l4.rs`, `listeners/mod.rs`, and
 Formatting, warnings-denied Clippy, all-target/all-feature checking, whitespace
 validation, final diff review, and status review passed. No Task 9 work was
 added.
+
+### Task 8 private staging publication finalization (2026-07-13)
+
+The public UDS permission transition now occurs entirely inside a
+cryptographically named, identity-anchored mode-0700 staging directory. That
+directory is the permission trust boundary: other UIDs cannot replace its
+socket entry, while retained directory descriptors keep verification, chmod,
+cleanup, and publication attached to the captured objects even if path aliases
+change. The staged socket is verified by device, inode, and type, changed to
+mode 0660 with descriptor-relative `fchmodat` flags 0, and verified again for
+identity, type, and mode before a cross-directory no-clobber rename publishes
+it. There is no chmod after publication.
+
+Using portable `fchmodat` inside the private directory avoids Linux
+`fchmodat2(AT_SYMLINK_NOFOLLOW)` and raw syscall 452 entirely. The 0700 boundary
+makes final-component symlink substitution by other UIDs unavailable before
+publication, so flags 0 retain the required security property while remaining
+compatible with older Linux kernels that do not implement `fchmodat2`.
+
+The eight focused staging, mode, Apple post-resolution regular-file/symlink,
+portable-contract, and path-length tests passed `8/8`. The same publication
+group passed `20/20` rounds (`160/160` contract executions), and the prior
+raw-FD/private-namespace group passed `20/20` rounds (`160/160` contract
+executions). The complete 45-test library harness passed `100/100` default-
+parallel runs (`4,500` test executions). Focused TLS/Unix and WebSocket
+verification passed `22/22` and `4/4`.
+
+`PROPTEST_CASES=256 cargo test --all-targets --all-features` passed `256/256`:
+library `45`, binary `0`, API `33`, config `27`, proxy `69`, routes `11`, store
+`45`, TLS/Unix `22`, and WebSocket `4`. `PROPTEST_CASES=512 cargo test --test
+route_properties` passed `11/11`. Rustfmt initially identified mechanical layout
+drift in the two Task 8 source files; after applying rustfmt, formatting check,
+warnings-denied Clippy with `--no-deps`, all-target/all-feature checking,
+whitespace validation, static syscall/publication review, final diff review,
+and status review passed.
+
+The checksum-verified Pingora 0.8.1 registry comparison still reports exactly
+the established three vendor deltas: `src/listeners/l4.rs`,
+`src/listeners/mod.rs`, and `src/services/listening.rs`. Every other vendored
+file, including the license, generated and original manifests, lockfile, and
+package metadata, remains byte-identical. No Task 9 work was added.

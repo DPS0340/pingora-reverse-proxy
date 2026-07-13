@@ -102,6 +102,17 @@ pub(crate) struct AnchoredDirectory {
     directory_path: PathBuf,
 }
 
+/// A cryptographically named, identity-anchored 0700 directory below a retained parent.
+#[cfg(unix)]
+pub(crate) struct PrivateDirectory {
+    parent: File,
+    parent_path: PathBuf,
+    name: OsString,
+    directory: File,
+    identity: FileIdentity,
+    active: bool,
+}
+
 #[cfg(unix)]
 impl AnchoredDirectory {
     pub(crate) fn capture(parent: &Path) -> io::Result<Self> {
@@ -113,36 +124,157 @@ impl AnchoredDirectory {
         })
     }
 
+    pub(crate) fn create_private_directory(&self) -> io::Result<PrivateDirectory> {
+        for _ in 0..QUARANTINE_ATTEMPTS {
+            let name = random_stage_name()?;
+            match rustix::fs::mkdirat(
+                &self.directory,
+                &name,
+                rustix::fs::Mode::from_raw_mode(0o700),
+            ) {
+                Ok(()) => {}
+                Err(error) if error == rustix::io::Errno::EXIST => continue,
+                Err(error) => return Err(io::Error::from_raw_os_error(error.raw_os_error())),
+            }
+            let directory = rustix::fs::openat(
+                &self.directory,
+                &name,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::CLOEXEC
+                    | rustix::fs::OFlags::NOFOLLOW,
+                rustix::fs::Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+            let identity = FileIdentity::from_file(&directory)?;
+            let mut guard = PrivateNamespaceGuard {
+                parent: &self.directory,
+                name: name.clone(),
+                identity,
+                armed: true,
+            };
+            let published = rustix::fs::statat(
+                &self.directory,
+                &name,
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+            if identity.device != published.st_dev as u64
+                || identity.inode != published.st_ino
+                || published.st_mode as u32 & libc::S_IFMT as u32 != libc::S_IFDIR as u32
+            {
+                return Err(io::Error::other(
+                    "private publication directory changed before verification",
+                ));
+            }
+            rustix::fs::fchmod(&directory, rustix::fs::Mode::from_raw_mode(0o700))
+                .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+            let metadata = directory.metadata()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if !metadata.file_type().is_dir() || metadata.permissions().mode() & 0o777 != 0o700
+                {
+                    return Err(io::Error::other(
+                        "private publication directory mode did not persist",
+                    ));
+                }
+            }
+            let parent = self.directory.try_clone()?;
+            guard.armed = false;
+            return Ok(PrivateDirectory {
+                parent,
+                parent_path: self.directory_path.clone(),
+                name,
+                directory,
+                identity,
+                active: true,
+            });
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not reserve a private publication directory",
+        ))
+    }
+}
+
+#[cfg(unix)]
+impl PrivateDirectory {
     pub(crate) fn stable_path(&self) -> io::Result<PathBuf> {
         stable_directory_path(&self.directory)
     }
 
-    pub(crate) fn own_entry(
-        &self,
-        public_path: PathBuf,
-        public_name: OsString,
-    ) -> io::Result<OwnedPath> {
+    pub(crate) fn own_entry(&self, name: OsString) -> io::Result<OwnedPath> {
+        let path = self.parent_path.join(&self.name).join(&name);
         let stat = rustix::fs::statat(
             &self.directory,
-            &public_name,
+            &name,
             rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
         )
         .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
         Ok(OwnedPath {
-            public_path,
+            public_path: path,
             identity: FileIdentity {
                 device: stat.st_dev as u64,
                 inode: stat.st_ino,
             },
             active: true,
             directory: self.directory.try_clone()?,
-            directory_path: self.directory_path.clone(),
-            public_name,
+            directory_path: self.parent_path.join(&self.name),
+            public_name: name,
         })
     }
 
     pub(crate) fn remove_entry(&self, name: &OsStr) {
         let _ = rustix::fs::unlinkat(&self.directory, name, rustix::fs::AtFlags::empty());
+    }
+
+    pub(crate) fn prepare_socket<F>(
+        &self,
+        owned: &OwnedPath,
+        mode: u32,
+        after_verify: F,
+    ) -> io::Result<()>
+    where
+        F: FnOnce() -> io::Result<()>,
+    {
+        if FileIdentity::from_file(&owned.directory)? != self.identity {
+            return Err(io::Error::other(
+                "socket is not owned by the private publication directory",
+            ));
+        }
+        owned.verify_owned_socket(None)?;
+        after_verify()?;
+        chmodat_portable(&owned.directory, &owned.public_name, mode)?;
+        owned.verify_owned_socket(Some(mode))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PrivateDirectory {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        let matches = rustix::fs::statat(
+            &self.parent,
+            &self.name,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .ok()
+        .is_some_and(|stat| {
+            self.identity.device == stat.st_dev as u64
+                && self.identity.inode == stat.st_ino
+                && stat.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFDIR as u32
+        });
+        if matches {
+            // POSIX has no identity-conditional rmdir-by-handle. The random
+            // 0700 stage excludes other UIDs; same-UID namespace mutation is
+            // outside the enforceable permission boundary documented here.
+            let _ = rustix::fs::unlinkat(&self.parent, &self.name, rustix::fs::AtFlags::REMOVEDIR);
+        }
     }
 }
 
@@ -293,24 +425,7 @@ impl OwnedPath {
     }
 
     #[cfg(unix)]
-    pub(crate) fn set_permissions(&self, mode: u32) -> io::Result<()> {
-        self.verify_owned_socket()?;
-        chmodat_nofollow(&self.directory, &self.public_name, mode)?;
-        self.verify_owned_socket()?;
-        let stat = rustix::fs::statat(
-            &self.directory,
-            &self.public_name,
-            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-        )
-        .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
-        if stat.st_mode as u32 & 0o777 != mode {
-            return Err(io::Error::other("owned Unix socket mode did not persist"));
-        }
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    fn verify_owned_socket(&self) -> io::Result<()> {
+    fn verify_owned_socket(&self, mode: Option<u32>) -> io::Result<()> {
         let stat = rustix::fs::statat(
             &self.directory,
             &self.public_name,
@@ -320,6 +435,7 @@ impl OwnedPath {
         if self.identity.device != stat.st_dev as u64
             || self.identity.inode != stat.st_ino
             || stat.st_mode as u32 & libc::S_IFMT as u32 != libc::S_IFSOCK as u32
+            || mode.is_some_and(|mode| stat.st_mode as u32 & 0o777 != mode)
         {
             return Err(io::Error::other("owned Unix socket identity changed"));
         }
@@ -327,17 +443,21 @@ impl OwnedPath {
     }
 
     #[cfg(unix)]
-    pub(crate) fn publish_as(
+    pub(crate) fn publish_into(
         &mut self,
+        destination: &AnchoredDirectory,
         path: PathBuf,
         destination_name: OsString,
     ) -> io::Result<()> {
+        let destination_directory = destination.directory.try_clone()?;
         rename_relative_noreplace(
             &self.directory,
             &self.public_name,
-            &self.directory,
+            &destination.directory,
             &destination_name,
         )?;
+        self.directory = destination_directory;
+        self.directory_path = destination.directory_path.clone();
         self.public_name = destination_name;
         self.public_path = path;
         Ok(())
@@ -622,37 +742,13 @@ impl OwnedPath {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn chmodat_nofollow(directory: &File, name: &OsStr, mode: u32) -> io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let name = CString::new(name.as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket name contains NUL"))?;
-    // fchmodat2 is the Linux interface that atomically honors AT_SYMLINK_NOFOLLOW.
-    let result = unsafe {
-        libc::syscall(
-            452 as libc::c_long,
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            mode as libc::mode_t,
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if result == -1 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-fn chmodat_nofollow(directory: &File, name: &OsStr, mode: u32) -> io::Result<()> {
+#[cfg(unix)]
+fn chmodat_portable(directory: &File, name: &OsStr, mode: u32) -> io::Result<()> {
     rustix::fs::chmodat(
         directory,
         name,
         rustix::fs::Mode::from_raw_mode(mode as _),
-        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        rustix::fs::AtFlags::empty(),
     )
     .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))
 }
@@ -734,6 +830,17 @@ fn random_private_name() -> io::Result<OsString> {
     Ok(OsString::from(format!(".chp-cleanup-{suffix}")))
 }
 
+#[cfg(unix)]
+fn random_stage_name() -> io::Result<OsString> {
+    // Ten random bytes keep "stage/s" no longer than the former 16-byte-hex
+    // temporary socket basename, preserving the sockaddr path-length boundary.
+    let mut random = [0_u8; 10];
+    openssl::rand::rand_bytes(&mut random)
+        .map_err(|_| io::Error::other("could not generate a private publication name"))?;
+    let suffix: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+    Ok(OsString::from(format!(".chp-stage-{suffix}")))
+}
+
 #[cfg(any(
     target_os = "linux",
     target_os = "android",
@@ -796,6 +903,45 @@ fn rename_noreplace(_source: &Path, _destination: &Path) -> io::Result<()> {
 mod tests {
     use super::{NamespaceStage, OwnedPath};
     use std::{fs, io};
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_permission_publication_uses_the_portable_contract() {
+        let ownership_source = include_str!("path_ownership.rs");
+        let production_source = ownership_source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production ownership source");
+        assert!(
+            !production_source.contains("libc::syscall"),
+            "application source must not issue a raw chmod syscall"
+        );
+        assert!(
+            !production_source.contains("452 as libc::c_long"),
+            "application source must not depend on Linux fchmodat2 syscall 452"
+        );
+        assert!(
+            production_source.contains("rustix::fs::AtFlags::empty()"),
+            "protected staging chmod must use portable fchmodat flags=0"
+        );
+
+        let pingora_source = include_str!("../vendor/pingora-core-0.8.1/src/listeners/l4.rs");
+        assert!(
+            pingora_source.contains(
+                "ServerAddress::Uds(l, _) if uds_permissions_preconfigured => {\n            uds::bind_with_preconfigured_permissions(l)"
+            ),
+            "Pingora direct-bind preconfigured-permissions branch was removed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_socket_path_component_does_not_exceed_the_previous_temporary_name() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let stage = super::random_stage_name().expect("random stage name");
+        assert!(stage.as_bytes().len() + b"/s".len() <= b".c".len() + 32);
+    }
 
     #[cfg(unix)]
     fn assert_namespace_fault_leaves_no_private_debris(stage: NamespaceStage) {

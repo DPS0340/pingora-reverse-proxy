@@ -46,7 +46,7 @@ use tokio_openssl::SslStream;
 use crate::config::{ListenerConfig, TlsConfig};
 use crate::metrics::Metrics;
 #[cfg(unix)]
-use crate::path_ownership::{AnchoredDirectory, OwnedPath};
+use crate::path_ownership::{AnchoredDirectory, OwnedPath, PrivateDirectory};
 
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_CONCURRENT_TLS_HANDSHAKES: usize = 64;
@@ -849,12 +849,20 @@ impl SocketOwner {
         self.owned.configured_entry_matches()
     }
 
-    fn set_permissions(&self, mode: u32) -> io::Result<()> {
-        self.owned.set_permissions(mode)
+    fn prepare_in<F>(&self, staging: &PrivateDirectory, mode: u32, hook: F) -> io::Result<()>
+    where
+        F: FnOnce() -> io::Result<()>,
+    {
+        staging.prepare_socket(&self.owned, mode, hook)
     }
 
-    fn publish_as(&mut self, path: PathBuf, name: std::ffi::OsString) -> io::Result<()> {
-        self.owned.publish_as(path, name)
+    fn publish_into(
+        &mut self,
+        destination: &AnchoredDirectory,
+        path: PathBuf,
+        name: std::ffi::OsString,
+    ) -> io::Result<()> {
+        self.owned.publish_into(destination, path, name)
     }
 
     #[cfg(test)]
@@ -985,9 +993,6 @@ impl PublicListenerReservation {
                         "Unix socket path is not UTF-8",
                     ))
                 })?;
-                owner
-                    .set_permissions(0o660)
-                    .map_err(ListenerError::UnixBind)?;
                 service.add_uds_with_preconfigured_permissions(path);
                 Ok((path.to_string(), socket, Some(owner)))
             }
@@ -1001,12 +1006,31 @@ fn bind_unix_socket(path: PathBuf) -> Result<(socket2::Socket, SocketOwner), Lis
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SocketPublicationStage {
+    BeforeChmod,
+}
+
+#[cfg(unix)]
 fn bind_unix_socket_with_hook<F>(
     path: PathBuf,
     after_parent_capture_before_bind: F,
 ) -> Result<(socket2::Socket, SocketOwner), ListenerError>
 where
     F: FnOnce(),
+{
+    bind_unix_socket_with_stage_hook(path, after_parent_capture_before_bind, |_| Ok(()))
+}
+
+#[cfg(unix)]
+fn bind_unix_socket_with_stage_hook<F, S>(
+    path: PathBuf,
+    after_parent_capture_before_bind: F,
+    before_chmod: S,
+) -> Result<(socket2::Socket, SocketOwner), ListenerError>
+where
+    F: FnOnce(),
+    S: FnOnce(SocketPublicationStage) -> io::Result<()>,
 {
     let public_name = path
         .file_name()
@@ -1020,45 +1044,38 @@ where
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let anchor = AnchoredDirectory::capture(parent).map_err(ListenerError::UnixBind)?;
     after_parent_capture_before_bind();
-    let stable_parent = anchor.stable_path().map_err(ListenerError::UnixBind)?;
-    for _ in 0..4 {
-        let mut random = [0_u8; 16];
-        openssl::rand::rand_bytes(&mut random).map_err(|_| {
-            ListenerError::UnixBind(io::Error::other(
-                "could not generate a private Unix socket name",
-            ))
-        })?;
-        let random: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
-        let temporary_name = std::ffi::OsString::from(format!(".c{random}"));
-        let temporary = stable_parent.join(&temporary_name);
-        let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
-            .map_err(ListenerError::UnixBind)?;
-        let address = socket2::SockAddr::unix(&temporary).map_err(ListenerError::UnixBind)?;
-        match socket.bind(&address) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AddrInUse => continue,
-            Err(error) => return Err(ListenerError::UnixBind(error)),
+    let staging = anchor
+        .create_private_directory()
+        .map_err(ListenerError::UnixBind)?;
+    let staged_name = std::ffi::OsString::from("s");
+    let staged_path = staging
+        .stable_path()
+        .map_err(ListenerError::UnixBind)?
+        .join(&staged_name);
+    let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
+        .map_err(ListenerError::UnixBind)?;
+    let address = socket2::SockAddr::unix(&staged_path).map_err(ListenerError::UnixBind)?;
+    socket.bind(&address).map_err(ListenerError::UnixBind)?;
+    let mut owner = match staging.own_entry(staged_name.clone()) {
+        Ok(owned) => SocketOwner::from_owned(owned),
+        Err(error) => {
+            staging.remove_entry(&staged_name);
+            return Err(ListenerError::UnixBind(error));
         }
-        let mut owner = match anchor.own_entry(temporary.clone(), temporary_name.clone()) {
-            Ok(owned) => SocketOwner::from_owned(owned),
-            Err(error) => {
-                anchor.remove_entry(&temporary_name);
-                return Err(ListenerError::UnixBind(error));
-            }
-        };
-        socket.listen(1024).map_err(ListenerError::UnixBind)?;
-        socket
-            .set_nonblocking(true)
-            .map_err(ListenerError::UnixBind)?;
-        owner
-            .publish_as(path, public_name.clone())
-            .map_err(ListenerError::UnixBind)?;
-        return Ok((socket, owner));
-    }
-    Err(ListenerError::UnixBind(io::Error::new(
-        io::ErrorKind::AddrInUse,
-        "could not reserve a private Unix socket path",
-    )))
+    };
+    socket.listen(1024).map_err(ListenerError::UnixBind)?;
+    socket
+        .set_nonblocking(true)
+        .map_err(ListenerError::UnixBind)?;
+    owner
+        .prepare_in(&staging, 0o660, || {
+            before_chmod(SocketPublicationStage::BeforeChmod)
+        })
+        .map_err(ListenerError::UnixBind)?;
+    owner
+        .publish_into(&anchor, path, public_name)
+        .map_err(ListenerError::UnixBind)?;
+    Ok((socket, owner))
 }
 
 #[cfg(unix)]
@@ -1567,6 +1584,8 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::io;
+    #[cfg(unix)]
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -2440,6 +2459,148 @@ mod tests {
                 .count(),
             0,
             "captured publication directory leaked entries"
+        );
+    }
+
+    #[cfg(unix)]
+    fn publication_stage_path(parent: &Path) -> PathBuf {
+        fs::read_dir(parent)
+            .expect("list publication parent")
+            .find_map(|entry| {
+                let entry = entry.expect("read publication entry");
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".chp-stage-")
+                    .then_some(entry.path())
+            })
+            .expect("private publication stage exists")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permission_boundary_mutates_only_the_private_staged_socket() {
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+        let root = tempfile::tempdir_in("/tmp").expect("temporary staging boundary root");
+        let public = root.path().join("public.sock");
+        let result = super::bind_unix_socket_with_stage_hook(
+            public.clone(),
+            || {},
+            |stage| {
+                if stage != super::SocketPublicationStage::BeforeChmod {
+                    return Ok(());
+                }
+                let staging = publication_stage_path(root.path());
+                assert_eq!(
+                    fs::metadata(&staging)
+                        .expect("staging metadata")
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o700
+                );
+                let staged = staging.join("s");
+                assert!(fs::symlink_metadata(&staged)
+                    .expect("staged socket metadata")
+                    .file_type()
+                    .is_socket());
+                assert!(!public.exists(), "socket was published before chmod");
+                fs::write(&public, b"replacement").expect("install public replacement");
+                fs::set_permissions(&public, fs::Permissions::from_mode(0o600))
+                    .expect("set replacement mode");
+                Ok(())
+            },
+        );
+
+        assert!(
+            result.is_err(),
+            "no-clobber publication replaced a public entry"
+        );
+        assert_eq!(
+            fs::read(&public).expect("replacement retained"),
+            b"replacement"
+        );
+        assert_eq!(
+            fs::metadata(&public)
+                .expect("replacement metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "staging chmod mutated the public replacement"
+        );
+        assert_eq!(
+            fs::read_dir(root.path())
+                .expect("list cleaned parent")
+                .count(),
+            1,
+            "owned staging socket or directory leaked"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_chmod_failure_removes_owned_socket_and_stage() {
+        let root = tempfile::tempdir_in("/tmp").expect("temporary chmod-fault root");
+        let public = root.path().join("public.sock");
+        let result = super::bind_unix_socket_with_stage_hook(
+            public.clone(),
+            || {},
+            |stage| {
+                if stage == super::SocketPublicationStage::BeforeChmod {
+                    return Err(io::Error::other("injected staging chmod failure"));
+                }
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err(), "injected chmod failure succeeded");
+        assert!(!public.exists(), "failed staging socket was published");
+        assert_eq!(
+            fs::read_dir(root.path())
+                .expect("list chmod-fault root")
+                .count(),
+            0,
+            "chmod failure leaked an owned socket or staging directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_replacement_during_chmod_failure_is_preserved() {
+        let root = tempfile::tempdir_in("/tmp").expect("temporary stage-replacement root");
+        let public = root.path().join("public.sock");
+        let displaced = root.path().join("displaced-owned-stage");
+        let result = super::bind_unix_socket_with_stage_hook(
+            public.clone(),
+            || {},
+            |stage| {
+                if stage != super::SocketPublicationStage::BeforeChmod {
+                    return Ok(());
+                }
+                let staging = publication_stage_path(root.path());
+                fs::rename(&staging, &displaced).expect("displace owned staging directory");
+                fs::create_dir(&staging).expect("install staging replacement");
+                fs::write(staging.join("foreign"), b"replacement")
+                    .expect("populate staging replacement");
+                Err(io::Error::other("injected staging chmod failure"))
+            },
+        );
+
+        assert!(result.is_err(), "injected replacement failure succeeded");
+        assert!(!public.exists(), "failed staging socket was published");
+        let replacement = publication_stage_path(root.path());
+        assert_eq!(
+            fs::read(replacement.join("foreign")).expect("replacement retained"),
+            b"replacement"
+        );
+        assert_eq!(
+            fs::read_dir(&displaced)
+                .expect("list displaced owned stage")
+                .count(),
+            0,
+            "owned staged socket was not cleaned through its retained dirfd"
         );
     }
 
