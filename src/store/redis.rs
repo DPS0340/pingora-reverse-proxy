@@ -1,13 +1,12 @@
 //! Redis-backed route persistence using one versioned hash.
 
 use std::collections::BTreeMap;
-use std::future::Future;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use redis::aio::MultiplexedConnection;
-use redis::{AsyncCommands, Script};
+use redis::AsyncCommands;
 use serde_json::{Map, Value};
 use tokio::sync::Mutex;
 
@@ -59,7 +58,8 @@ impl RedisStoreConfig {
 
 /// Persistent route store backed by a single Redis hash.
 pub struct RedisStore {
-    connection: Mutex<MultiplexedConnection>,
+    client: redis::Client,
+    connection: Mutex<Option<MultiplexedConnection>>,
     key: String,
     operation_timeout: Duration,
 }
@@ -90,7 +90,8 @@ impl RedisStore {
             })?;
 
         Ok(Self {
-            connection: Mutex::new(connection),
+            client,
+            connection: Mutex::new(Some(connection)),
             key: config.key,
             operation_timeout: config.operation_timeout,
         })
@@ -149,14 +150,70 @@ impl RedisStore {
         Ok(RouteKey::parse(&parse_input).expect("route-key normalization is infallible"))
     }
 
-    async fn bounded<T>(
+    fn connection_config(&self) -> redis::AsyncConnectionConfig {
+        redis::AsyncConnectionConfig::new()
+            .set_connection_timeout(self.operation_timeout)
+            .set_response_timeout(self.operation_timeout)
+    }
+
+    async fn connect_new(
         &self,
         operation: &'static str,
-        future: impl Future<Output = Result<T, StoreError>>,
-    ) -> Result<T, StoreError> {
-        tokio::time::timeout(self.operation_timeout, future)
-            .await
-            .map_err(|_| StoreError::Backend { operation })?
+    ) -> Result<MultiplexedConnection, StoreError> {
+        tokio::time::timeout(
+            self.operation_timeout,
+            self.client
+                .get_multiplexed_async_connection_with_config(&self.connection_config()),
+        )
+        .await
+        .map_err(|_| StoreError::Backend { operation })?
+        .map_err(Self::backend_error(operation))
+    }
+
+    async fn take_connection(
+        &self,
+        operation: &'static str,
+    ) -> Result<MultiplexedConnection, StoreError> {
+        if let Some(connection) = self.connection.lock().await.take() {
+            Ok(connection)
+        } else {
+            self.connect_new(operation).await
+        }
+    }
+
+    async fn return_connection(&self, mut connection: MultiplexedConnection) {
+        connection.set_response_timeout(self.operation_timeout);
+        *self.connection.lock().await = Some(connection);
+    }
+
+    fn use_remaining_timeout(
+        &self,
+        operation: &'static str,
+        deadline: tokio::time::Instant,
+        connection: &mut MultiplexedConnection,
+    ) -> Result<(), StoreError> {
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .ok_or(StoreError::Backend { operation })?;
+        connection.set_response_timeout(remaining);
+        Ok(())
+    }
+
+    async fn reconcile(
+        &self,
+        operation: &'static str,
+        key: &RouteKey,
+    ) -> Result<Option<String>, StoreError> {
+        let mut connection = self.connect_new(operation).await?;
+        let current = tokio::time::timeout(
+            self.operation_timeout,
+            connection.hget(&self.key, key.as_str()),
+        )
+        .await
+        .map_err(|_| StoreError::Backend { operation })?
+        .map_err(Self::backend_error(operation))?;
+        self.return_connection(connection).await;
+        Ok(current)
     }
 
     async fn atomic_replace(
@@ -166,57 +223,69 @@ impl RedisStore {
         mut data: RouteData,
         activity_floor: &ActivityFloor,
     ) -> Result<RouteData, StoreError> {
-        self.bounded(operation, async {
-            let mut connection = self.connection.lock().await;
-            loop {
-                redis::cmd("WATCH")
-                    .arg(&self.key)
-                    .query_async::<()>(&mut *connection)
-                    .await
-                    .map_err(Self::backend_error(operation))?;
+        let mut connection = self.take_connection(operation).await?;
+        let deadline = tokio::time::Instant::now() + self.operation_timeout;
+        loop {
+            self.use_remaining_timeout(operation, deadline, &mut connection)?;
+            if redis::cmd("WATCH")
+                .arg(&self.key)
+                .query_async::<()>(&mut connection)
+                .await
+                .is_err()
+            {
+                return Err(StoreError::Backend { operation });
+            }
 
-                if let Some(floor) = activity_floor.current() {
-                    data.last_activity = data.last_activity.max(floor);
-                }
-                let encoded = Self::encode(operation, &data)?;
-                let committed_data = Self::decode(operation, key.as_str(), &encoded)?;
-                let committed = redis::pipe()
-                    .atomic()
-                    .cmd("HSET")
-                    .arg(&self.key)
-                    .arg(key.as_str())
-                    .arg(encoded)
-                    .ignore()
-                    .query_async::<Option<()>>(&mut *connection)
-                    .await
-                    .map_err(Self::backend_error(operation))?;
-                if committed.is_some() {
+            if let Some(floor) = activity_floor.current() {
+                data.last_activity = data.last_activity.max(floor);
+            }
+            let encoded = Self::encode(operation, &data)?;
+            let committed_data = Self::decode(operation, key.as_str(), &encoded)?;
+            self.use_remaining_timeout(operation, deadline, &mut connection)?;
+            let transaction = redis::pipe()
+                .atomic()
+                .cmd("HSET")
+                .arg(&self.key)
+                .arg(key.as_str())
+                .arg(&encoded)
+                .ignore()
+                .query_async::<Option<()>>(&mut connection)
+                .await;
+            match transaction {
+                Ok(Some(())) => {
+                    self.return_connection(connection).await;
                     return Ok(committed_data);
                 }
+                Ok(None) => continue,
+                Err(_) => {
+                    drop(connection);
+                    return if self.reconcile(operation, key).await? == Some(encoded) {
+                        Ok(committed_data)
+                    } else {
+                        Err(StoreError::Backend { operation })
+                    };
+                }
             }
-        })
-        .await
+        }
     }
 }
 
 #[async_trait]
 impl Store for RedisStore {
     async fn snapshot(&self) -> Result<BTreeMap<RouteKey, RouteData>, StoreError> {
-        self.bounded("snapshot", async {
-            let mut connection = self.connection.lock().await;
-            let records: Vec<(String, String)> = connection
-                .hgetall(&self.key)
-                .await
-                .map_err(Self::backend_error("snapshot"))?;
-            let mut snapshot = BTreeMap::new();
-            for (field, encoded) in records {
-                let key = Self::decode_key(&field)?;
-                let data = Self::decode("snapshot", key.as_str(), &encoded)?;
-                snapshot.insert(key, data);
-            }
-            Ok(snapshot)
-        })
-        .await
+        let mut connection = self.take_connection("snapshot").await?;
+        let records: Vec<(String, String)> = connection
+            .hgetall(&self.key)
+            .await
+            .map_err(Self::backend_error("snapshot"))?;
+        let mut snapshot = BTreeMap::new();
+        for (field, encoded) in records {
+            let key = Self::decode_key(&field)?;
+            let data = Self::decode("snapshot", key.as_str(), &encoded)?;
+            snapshot.insert(key, data);
+        }
+        self.return_connection(connection).await;
+        Ok(snapshot)
     }
 
     async fn add(
@@ -241,14 +310,24 @@ impl Store for RedisStore {
 
     async fn put(&self, key: RouteKey, data: RouteData) -> Result<(), StoreError> {
         let encoded = Self::encode("put", &data)?;
-        self.bounded("put", async {
-            let mut connection = self.connection.lock().await;
-            connection
-                .hset::<_, _, _, ()>(&self.key, key.as_str(), encoded)
-                .await
-                .map_err(Self::backend_error("put"))
-        })
-        .await
+        let mut connection = self.take_connection("put").await?;
+        match connection
+            .hset::<_, _, _, ()>(&self.key, key.as_str(), &encoded)
+            .await
+        {
+            Ok(()) => {
+                self.return_connection(connection).await;
+                Ok(())
+            }
+            Err(_) => {
+                drop(connection);
+                if self.reconcile("put", &key).await? == Some(encoded) {
+                    Ok(())
+                } else {
+                    Err(StoreError::Backend { operation: "put" })
+                }
+            }
+        }
     }
 
     async fn put_preserving_activity(
@@ -262,67 +341,141 @@ impl Store for RedisStore {
     }
 
     async fn update_activity(&self, key: &RouteKey, at: DateTime<Utc>) -> Result<(), StoreError> {
-        self.bounded("update_activity", async {
-            let mut connection = self.connection.lock().await;
-            loop {
-                redis::cmd("WATCH")
-                    .arg(&self.key)
-                    .query_async::<()>(&mut *connection)
+        let mut connection = self.take_connection("update_activity").await?;
+        let deadline = tokio::time::Instant::now() + self.operation_timeout;
+        loop {
+            self.use_remaining_timeout("update_activity", deadline, &mut connection)?;
+            if redis::cmd("WATCH")
+                .arg(&self.key)
+                .query_async::<()>(&mut connection)
+                .await
+                .is_err()
+            {
+                return Err(StoreError::Backend {
+                    operation: "update_activity",
+                });
+            }
+            self.use_remaining_timeout("update_activity", deadline, &mut connection)?;
+            let current: Option<String> = match connection.hget(&self.key, key.as_str()).await {
+                Ok(current) => current,
+                Err(_) => {
+                    return Err(StoreError::Backend {
+                        operation: "update_activity",
+                    });
+                }
+            };
+            let Some(current) = current else {
+                self.use_remaining_timeout("update_activity", deadline, &mut connection)?;
+                if redis::cmd("UNWATCH")
+                    .query_async::<()>(&mut connection)
                     .await
-                    .map_err(Self::backend_error("update_activity"))?;
-                let current: Option<String> = connection
-                    .hget(&self.key, key.as_str())
-                    .await
-                    .map_err(Self::backend_error("update_activity"))?;
-                let Some(current) = current else {
-                    redis::cmd("UNWATCH")
-                        .query_async::<()>(&mut *connection)
-                        .await
-                        .map_err(Self::backend_error("update_activity"))?;
-                    return Ok(());
-                };
-                let mut data = Self::decode("update_activity", key.as_str(), &current)?;
-                data.last_activity = at;
-                let encoded = Self::encode("update_activity", &data)?;
-                let committed = redis::pipe()
-                    .atomic()
-                    .cmd("HSET")
-                    .arg(&self.key)
-                    .arg(key.as_str())
-                    .arg(encoded)
-                    .ignore()
-                    .query_async::<Option<()>>(&mut *connection)
-                    .await
-                    .map_err(Self::backend_error("update_activity"))?;
-                if committed.is_some() {
+                    .is_err()
+                {
+                    return Err(StoreError::Backend {
+                        operation: "update_activity",
+                    });
+                }
+                self.return_connection(connection).await;
+                return Ok(());
+            };
+            let mut data = Self::decode("update_activity", key.as_str(), &current)?;
+            data.last_activity = at;
+            let encoded = Self::encode("update_activity", &data)?;
+            self.use_remaining_timeout("update_activity", deadline, &mut connection)?;
+            let transaction = redis::pipe()
+                .atomic()
+                .cmd("HSET")
+                .arg(&self.key)
+                .arg(key.as_str())
+                .arg(&encoded)
+                .ignore()
+                .query_async::<Option<()>>(&mut connection)
+                .await;
+            match transaction {
+                Ok(Some(())) => {
+                    self.return_connection(connection).await;
                     return Ok(());
                 }
+                Ok(None) => continue,
+                Err(_) => {
+                    drop(connection);
+                    return if self.reconcile("update_activity", key).await? == Some(encoded) {
+                        Ok(())
+                    } else {
+                        Err(StoreError::Backend {
+                            operation: "update_activity",
+                        })
+                    };
+                }
             }
-        })
-        .await
+        }
     }
 
     async fn delete(&self, key: &RouteKey) -> Result<Option<RouteData>, StoreError> {
-        self.bounded("delete", async {
-            let mut connection = self.connection.lock().await;
-            let encoded: Option<String> = Script::new(
-                r#"
-local prior = redis.call('HGET', KEYS[1], ARGV[1])
-if prior then
-    redis.call('HDEL', KEYS[1], ARGV[1])
-end
-return prior
-"#,
-            )
-            .key(&self.key)
-            .arg(key.as_str())
-            .invoke_async(&mut *connection)
-            .await
-            .map_err(Self::backend_error("delete"))?;
-            encoded
-                .map(|encoded| Self::decode("delete", key.as_str(), &encoded))
-                .transpose()
-        })
-        .await
+        let mut connection = self.take_connection("delete").await?;
+        let deadline = tokio::time::Instant::now() + self.operation_timeout;
+        loop {
+            self.use_remaining_timeout("delete", deadline, &mut connection)?;
+            if redis::cmd("WATCH")
+                .arg(&self.key)
+                .query_async::<()>(&mut connection)
+                .await
+                .is_err()
+            {
+                return Err(StoreError::Backend {
+                    operation: "delete",
+                });
+            }
+            self.use_remaining_timeout("delete", deadline, &mut connection)?;
+            let current: Option<String> = match connection.hget(&self.key, key.as_str()).await {
+                Ok(current) => current,
+                Err(_) => {
+                    return Err(StoreError::Backend {
+                        operation: "delete",
+                    });
+                }
+            };
+            let Some(encoded) = current else {
+                self.use_remaining_timeout("delete", deadline, &mut connection)?;
+                if redis::cmd("UNWATCH")
+                    .query_async::<()>(&mut connection)
+                    .await
+                    .is_err()
+                {
+                    return Err(StoreError::Backend {
+                        operation: "delete",
+                    });
+                }
+                self.return_connection(connection).await;
+                return Ok(None);
+            };
+            let prior = Self::decode("delete", key.as_str(), &encoded)?;
+            self.use_remaining_timeout("delete", deadline, &mut connection)?;
+            let transaction = redis::pipe()
+                .atomic()
+                .cmd("HDEL")
+                .arg(&self.key)
+                .arg(key.as_str())
+                .ignore()
+                .query_async::<Option<()>>(&mut connection)
+                .await;
+            match transaction {
+                Ok(Some(())) => {
+                    self.return_connection(connection).await;
+                    return Ok(Some(prior));
+                }
+                Ok(None) => continue,
+                Err(_) => {
+                    drop(connection);
+                    return if self.reconcile("delete", key).await?.is_none() {
+                        Ok(Some(prior))
+                    } else {
+                        Err(StoreError::Backend {
+                            operation: "delete",
+                        })
+                    };
+                }
+            }
+        }
     }
 }

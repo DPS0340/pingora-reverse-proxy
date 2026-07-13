@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -21,6 +22,8 @@ use proptest::prelude::*;
 use redis::AsyncCommands;
 use serde_json::{json, Map};
 use serial_test::serial;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Barrier, RwLock, Semaphore};
 
 fn key(path: &str) -> RouteKey {
@@ -130,6 +133,137 @@ async fn clear_redis_hash(test_name: &str) {
     let _: usize = connection.del(redis_hash_key(test_name)).await.unwrap();
 }
 
+async fn redis_client_ids(connection: &mut redis::aio::MultiplexedConnection) -> BTreeSet<u64> {
+    let clients: String = redis::cmd("CLIENT")
+        .arg("LIST")
+        .query_async(connection)
+        .await
+        .unwrap();
+    clients
+        .lines()
+        .filter_map(|line| {
+            line.split_whitespace()
+                .find_map(|field| field.strip_prefix("id="))
+                .map(|id| id.parse().unwrap())
+        })
+        .collect()
+}
+
+async fn redis_exec_calls(connection: &mut redis::aio::MultiplexedConnection) -> u64 {
+    let command_stats: String = redis::cmd("INFO")
+        .arg("commandstats")
+        .query_async(connection)
+        .await
+        .unwrap();
+    command_stats
+        .lines()
+        .find_map(|line| line.strip_prefix("cmdstat_exec:calls="))
+        .and_then(|statistics| statistics.split(',').next())
+        .map(|calls| calls.parse().unwrap())
+        .unwrap_or_default()
+}
+
+struct SuppressMutationReplyProxy {
+    url: String,
+    suppressed: tokio::sync::oneshot::Receiver<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl SuppressMutationReplyProxy {
+    async fn start(marker: &str) -> Self {
+        let backend = url::Url::parse(&redis_url()).unwrap();
+        let backend_address = format!(
+            "{}:{}",
+            backend.host_str().unwrap(),
+            backend.port_or_known_default().unwrap()
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let marker = marker.as_bytes().to_vec();
+        let triggered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (suppressed_tx, suppressed) = tokio::sync::oneshot::channel();
+        let suppressed_tx = Arc::new(std::sync::Mutex::new(Some(suppressed_tx)));
+        let task = tokio::spawn(async move {
+            loop {
+                let (client, _) = listener.accept().await.unwrap();
+                let server = TcpStream::connect(&backend_address).await.unwrap();
+                let marker = marker.clone();
+                let triggered = triggered.clone();
+                let suppressed_tx = suppressed_tx.clone();
+                tokio::spawn(async move {
+                    let (mut client_read, mut client_write) = client.into_split();
+                    let (mut server_read, mut server_write) = server.into_split();
+                    let request_triggered = triggered.clone();
+                    let request = tokio::spawn(async move {
+                        let mut buffer = [0_u8; 16 * 1024];
+                        loop {
+                            let read = client_read.read(&mut buffer).await.unwrap();
+                            if read == 0 {
+                                break;
+                            }
+                            server_write.write_all(&buffer[..read]).await.unwrap();
+                            if buffer[..read]
+                                .windows(marker.len())
+                                .any(|window| window == marker)
+                            {
+                                request_triggered.store(true, Ordering::SeqCst);
+                            }
+                        }
+                    });
+                    let response = tokio::spawn(async move {
+                        let mut buffer = [0_u8; 16 * 1024];
+                        loop {
+                            let read = server_read.read(&mut buffer).await.unwrap();
+                            if read == 0 {
+                                break;
+                            }
+                            if triggered.swap(false, Ordering::SeqCst) {
+                                if let Some(sender) = suppressed_tx.lock().unwrap().take() {
+                                    let _ = sender.send(());
+                                }
+                                tokio::time::sleep(Duration::from_millis(250)).await;
+                                break;
+                            }
+                            client_write.write_all(&buffer[..read]).await.unwrap();
+                        }
+                    });
+                    let _ = tokio::join!(request, response);
+                });
+            }
+        });
+        Self {
+            url: format!("redis://{address}/"),
+            suppressed,
+            task,
+        }
+    }
+
+    async fn wait_for_suppressed_reply(&mut self) {
+        (&mut self.suppressed).await.unwrap();
+    }
+}
+
+impl Drop for SuppressMutationReplyProxy {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn fault_proxy_store(
+    test_name: &str,
+    marker: &str,
+) -> (RedisStore, SuppressMutationReplyProxy) {
+    let proxy = SuppressMutationReplyProxy::start(marker).await;
+    let store = RedisStore::connect(
+        RedisStoreConfig::new(proxy.url.clone())
+            .with_key(redis_hash_key(test_name))
+            .with_operation_timeout(Duration::from_millis(100)),
+    )
+    .await
+    .unwrap();
+    (store, proxy)
+}
+
 #[tokio::test]
 #[serial(redis)]
 async fn redis_store_satisfies_backend_neutral_contract() {
@@ -178,6 +312,23 @@ async fn redis_overwrite_delete_missing_and_metadata_round_trip() {
 
     assert_eq!(store.snapshot().await.unwrap().len(), 1);
     assert_eq!(store.snapshot().await.unwrap()[&route_key], replacement);
+    let client = redis::Client::open(redis_url()).unwrap();
+    let mut raw_connection = client.get_multiplexed_async_connection().await.unwrap();
+    let raw_records: Vec<(String, String)> = raw_connection
+        .hgetall(redis_hash_key(TEST_NAME))
+        .await
+        .unwrap();
+    assert_eq!(raw_records.len(), 1);
+    assert_eq!(raw_records[0].0, route_key.as_str());
+    let raw: serde_json::Value = serde_json::from_str(&raw_records[0].1).unwrap();
+    assert_eq!(raw["target"], replacement.target);
+    assert_eq!(raw["last_activity"], "1970-01-01T00:16:27.654000000Z");
+    assert_eq!(raw["owner"], "replacement");
+    assert_eq!(
+        raw["arbitrary"],
+        json!({"deep": {"array": [1, "two", false]}})
+    );
+    assert_eq!(raw.as_object().unwrap().len(), 4);
     assert_eq!(store.delete(&key("/missing")).await.unwrap(), None);
     assert_eq!(store.delete(&route_key).await.unwrap(), Some(replacement));
     clear_redis_hash(TEST_NAME).await;
@@ -217,6 +368,55 @@ async fn redis_corrupt_snapshot_is_typed_redacted_and_never_published() {
 
 #[tokio::test]
 #[serial(redis)]
+async fn redis_corrupt_watched_record_poisoned_connection_is_not_reused() {
+    const TEST_NAME: &str = "corrupt-watched-record";
+    clear_redis_hash(TEST_NAME).await;
+    let client = redis::Client::open(redis_url()).unwrap();
+    let mut administrator = client.get_multiplexed_async_connection().await.unwrap();
+    let before = redis_client_ids(&mut administrator).await;
+    let store = redis_store(TEST_NAME).await;
+    let connected = redis_client_ids(&mut administrator).await;
+    let store_id = *connected.difference(&before).next().unwrap();
+    let route_key = key("/corrupt-watched");
+    let _: usize = administrator
+        .hset(
+            redis_hash_key(TEST_NAME),
+            route_key.as_str(),
+            r#"{"target":false}"#,
+        )
+        .await
+        .unwrap();
+
+    let error = store
+        .update_activity(&route_key, Utc::now())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::CorruptData {
+            operation: "update_activity",
+            ..
+        }
+    ));
+    tokio::task::yield_now().await;
+    assert!(
+        !redis_client_ids(&mut administrator)
+            .await
+            .contains(&store_id),
+        "a connection that may still be WATCHing must be replaced"
+    );
+
+    let replacement = route("http://replacement-after-corruption.example");
+    store
+        .put(route_key.clone(), replacement.clone())
+        .await
+        .unwrap();
+    assert_eq!(store.snapshot().await.unwrap()[&route_key], replacement);
+    clear_redis_hash(TEST_NAME).await;
+}
+
+#[tokio::test]
+#[serial(redis)]
 async fn redis_unavailable_startup_is_bounded_typed_and_redacts_credentials() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -245,19 +445,21 @@ async fn redis_unavailable_startup_is_bounded_typed_and_redacts_credentials() {
 async fn redis_disconnect_during_mutation_returns_typed_error_without_applying_write() {
     const TEST_NAME: &str = "disconnect";
     clear_redis_hash(TEST_NAME).await;
-    let store = redis_store(TEST_NAME).await;
     let client = redis::Client::open(redis_url()).unwrap();
     let mut administrator = client.get_multiplexed_async_connection().await.unwrap();
+    let before = redis_client_ids(&mut administrator).await;
+    let store = redis_store(TEST_NAME).await;
+    let after = redis_client_ids(&mut administrator).await;
+    let store_ids: Vec<_> = after.difference(&before).copied().collect();
+    assert_eq!(store_ids.len(), 1, "exactly one store client must connect");
     let killed: usize = redis::cmd("CLIENT")
         .arg("KILL")
-        .arg("TYPE")
-        .arg("normal")
-        .arg("SKIPME")
-        .arg("yes")
+        .arg("ID")
+        .arg(store_ids[0])
         .query_async(&mut administrator)
         .await
         .unwrap();
-    assert!(killed >= 1, "the store connection must be disconnected");
+    assert_eq!(killed, 1, "only the exact store connection is disconnected");
 
     let error = store
         .put(key("/not-applied"), route("http://not-applied.example"))
@@ -282,8 +484,136 @@ async fn redis_disconnect_during_mutation_returns_typed_error_without_applying_w
 
 #[tokio::test]
 #[serial(redis)]
+async fn redis_reconciles_committed_mutations_when_their_replies_are_lost() {
+    const TEST_NAME: &str = "lost-mutation-replies";
+    clear_redis_hash(TEST_NAME).await;
+    let route_key = key("/uncertain");
+
+    let put_marker = "lost-put-reply.example";
+    let (put_store, mut put_proxy) = fault_proxy_store(TEST_NAME, put_marker).await;
+    let put_data = route(&format!("http://{put_marker}"));
+    put_store
+        .put(route_key.clone(), put_data.clone())
+        .await
+        .expect("a committed put with a lost reply must reconcile as success");
+    put_proxy.wait_for_suppressed_reply().await;
+    assert_eq!(put_store.snapshot().await.unwrap()[&route_key], put_data);
+    drop(put_store);
+    drop(put_proxy);
+
+    let add_marker = "lost-add-reply.example";
+    let (add_store, mut add_proxy) = fault_proxy_store(TEST_NAME, add_marker).await;
+    let added = add_store
+        .add(
+            route_key.clone(),
+            format!("http://{add_marker}"),
+            Map::from_iter([("mutation".to_owned(), json!("add"))]),
+            ActivityFloor::fixed(None),
+        )
+        .await
+        .expect("a committed add with a lost EXEC reply must reconcile as success");
+    add_proxy.wait_for_suppressed_reply().await;
+    assert_eq!(add_store.snapshot().await.unwrap()[&route_key], added);
+    drop(add_store);
+    drop(add_proxy);
+
+    let activity = Utc.timestamp_opt(7_654_321, 123_456_789).unwrap();
+    let activity_marker = activity.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    let (activity_store, mut activity_proxy) = fault_proxy_store(TEST_NAME, &activity_marker).await;
+    activity_store
+        .update_activity(&route_key, activity)
+        .await
+        .expect("a committed activity update with a lost EXEC reply must reconcile as success");
+    activity_proxy.wait_for_suppressed_reply().await;
+    assert_eq!(
+        activity_store.snapshot().await.unwrap()[&route_key].last_activity,
+        activity
+    );
+    drop(activity_store);
+    drop(activity_proxy);
+
+    let delete_marker = "HDEL";
+    let (delete_store, mut delete_proxy) = fault_proxy_store(TEST_NAME, delete_marker).await;
+    let deleted = delete_store
+        .delete(&route_key)
+        .await
+        .expect("a committed delete with a lost reply must reconcile as success");
+    delete_proxy.wait_for_suppressed_reply().await;
+    assert!(deleted.is_some());
+    assert!(delete_store.snapshot().await.unwrap().is_empty());
+    clear_redis_hash(TEST_NAME).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial(redis)]
+async fn redis_two_stores_retry_forced_exec_contention() {
+    const TEST_NAME: &str = "two-store-contention";
+    const ROUNDS: u64 = 12;
+    clear_redis_hash(TEST_NAME).await;
+    let first = Arc::new(redis_store(TEST_NAME).await);
+    let second = Arc::new(redis_store(TEST_NAME).await);
+    let client = redis::Client::open(redis_url()).unwrap();
+    let mut administrator = client.get_multiplexed_async_connection().await.unwrap();
+    let exec_calls_before = redis_exec_calls(&mut administrator).await;
+    let large_metadata = "x".repeat(512 * 1024);
+
+    for round in 0..ROUNDS {
+        let barrier = Arc::new(Barrier::new(3));
+        let first_task = {
+            let store = first.clone();
+            let barrier = barrier.clone();
+            let large_metadata = large_metadata.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                store
+                    .add(
+                        key("/contended"),
+                        format!("http://first-{round}.example"),
+                        Map::from_iter([("padding".to_owned(), json!(large_metadata))]),
+                        ActivityFloor::fixed(None),
+                    )
+                    .await
+                    .unwrap();
+            })
+        };
+        let second_task = {
+            let store = second.clone();
+            let barrier = barrier.clone();
+            let large_metadata = large_metadata.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                store
+                    .add(
+                        key("/contended"),
+                        format!("http://second-{round}.example"),
+                        Map::from_iter([("padding".to_owned(), json!(large_metadata))]),
+                        ActivityFloor::fixed(None),
+                    )
+                    .await
+                    .unwrap();
+            })
+        };
+        barrier.wait().await;
+        first_task.await.unwrap();
+        second_task.await.unwrap();
+    }
+
+    let exec_calls = redis_exec_calls(&mut administrator).await - exec_calls_before;
+    assert!(
+        exec_calls > ROUNDS * 2,
+        "at least one watched transaction must abort and retry: {exec_calls} EXEC calls"
+    );
+    assert_eq!(first.snapshot().await.unwrap().len(), 1);
+    clear_redis_hash(TEST_NAME).await;
+}
+
+#[tokio::test]
+#[serial(redis)]
 async fn redis_restart_persistence_recovers_complete_routes_without_clearing() {
     const TEST_NAME: &str = "restart-persistence";
+    let Ok(phase) = std::env::var("REDIS_RESTART_PHASE") else {
+        return;
+    };
     let store = Arc::new(redis_store(TEST_NAME).await);
     let route_key = key("//persistent/user///");
     let expected = RouteData {
@@ -298,18 +628,20 @@ async fn redis_restart_persistence_recovers_complete_routes_without_clearing() {
         ]),
     };
 
-    let registry = RouteRegistry::load(store).await.unwrap();
-    if registry.get(&route_key).is_none() {
-        registry
-            .put(route_key.clone(), expected.clone())
-            .await
-            .unwrap();
+    match phase.as_str() {
+        "writer" => {
+            clear_redis_hash(TEST_NAME).await;
+            let registry = RouteRegistry::load(store).await.unwrap();
+            assert!(registry.get(&route_key).is_none());
+            registry.put(route_key, expected).await.unwrap();
+        }
+        "reader" => {
+            let registry = RouteRegistry::load(store).await.unwrap();
+            assert_eq!(registry.get(&route_key), Some(expected));
+            clear_redis_hash(TEST_NAME).await;
+        }
+        phase => panic!("unknown REDIS_RESTART_PHASE {phase:?}"),
     }
-    drop(registry);
-
-    let reconnected = Arc::new(redis_store(TEST_NAME).await);
-    let reloaded = RouteRegistry::load(reconnected).await.unwrap();
-    assert_eq!(reloaded.get(&route_key), Some(expected));
 }
 
 #[derive(Clone, Debug)]
