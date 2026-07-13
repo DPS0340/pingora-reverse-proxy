@@ -770,3 +770,39 @@ each side and still reports exactly the established three vendor deltas:
 `src/listeners/l4.rs`, `src/listeners/mod.rs`, and
 `src/services/listening.rs`. No Task 9 implementation or unrelated refactor was
 added.
+
+### Task 8 safe publication parent closure (2026-07-13)
+
+Unix publication parents are now authenticated from retained descriptor
+metadata before staging and rechecked before stable-path child binding,
+publication, and guarded cleanup. Directories with group/other write bits are
+accepted only when sticky, permitting `/tmp`-style parents while rejecting
+non-sticky shared writable parents before debris is created. Private stages
+created under a restrictive umask are accepted only when their permissions are
+a subset of 0700, normalized through the authenticated descriptor to exact mode
+0700, and reauthenticated before child use.
+
+The four new safe-parent and restrictive-umask contracts passed in the initial
+`cargo test --lib` run, whose complete result was `55/55`. The combined
+safe-parent, authenticated-acquisition, and staged-publication group then passed
+`20/20` rounds across 17 contracts (`340/340` contract executions). The prior
+raw-FD/private-namespace eight-contract group independently passed `20/20`
+rounds (`160/160` contract executions). The complete 55-test library harness
+passed `100/100` default-parallel runs (`5,500/5,500` top-level test
+executions); each run also passed the isolated restrictive-umask child contract.
+Focused TLS/Unix and WebSocket suites passed `22/22` and `4/4`.
+
+`PROPTEST_CASES=256 cargo test --all-targets --all-features` passed `266/266`:
+library `55`, binary `0`, API `33`, config `27`, proxy `69`, routes `11`, store
+`45`, TLS/Unix `22`, and WebSocket `4`. `PROPTEST_CASES=512 cargo test --test
+route_properties` passed `11/11`. Formatting, warnings-denied Clippy with
+`--all-targets --all-features --no-deps`, all-target/all-feature checking,
+whitespace validation, final diff review, and status review passed. The sole
+build warning remains the established vendored OpenSSL deprecation outside the
+`--no-deps` Clippy scope.
+
+The checksum-verified Pingora 0.8.1 registry comparison still contains 114
+files on each side and exactly the established three vendor deltas:
+`src/listeners/l4.rs`, `src/listeners/mod.rs`, and
+`src/services/listening.rs`. No Task 9 implementation or unrelated refactor was
+added.

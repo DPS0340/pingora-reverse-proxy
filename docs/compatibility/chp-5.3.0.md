@@ -68,7 +68,11 @@ and two seconds for admitted HTTP/WebSocket traffic. Final runtime teardown is
 bounded separately at one second.
 
 Unix PID/UDS publication and cleanup remain anchored to the originally opened
-parent directory. Cleanup places the candidate inside an unpredictable 0700
+parent directory. The retained parent must be a directory with no group/other
+writes or with sticky mode, rejecting non-sticky shared writable parents before
+staging while permitting private and `/tmp`-style parents. That invariant is
+rechecked before stable-path child binding, publication, and guarded cleanup.
+Cleanup places the candidate inside an unpredictable 0700
 directory and verifies/unlinks it through that private dirfd, eliminating the
 public-parent verify/unlink window for separate-UID attackers under ordinary
 Unix permissions. Replacement and restoration collisions are preserved, and
@@ -80,11 +84,12 @@ Public UDS prebinding captures that parent before bind. Immediately after a
 cryptographically named stage is created with `mkdirat`, a provisional cleanup
 guard is armed. `openat(O_DIRECTORY|O_NOFOLLOW)` is followed by authoritative
 `fstat` authentication before any chmod or child use: the opened stage must be a
-directory owned by the process effective UID with exact initial mode 0700. Its
-descriptor identity is retained, while a nofollow parent lookup only confirms
-that the published name still refers to that authenticated object. This rejects
-other-UID replacements even for a privileged proxy; Unix permissions do not
-isolate a process sharing the effective UID.
+directory owned by the process effective UID with permission bits that are a
+subset of 0700. Only then is its descriptor normalized with `fchmod` to 0700;
+an exact-mode recheck captures its identity, while a nofollow parent lookup only
+confirms that the published name still refers to that authenticated object. This
+rejects other-UID replacements even for a privileged proxy; Unix permissions do
+not isolate a process sharing the effective UID.
 
 The socket is bound through the authenticated stage descriptor, verified by
 exact device, inode, and socket type, changed to mode 0660 with
@@ -98,12 +103,14 @@ identity-guarded from Pingora table insertion through listener construction;
 cancellation or panic closes it without readiness, and successful adoption
 disarms the guard.
 
-On an `openat` or descriptor-identity failure, provisional cleanup uses a
+On an `openat` or descriptor-authentication failure, provisional cleanup uses a
 descriptor-relative nofollow lookup and removes only an empty directory still
-owned by the effective UID with exact mode 0700. Unknown, foreign-owned,
-non-directory, and unsafe-mode replacements are preserved. Once authentication
-succeeds, identity-anchored cleanup takes over without adopting pathname
-metadata as authority.
+owned by the effective UID with permission bits no more permissive than 0700.
+Unknown, foreign-owned, non-directory, and permissive replacements are
+preserved. Once authentication succeeds, identity-anchored cleanup takes over
+without adopting pathname metadata as authority. Verification and unlink are
+not claimed to be one atomic identity operation; their safety depends on this
+permission boundary, with same-UID and root attackers outside it.
 
 ## `requests_api` timing divergence
 

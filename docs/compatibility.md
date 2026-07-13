@@ -75,7 +75,12 @@ ten-second grace period strictly contains that nine-second sequential bound;
 final Tokio runtime teardown has its own one-second bound.
 
 On supported Unix targets, PID and UDS owners retain an open descriptor for the
-original canonical parent. UDS publication and cleanup are dirfd-relative.
+original canonical parent. Before publication staging, descriptor metadata must
+identify a directory whose group/other write bits are clear or whose sticky bit
+is set. This permits private application directories and `/tmp`-style parents,
+while rejecting non-sticky shared writable parents before debris is created.
+The invariant is rechecked before descriptor-backed child binding, publication,
+and guarded cleanup. UDS publication and cleanup are dirfd-relative.
 Cleanup atomically moves the public entry into an unpredictable mode-0700
 private directory, verifies and unlinks the candidate through that directory's
 descriptor, and removes the empty private directory during ordinary cleanup.
@@ -101,9 +106,10 @@ its descriptor-backed stable path if the configured parent alias is replaced.
 Immediately after creating a cryptographically named stage with `mkdirat`, a
 provisional guard is armed. The subsequent `openat(O_DIRECTORY|O_NOFOLLOW)` is
 authenticated by `fstat`: before any chmod or child use, the opened object must
-be a directory owned by the process effective UID with exact initial mode 0700.
-Its descriptor identity is then retained, and pathname metadata is used only to
-confirm that the parent entry still names that authenticated identity. This
+be a directory owned by the process effective UID whose permission bits are a
+subset of 0700. Only that authenticated descriptor is normalized with `fchmod`
+to 0700, then rechecked for exact mode and retained identity. Pathname metadata
+is used only to confirm that the parent entry still names that identity. This
 owner check covers replacement by other UIDs even when the proxy itself is
 privileged; Unix permissions still cannot isolate an attacker sharing the
 effective UID.
@@ -117,12 +123,15 @@ configured parent is reopened and the basename is checked relative to it
 against both the captured parent and owned socket identities; an alias change
 therefore exits without readiness and cleans only the anchored socket.
 
-If opening or descriptor-identity capture fails, the provisional guard performs
-a descriptor-relative nofollow lookup and removes only an empty candidate that
-is still a directory owned by the effective UID with exact mode 0700. Unknown,
-foreign-owned, non-directory, or unsafe-mode replacements are preserved. After
-authentication, the identity guard owns cleanup and likewise avoids pathname
-adoption.
+If opening or descriptor authentication fails, the provisional guard performs a
+descriptor-relative nofollow lookup and removes only an empty candidate that is
+still a directory owned by the effective UID with permission bits no more
+permissive than 0700. Unknown, foreign-owned, non-directory, or permissive-mode
+replacements are preserved. After authentication, the identity guard owns
+cleanup and likewise avoids pathname adoption. Verification and unlink remain
+separate operations protected by the stated permission boundary; no atomic
+identity-conditional unlink is claimed. Same-UID and root namespace attackers
+remain outside that documented boundary.
 
 | CHP long option | Classification | Configuration behavior and contract test |
 |---|---|---|

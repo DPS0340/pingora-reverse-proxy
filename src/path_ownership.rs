@@ -118,6 +118,7 @@ impl AnchoredDirectory {
     pub(crate) fn capture(parent: &Path) -> io::Result<Self> {
         let directory_path = fs::canonicalize(parent)?;
         let directory = open_directory(&directory_path)?;
+        authenticate_publication_parent(&directory)?;
         Ok(Self {
             directory,
             directory_path,
@@ -132,6 +133,7 @@ impl AnchoredDirectory {
     where
         F: FnMut(PublicationDirectoryStage) -> io::Result<()>,
     {
+        authenticate_publication_parent(&self.directory)?;
         for _ in 0..QUARANTINE_ATTEMPTS {
             let name = random_stage_name()?;
             match rustix::fs::mkdirat(
@@ -210,18 +212,46 @@ fn authenticate_private_directory(directory: &File) -> io::Result<FileIdentity> 
     let effective_uid = unsafe { libc::geteuid() };
     if metadata.mode() & libc::S_IFMT as u32 != libc::S_IFDIR as u32
         || metadata.uid() != effective_uid
-        || metadata.mode() & 0o7777 != 0o700
+        || metadata.mode() & 0o7777 & !0o700 != 0
     {
         return Err(io::Error::other(
             "private publication directory failed type, owner, or mode authentication",
         ));
     }
-    FileIdentity::from_metadata(&metadata)
+    rustix::fs::fchmod(directory, rustix::fs::Mode::from_raw_mode(0o700))
+        .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+    let normalized = directory.metadata()?;
+    if normalized.mode() & libc::S_IFMT as u32 != libc::S_IFDIR as u32
+        || normalized.uid() != effective_uid
+        || normalized.mode() & 0o7777 != 0o700
+    {
+        return Err(io::Error::other(
+            "private publication directory failed normalized authentication",
+        ));
+    }
+    FileIdentity::from_metadata(&normalized)
+}
+
+#[cfg(unix)]
+fn authenticate_publication_parent(directory: &File) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = directory.metadata()?;
+    let mode = metadata.mode();
+    if mode & libc::S_IFMT as u32 != libc::S_IFDIR as u32
+        || mode & 0o022 != 0 && mode & libc::S_ISVTX as u32 == 0
+    {
+        return Err(io::Error::other(
+            "publication parent must be a directory without shared writes or with sticky mode",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
 impl PrivateDirectory {
     pub(crate) fn stable_path(&self) -> io::Result<PathBuf> {
+        authenticate_publication_parent(&self.parent)?;
         stable_directory_path(&self.directory)
     }
 
@@ -278,6 +308,9 @@ impl Drop for PrivateDirectory {
             return;
         }
         self.active = false;
+        if authenticate_publication_parent(&self.parent).is_err() {
+            return;
+        }
         let matches = rustix::fs::statat(
             &self.parent,
             &self.name,
@@ -469,6 +502,7 @@ impl OwnedPath {
         path: PathBuf,
         destination_name: OsString,
     ) -> io::Result<()> {
+        authenticate_publication_parent(&destination.directory)?;
         let destination_directory = destination.directory.try_clone()?;
         rename_relative_noreplace(
             &self.directory,
@@ -558,6 +592,7 @@ impl OwnedPath {
     where
         F: FnMut(NamespaceStage) -> io::Result<()>,
     {
+        authenticate_publication_parent(&self.directory)?;
         for _ in 0..QUARANTINE_ATTEMPTS {
             let private_name = random_private_name()?;
             match rustix::fs::mkdirat(
@@ -584,7 +619,7 @@ impl OwnedPath {
                     return Err(io::Error::from_raw_os_error(error.raw_os_error()));
                 }
             };
-            let directory_identity = FileIdentity::from_file(&private_directory)?;
+            let directory_identity = authenticate_private_directory(&private_directory)?;
             let mut namespace_guard = PrivateNamespaceGuard {
                 parent: &self.directory,
                 name: private_name.clone(),
@@ -608,8 +643,6 @@ impl OwnedPath {
                 ));
             }
             fault(NamespaceStage::Chmod)?;
-            rustix::fs::fchmod(&private_directory, rustix::fs::Mode::from_raw_mode(0o700))
-                .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
             fault(NamespaceStage::Identity)?;
             let quarantine = UnixQuarantine {
                 name: private_name,
@@ -814,6 +847,9 @@ impl Drop for ProvisionalPrivateDirectoryGuard<'_> {
         if !self.armed {
             return;
         }
+        if authenticate_publication_parent(self.parent).is_err() {
+            return;
+        }
         let safe_to_remove = rustix::fs::statat(
             self.parent,
             &self.name,
@@ -823,7 +859,7 @@ impl Drop for ProvisionalPrivateDirectoryGuard<'_> {
         .is_some_and(|stat| {
             stat.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFDIR as u32
                 && stat.st_uid == self.effective_uid
-                && stat.st_mode as u32 & 0o7777 == 0o700
+                && stat.st_mode as u32 & 0o7777 & !0o700 == 0
         });
         if safe_to_remove {
             let _ = rustix::fs::unlinkat(self.parent, &self.name, rustix::fs::AtFlags::REMOVEDIR);
@@ -843,6 +879,9 @@ struct PrivateNamespaceGuard<'a> {
 impl Drop for PrivateNamespaceGuard<'_> {
     fn drop(&mut self) {
         if !self.armed {
+            return;
+        }
+        if authenticate_publication_parent(self.parent).is_err() {
             return;
         }
         let matches = rustix::fs::statat(
@@ -961,6 +1000,125 @@ fn rename_noreplace(_source: &Path, _destination: &Path) -> io::Result<()> {
 mod tests {
     use super::{AnchoredDirectory, NamespaceStage, OwnedPath, PublicationDirectoryStage};
     use std::{fs, io};
+
+    #[cfg(unix)]
+    #[test]
+    fn nonsticky_writable_publication_parent_is_rejected_without_debris() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("temporary unsafe publication parent");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o777))
+            .expect("make publication parent non-sticky writable");
+
+        assert!(AnchoredDirectory::capture(root.path()).is_err());
+        assert_eq!(
+            fs::read_dir(root.path())
+                .expect("list rejected publication parent")
+                .count(),
+            0,
+            "rejected parent retained publication debris"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sticky_writable_publication_parent_is_accepted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("temporary sticky publication parent");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o1777))
+            .expect("make publication parent sticky writable");
+
+        let anchored = AnchoredDirectory::capture(root.path()).expect("capture sticky parent");
+        drop(
+            anchored
+                .create_private_directory()
+                .expect("stage below sticky parent"),
+        );
+        assert_eq!(
+            fs::read_dir(root.path())
+                .expect("list sticky publication parent")
+                .count(),
+            0,
+            "sticky parent cleanup retained publication debris"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restrictive_umask_is_normalized_and_restored() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        const CHILD: &str = "CHP_RESTRICTIVE_UMASK_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "path_ownership::tests::restrictive_umask_is_normalized_and_restored",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .expect("run isolated restrictive-umask contract");
+            assert!(
+                status.success(),
+                "isolated restrictive-umask contract failed"
+            );
+            return;
+        }
+
+        struct UmaskGuard(libc::mode_t);
+        impl Drop for UmaskGuard {
+            fn drop(&mut self) {
+                unsafe { libc::umask(self.0) };
+            }
+        }
+
+        let root = tempfile::tempdir().expect("temporary restrictive-umask parent");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("make restrictive-umask parent private");
+        let anchored = AnchoredDirectory::capture(root.path()).expect("capture private parent");
+        let prior = unsafe { libc::umask(0o177) };
+        let guard = UmaskGuard(prior);
+
+        let staging = anchored
+            .create_private_directory()
+            .expect("normalize restrictive umask");
+        assert_eq!(staging.directory.metadata().unwrap().mode() & 0o7777, 0o700);
+        drop(staging);
+        drop(guard);
+
+        let observed = unsafe { libc::umask(prior) };
+        unsafe { libc::umask(observed) };
+        assert_eq!(observed, prior, "process umask was not restored");
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safe_parent_is_rechecked_before_descriptor_backed_child_bind() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("temporary stable-path parent");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("make stable-path parent private");
+        let anchored = AnchoredDirectory::capture(root.path()).expect("capture safe parent");
+        let staging = anchored
+            .create_private_directory()
+            .expect("create stable-path stage");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o777))
+            .expect("make retained parent unsafe");
+
+        assert!(
+            staging.stable_path().is_err(),
+            "unsafe retained parent reached stable child path resolution"
+        );
+        drop(staging);
+        assert!(
+            publication_directory_path(root.path()).is_dir(),
+            "cleanup mutated a now-unsafe parent"
+        );
+    }
 
     #[cfg(unix)]
     fn publication_directory_path(parent: &std::path::Path) -> std::path::PathBuf {
