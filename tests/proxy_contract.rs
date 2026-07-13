@@ -372,6 +372,7 @@ struct ProxyHarness {
     registry: Arc<RouteRegistry>,
     activity: ActivityWriter,
     metrics: Arc<Metrics>,
+    traffic: Arc<pingora_reverse_proxy::api_server::TrafficLifecycle>,
     base_url: String,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -419,6 +420,7 @@ impl ProxyHarness {
             let proxy = ChpProxy::from_config(Arc::clone(&registry), &config, activity.clone())
                 .await
                 .unwrap();
+            let traffic = proxy.traffic_lifecycle();
             let stop = Arc::new(AtomicBool::new(false));
             let thread_stop = Arc::clone(&stop);
             reservation.release();
@@ -441,6 +443,7 @@ impl ProxyHarness {
                         registry,
                         activity,
                         metrics,
+                        traffic,
                         base_url,
                         stop,
                         thread: Some(thread),
@@ -1079,6 +1082,40 @@ async fn consistency_seal_makes_health_and_cached_routes_fixed_empty_503s() {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
         assert!(response.bytes().await.unwrap().is_empty(), "{path}");
     }
+
+    let snapshot = harness.metrics.snapshot();
+    assert_eq!(snapshot.requests_web, 3);
+    assert_eq!(snapshot.requests_ws, 0);
+    assert_eq!(snapshot.requests_proxy.get(&503), Some(&3));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn admission_closed_http_and_websocket_failures_are_counted_exactly_once() {
+    let harness = ProxyHarness::start(&[], &[]).await;
+    harness.traffic.acknowledge_accepts_stopped();
+
+    let http = harness.get("/closed-http").await;
+    assert_eq!(http.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(http.bytes().await.unwrap().is_empty());
+
+    let websocket = harness
+        .request(
+            reqwest::Client::new()
+                .get(harness.url("/closed-ws"))
+                .header(CONNECTION, "upgrade")
+                .header(UPGRADE, "websocket")
+                .header("sec-websocket-version", "13")
+                .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+        )
+        .await;
+    assert_eq!(websocket.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(websocket.bytes().await.unwrap().is_empty());
+
+    let snapshot = harness.metrics.snapshot();
+    assert_eq!(snapshot.requests_web, 1);
+    assert_eq!(snapshot.requests_ws, 1);
+    assert_eq!(snapshot.requests_proxy.get(&503), Some(&2));
 }
 
 #[tokio::test]
@@ -1565,26 +1602,46 @@ async fn network_streams_chunked_response_and_reuses_downstream_keepalive() {
 
 #[tokio::test]
 #[serial_test::serial]
-async fn network_stream_activity_is_observable_before_response_finishes() {
+async fn network_http_response_activity_waits_for_successful_completion_like_chp() {
     let upstream =
         ChunkedUpstream::start_with_delay(vec![b"first", b"last"], Duration::from_millis(250))
             .await;
     let harness = ProxyHarness::start(&[], &[("/stream", upstream.target())]).await;
     let before = harness.route("/stream").last_activity;
+    let activity_count = || {
+        harness
+            .metrics
+            .render_prometheus()
+            .lines()
+            .find_map(|line| line.strip_prefix("last_activity_updating_count "))
+            .expect("last-activity summary count")
+            .parse::<u64>()
+            .expect("numeric last-activity summary count")
+    };
+    let count_before = activity_count();
     let mut response = harness
         .request(reqwest::Client::new().get(harness.url("/stream")))
         .await;
 
     assert_eq!(response.chunk().await.unwrap().unwrap(), "first");
-    assert!(
-        harness.route("/stream").last_activity > before,
-        "stream activity must publish before the final chunk and logging callback"
-    );
+    assert_eq!(harness.route("/stream").last_activity, before);
+    assert_eq!(activity_count(), count_before);
+
+    while response.chunk().await.unwrap().is_some() {}
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while activity_count() == count_before {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("successful HTTP completion did not publish activity");
+    assert_eq!(activity_count(), count_before + 1);
+    assert!(harness.route("/stream").last_activity > before);
 }
 
 #[tokio::test]
 #[serial_test::serial]
-async fn network_redirect_request_and_response_body_traffic_never_records_activity() {
+async fn network_redirect_request_and_response_body_traffic_records_activity_like_chp() {
     let upstream = EchoServer::start().await;
     let harness = ProxyHarness::start(
         &["--no-include-prefix".to_owned()],
@@ -1613,7 +1670,7 @@ async fn network_redirect_request_and_response_body_traffic_never_records_activi
     assert_eq!(response.status(), StatusCode::FOUND);
     assert_eq!(response.text().await.unwrap(), "redirect traffic");
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(harness.route("/redirect").last_activity, before);
+    assert!(harness.route("/redirect").last_activity > before);
 }
 
 #[tokio::test]

@@ -874,3 +874,32 @@ passed `353/353`: library `64`, binary `0`, API `34`, config `27`, differential
 all-target/all-feature checking, whitespace validation, artifact review, and
 process/container cleanup all passed. The sole build warning remains the
 established vendored OpenSSL deprecation.
+
+### Task 11 final acceptance-fix closure (2026-07-13)
+
+The acceptance wave replaced the host-Node oracle with uniquely named Docker
+children running Node `20.20.2` and the exact in-image
+`configurable-http-proxy@5.3.0` tree. Runtime and source probes, launcher
+negative cases, TCP/TLS/mTLS/WebSocket/UDS differential scenarios, role-aware
+normalization adversarials, strict metric metadata/value/delta comparisons,
+bounded redacted stderr capture, serialized launch handoff, and standalone
+Compose failure/concurrency cleanup contracts all passed. The standalone
+script is the literal implementation called by `just test-differential`; it
+uses a unique project and Docker-assigned Redis port and cleans partial starts.
+
+The public admission/indeterminate 503 paths now count HTTP and WebSocket
+failures exactly once. Summary rendering snapshots under each mutex, releases
+the lock before sorting, and sorts once. The preserved HTTP activity-phase
+duplicate was fixed by sharing the request-phase claim between body traffic and
+successful HTTP completion, without merging WebSocket request/response phases.
+The oracle support module is differential-only, keeping unrelated integration
+targets lean. The semantic metric comparator was not weakened.
+
+Final correctly provisioned results were differential `24/24`, differential
+script lifecycle `3/3`, proxy `74/74`, TLS/Unix `22/22`, WebSocket `4/4`, and
+`PROPTEST_CASES=256 cargo test --all-targets --all-features` `372/372` with a
+disposable Redis and the verified Node 20 oracle image. The dedicated
+`PROPTEST_CASES=512` route suite passed `11/11`. Formatting, warnings-denied
+Clippy, all-target/all-feature checking, whitespace validation, final diff
+review, and process/container cleanup passed. The sole emitted warning remains
+the established vendored Pingora OpenSSL deprecation.

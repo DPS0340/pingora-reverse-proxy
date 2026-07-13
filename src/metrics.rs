@@ -45,6 +45,12 @@ struct Summary {
     recent: std::collections::VecDeque<f64>,
 }
 
+struct SummarySnapshot {
+    count: u64,
+    sum: f64,
+    sorted_recent: Vec<f64>,
+}
+
 impl Summary {
     fn observe(&mut self, duration: Duration) {
         let value = duration.as_secs_f64();
@@ -56,14 +62,26 @@ impl Summary {
         self.recent.push_back(value);
     }
 
+    fn snapshot(&self) -> SummarySnapshot {
+        SummarySnapshot {
+            count: self.count,
+            sum: self.sum,
+            sorted_recent: self.recent.iter().copied().collect(),
+        }
+    }
+}
+
+impl SummarySnapshot {
+    fn sort(&mut self) {
+        self.sorted_recent.sort_by(f64::total_cmp);
+    }
+
     fn quantile(&self, quantile: f64) -> f64 {
-        if self.recent.is_empty() {
+        if self.sorted_recent.is_empty() {
             return 0.0;
         }
-        let mut values: Vec<_> = self.recent.iter().copied().collect();
-        values.sort_by(f64::total_cmp);
-        let index = ((values.len() - 1) as f64 * quantile).round() as usize;
-        values[index]
+        let index = ((self.sorted_recent.len() - 1) as f64 * quantile).round() as usize;
+        self.sorted_recent[index]
     }
 }
 
@@ -159,14 +177,18 @@ impl Metrics {
     /// Render the CHP 5.3.0 metric families using its exact names and labels.
     pub fn render_prometheus(&self) -> String {
         let snapshot = self.snapshot();
-        let find_target = self
+        let mut find_target = self
             .find_target_for_req
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let last_activity = self
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .snapshot();
+        let mut last_activity = self
             .last_activity_updating
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .snapshot();
+        find_target.sort();
+        last_activity.sort();
         let mut body = String::new();
         render_counter(
             &mut body,
@@ -240,7 +262,7 @@ fn render_status_counter(body: &mut String, name: &str, help: &str, values: &BTr
     body.push('\n');
 }
 
-fn render_summary(body: &mut String, name: &str, help: &str, summary: &Summary) {
+fn render_summary(body: &mut String, name: &str, help: &str, summary: &SummarySnapshot) {
     body.push_str(&format!("# HELP {name} {help}\n# TYPE {name} summary\n"));
     for quantile in SUMMARY_QUANTILES {
         body.push_str(&format!(
@@ -252,4 +274,58 @@ fn render_summary(body: &mut String, name: &str, help: &str, summary: &Summary) 
         "{name}_sum {}\n{name}_count {}\n\n",
         summary.sum, summary.count
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::Metrics;
+
+    #[test]
+    fn rendering_does_not_hold_one_summary_lock_while_waiting_for_another() {
+        let metrics = Arc::new(Metrics::new());
+        metrics.record_find_target(Duration::from_millis(10));
+        metrics.record_last_activity_update(Duration::from_millis(20));
+
+        let last_activity = metrics
+            .last_activity_updating
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let rendering = Arc::clone(&metrics);
+        let render_thread = std::thread::spawn(move || rendering.render_prometheus());
+
+        let (recorded, observed) = mpsc::channel();
+        let recording = Arc::clone(&metrics);
+        let record_thread = std::thread::spawn(move || {
+            recording.record_find_target(Duration::from_millis(30));
+            recorded.send(()).expect("report completed observation");
+        });
+        let completed_without_other_summary = observed.recv_timeout(Duration::from_millis(200));
+
+        drop(last_activity);
+        let _ = render_thread.join().expect("renderer thread");
+        record_thread.join().expect("observer thread");
+        assert!(
+            completed_without_other_summary.is_ok(),
+            "rendering held the find-target mutex while blocked on last-activity"
+        );
+    }
+
+    #[test]
+    fn summary_rendering_uses_one_sorted_snapshot_with_exact_count_and_sum() {
+        let metrics = Metrics::new();
+        for millis in [40, 10, 30, 20] {
+            metrics.record_find_target(Duration::from_millis(millis));
+        }
+
+        let body = metrics.render_prometheus();
+        assert!(body.contains("find_target_for_req{quantile=\"0.01\"} 0.01\n"));
+        assert!(body.contains("find_target_for_req{quantile=\"0.5\"} 0.03\n"));
+        assert!(body.contains("find_target_for_req{quantile=\"0.999\"} 0.04\n"));
+        assert!(body.contains("find_target_for_req_sum 0.1\n"));
+        assert!(body.contains("find_target_for_req_count 4\n"));
+    }
 }

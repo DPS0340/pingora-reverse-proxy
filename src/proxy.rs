@@ -45,8 +45,8 @@ pub struct RequestContext {
     pub activity_eligible: bool,
     pub error_classification: Option<ProxyErrorClass>,
     upstream_route: Option<UpstreamRoute>,
-    stream_data_seen: bool,
-    activity_published: bool,
+    request_activity_published: bool,
+    response_activity_published: bool,
     traffic_admission: Option<Arc<TrafficLifecycle>>,
 }
 
@@ -59,14 +59,26 @@ impl Default for RequestContext {
             activity_eligible: false,
             error_classification: None,
             upstream_route: None,
-            stream_data_seen: false,
-            activity_published: false,
+            request_activity_published: false,
+            response_activity_published: false,
             traffic_admission: None,
         }
     }
 }
 
 impl RequestContext {
+    fn claim_request_activity(&mut self) -> bool {
+        !std::mem::replace(&mut self.request_activity_published, true)
+    }
+
+    fn claim_response_activity(&mut self, websocket: bool) -> bool {
+        websocket && !std::mem::replace(&mut self.response_activity_published, true)
+    }
+
+    fn claim_http_completion_activity(&mut self, successful: bool, websocket: bool) -> bool {
+        successful && !websocket && self.claim_request_activity()
+    }
+
     fn release_traffic_admission(&mut self) {
         if let Some(traffic) = self.traffic_admission.take() {
             traffic.finish();
@@ -213,18 +225,30 @@ impl ChpProxy {
             .await
     }
 
-    fn observe_stream_data(&self, ctx: &mut RequestContext) {
-        ctx.stream_data_seen = true;
-        self.publish_activity_if_eligible(ctx);
+    fn record_public_failure(&self, session: &Session, status: StatusCode) {
+        if session.is_upgrade_req() {
+            self.metrics.record_ws_request();
+        } else {
+            self.metrics.record_web_request();
+        }
+        self.metrics.record_proxy_request(status.as_u16());
     }
 
-    fn publish_activity_if_eligible(&self, ctx: &mut RequestContext) {
-        if !ctx.activity_eligible || ctx.activity_published {
-            return;
+    fn observe_request_stream_data(&self, ctx: &mut RequestContext) {
+        if ctx.claim_request_activity() {
+            self.publish_activity(ctx);
         }
+    }
+
+    fn observe_response_stream_data(&self, ctx: &mut RequestContext, websocket: bool) {
+        if ctx.claim_response_activity(websocket) {
+            self.publish_activity(ctx);
+        }
+    }
+
+    fn publish_activity(&self, ctx: &RequestContext) {
         if let Some(key) = &ctx.resolved_route_key {
             self.activity.record(key);
-            ctx.activity_published = true;
         }
     }
 }
@@ -243,11 +267,13 @@ impl ProxyHttp for ChpProxy {
         ctx: &mut Self::CTX,
     ) -> pingora::Result<bool> {
         if !self.traffic.try_admit() {
+            self.record_public_failure(session, StatusCode::SERVICE_UNAVAILABLE);
             Self::send_empty(session, StatusCode::SERVICE_UNAVAILABLE).await?;
             return Ok(true);
         }
         ctx.traffic_admission = Some(Arc::clone(&self.traffic));
         if self.registry.consistency_status() == ConsistencyStatus::Indeterminate {
+            self.record_public_failure(session, StatusCode::SERVICE_UNAVAILABLE);
             Self::send_empty(session, StatusCode::SERVICE_UNAVAILABLE).await?;
             return Ok(true);
         }
@@ -407,9 +433,6 @@ impl ProxyHttp for ChpProxy {
             self.metrics
                 .record_proxy_request(upstream_response.status.as_u16());
         }
-        if ctx.stream_data_seen {
-            self.publish_activity_if_eligible(ctx);
-        }
         Ok(())
     }
 
@@ -421,20 +444,20 @@ impl ProxyHttp for ChpProxy {
         ctx: &mut Self::CTX,
     ) -> pingora::Result<()> {
         if body.as_ref().is_some_and(|body| !body.is_empty()) {
-            self.observe_stream_data(ctx);
+            self.observe_request_stream_data(ctx);
         }
         Ok(())
     }
 
     fn upstream_response_body_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         body: &mut Option<Bytes>,
         _end_of_stream: bool,
         ctx: &mut Self::CTX,
     ) -> pingora::Result<Option<Duration>> {
         if body.as_ref().is_some_and(|body| !body.is_empty()) {
-            self.observe_stream_data(ctx);
+            self.observe_response_stream_data(ctx, session.is_upgrade_req());
         }
         Ok(None)
     }
@@ -524,8 +547,8 @@ impl ProxyHttp for ChpProxy {
                 .response_written()
                 .is_some_and(|response| response.status.as_u16() < 300);
         ctx.activity_eligible |= successful;
-        if successful {
-            self.publish_activity_if_eligible(ctx);
+        if ctx.claim_http_completion_activity(successful, session.is_upgrade_req()) {
+            self.publish_activity(ctx);
         }
         ctx.release_traffic_admission();
     }
@@ -601,6 +624,27 @@ mod tests {
         assert!(!super::records_proxy_response_status(101));
         assert!(super::records_proxy_response_status(200));
         assert!(super::records_proxy_response_status(503));
+    }
+
+    #[test]
+    fn chp_activity_phases_dedupe_each_direction_and_ignore_http_response_chunks() {
+        let mut http = RequestContext::default();
+        assert!(http.claim_request_activity());
+        assert!(!http.claim_request_activity());
+        assert!(!http.claim_response_activity(false));
+        assert!(!http.claim_response_activity(false));
+        assert!(!http.claim_http_completion_activity(true, false));
+
+        let mut bodyless_http = RequestContext::default();
+        assert!(bodyless_http.claim_http_completion_activity(true, false));
+        assert!(!bodyless_http.claim_http_completion_activity(true, false));
+
+        let mut websocket = RequestContext::default();
+        assert!(websocket.claim_request_activity());
+        assert!(!websocket.claim_request_activity());
+        assert!(websocket.claim_response_activity(true));
+        assert!(!websocket.claim_response_activity(true));
+        assert!(!websocket.claim_http_completion_activity(true, true));
     }
 
     #[test]

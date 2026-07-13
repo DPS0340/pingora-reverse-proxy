@@ -8,6 +8,9 @@ import { pathToFileURL } from "node:url";
 const expectedVersion = "5.3.0";
 const requestedSource = process.env.CHP_SOURCE_DIR || "/opt/chp-5.3.0";
 const source = fs.realpathSync(requestedSource);
+if (source.split(path.sep).includes("node_modules")) {
+  throw new Error("refusing global node_modules source; use the pinned in-image CHP tree");
+}
 const packagePath = path.join(source, "package.json");
 const configProxyPath = path.join(source, "lib", "configproxy.js");
 const cliPath = path.join(source, "bin", "configurable-http-proxy");
@@ -27,6 +30,22 @@ if (
   throw new Error(
     `expected configurable-http-proxy ${expectedVersion}, got ${packageJson.name} ${packageJson.version}`
   );
+}
+
+const nodeMajor = Number.parseInt(process.versions.node.split(".", 1)[0], 10);
+if (nodeMajor !== 20) {
+  throw new Error(`CHP oracle requires Node 20, got ${process.version}`);
+}
+
+if (process.argv[2] === "--runtime-probe") {
+  process.stdout.write(
+    `${JSON.stringify({
+      node: process.version,
+      package: `${packageJson.name}@${packageJson.version}`,
+      source,
+    })}\n`
+  );
+  process.exit(0);
 }
 
 // Import the requested oracle implementation itself before executing its
