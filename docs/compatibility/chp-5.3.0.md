@@ -76,21 +76,34 @@ ordinary cleanup removes its private directory. Processes sharing the service
 UID are not isolated by Unix file permissions; same-UID namespace attackers
 are outside this enforceable trust boundary.
 
-Public UDS prebinding captures that parent before bind and uses a
-descriptor-backed stable published path as Pingora's own `ListenAddr`. The
-application applies mode 0660 relative to the retained parent descriptor with
-nofollow semantics and exact socket identity checks before and after. Pingora's
-explicit preconfigured-permissions endpoint then skips its pathname chmod.
-Before readiness, a reopened configured parent and descriptor-relative basename
-lookup must match the captured parent and socket identities; otherwise startup
-fails closed and only the anchored socket is cleaned. The raw listener FD
-remains identity-guarded from Pingora table insertion through listener
-construction; cancellation or panic closes it without readiness, and successful
-adoption disarms the guard. Immediately after `mkdirat`, private-namespace
-cleanup opens the directory without following links, captures its descriptor
-identity, then arms cleanup before pathname verification. Initial-`statat`
-faults remove matching empty debris; open failures and unknown or foreign
-identities are preserved.
+Public UDS prebinding captures that parent before bind. Immediately after a
+cryptographically named stage is created with `mkdirat`, a provisional cleanup
+guard is armed. `openat(O_DIRECTORY|O_NOFOLLOW)` is followed by authoritative
+`fstat` authentication before any chmod or child use: the opened stage must be a
+directory owned by the process effective UID with exact initial mode 0700. Its
+descriptor identity is retained, while a nofollow parent lookup only confirms
+that the published name still refers to that authenticated object. This rejects
+other-UID replacements even for a privileged proxy; Unix permissions do not
+isolate a process sharing the effective UID.
+
+The socket is bound through the authenticated stage descriptor, verified by
+exact device, inode, and socket type, changed to mode 0660 with
+descriptor-relative `fchmodat` flags 0, and verified again for identity, type,
+and exact mode. Cross-directory no-clobber publication follows. There is no
+public-path chmod by either the application or Pingora. Before readiness, a
+reopened configured parent and descriptor-relative basename lookup must match
+the captured parent and socket identities; otherwise startup fails closed and
+only the anchored socket is cleaned. The raw listener FD remains
+identity-guarded from Pingora table insertion through listener construction;
+cancellation or panic closes it without readiness, and successful adoption
+disarms the guard.
+
+On an `openat` or descriptor-identity failure, provisional cleanup uses a
+descriptor-relative nofollow lookup and removes only an empty directory still
+owned by the effective UID with exact mode 0700. Unknown, foreign-owned,
+non-directory, and unsafe-mode replacements are preserved. Once authentication
+succeeds, identity-anchored cleanup takes over without adopting pathname
+metadata as authority.
 
 ## `requests_api` timing divergence
 

@@ -125,6 +125,13 @@ impl AnchoredDirectory {
     }
 
     pub(crate) fn create_private_directory(&self) -> io::Result<PrivateDirectory> {
+        self.create_private_directory_with_fault(|_| Ok(()))
+    }
+
+    fn create_private_directory_with_fault<F>(&self, mut fault: F) -> io::Result<PrivateDirectory>
+    where
+        F: FnMut(PublicationDirectoryStage) -> io::Result<()>,
+    {
         for _ in 0..QUARANTINE_ATTEMPTS {
             let name = random_stage_name()?;
             match rustix::fs::mkdirat(
@@ -136,6 +143,13 @@ impl AnchoredDirectory {
                 Err(error) if error == rustix::io::Errno::EXIST => continue,
                 Err(error) => return Err(io::Error::from_raw_os_error(error.raw_os_error())),
             }
+            let mut provisional_guard = ProvisionalPrivateDirectoryGuard {
+                parent: &self.directory,
+                name: name.clone(),
+                effective_uid: unsafe { libc::geteuid() },
+                armed: true,
+            };
+            fault(PublicationDirectoryStage::Open)?;
             let directory = rustix::fs::openat(
                 &self.directory,
                 &name,
@@ -147,13 +161,15 @@ impl AnchoredDirectory {
             )
             .map(File::from)
             .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
-            let identity = FileIdentity::from_file(&directory)?;
+            fault(PublicationDirectoryStage::Identity)?;
+            let identity = authenticate_private_directory(&directory)?;
             let mut guard = PrivateNamespaceGuard {
                 parent: &self.directory,
                 name: name.clone(),
                 identity,
                 armed: true,
             };
+            provisional_guard.armed = false;
             let published = rustix::fs::statat(
                 &self.directory,
                 &name,
@@ -167,19 +183,6 @@ impl AnchoredDirectory {
                 return Err(io::Error::other(
                     "private publication directory changed before verification",
                 ));
-            }
-            rustix::fs::fchmod(&directory, rustix::fs::Mode::from_raw_mode(0o700))
-                .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
-            let metadata = directory.metadata()?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if !metadata.file_type().is_dir() || metadata.permissions().mode() & 0o777 != 0o700
-                {
-                    return Err(io::Error::other(
-                        "private publication directory mode did not persist",
-                    ));
-                }
             }
             let parent = self.directory.try_clone()?;
             guard.armed = false;
@@ -197,6 +200,23 @@ impl AnchoredDirectory {
             "could not reserve a private publication directory",
         ))
     }
+}
+
+#[cfg(unix)]
+fn authenticate_private_directory(directory: &File) -> io::Result<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = directory.metadata()?;
+    let effective_uid = unsafe { libc::geteuid() };
+    if metadata.mode() & libc::S_IFMT as u32 != libc::S_IFDIR as u32
+        || metadata.uid() != effective_uid
+        || metadata.mode() & 0o7777 != 0o700
+    {
+        return Err(io::Error::other(
+            "private publication directory failed type, owner, or mode authentication",
+        ));
+    }
+    FileIdentity::from_metadata(&metadata)
 }
 
 #[cfg(unix)]
@@ -774,6 +794,44 @@ enum NamespaceStage {
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PublicationDirectoryStage {
+    Open,
+    Identity,
+}
+
+#[cfg(unix)]
+struct ProvisionalPrivateDirectoryGuard<'a> {
+    parent: &'a File,
+    name: OsString,
+    effective_uid: libc::uid_t,
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl Drop for ProvisionalPrivateDirectoryGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let safe_to_remove = rustix::fs::statat(
+            self.parent,
+            &self.name,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .ok()
+        .is_some_and(|stat| {
+            stat.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFDIR as u32
+                && stat.st_uid == self.effective_uid
+                && stat.st_mode as u32 & 0o7777 == 0o700
+        });
+        if safe_to_remove {
+            let _ = rustix::fs::unlinkat(self.parent, &self.name, rustix::fs::AtFlags::REMOVEDIR);
+        }
+    }
+}
+
+#[cfg(unix)]
 struct PrivateNamespaceGuard<'a> {
     parent: &'a File,
     name: OsString,
@@ -901,8 +959,164 @@ fn rename_noreplace(_source: &Path, _destination: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{NamespaceStage, OwnedPath};
+    use super::{AnchoredDirectory, NamespaceStage, OwnedPath, PublicationDirectoryStage};
     use std::{fs, io};
+
+    #[cfg(unix)]
+    fn publication_directory_path(parent: &std::path::Path) -> std::path::PathBuf {
+        fs::read_dir(parent)
+            .expect("list publication directory parent")
+            .find_map(|entry| {
+                let entry = entry.expect("read publication directory entry");
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".chp-stage-")
+                    .then_some(entry.path())
+            })
+            .expect("private publication directory exists")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_mode_replacement_before_open_is_rejected_without_chmod() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("temporary publication replacement root");
+        let anchored = AnchoredDirectory::capture(root.path()).expect("capture parent");
+        let displaced = root.path().join("displaced-owned-stage");
+
+        let result = anchored.create_private_directory_with_fault(|stage| {
+            if stage != PublicationDirectoryStage::Open {
+                return Ok(());
+            }
+            let private = publication_directory_path(root.path());
+            fs::rename(&private, &displaced).expect("displace created stage");
+            fs::create_dir(&private).expect("install unsafe stage replacement");
+            fs::set_permissions(&private, fs::Permissions::from_mode(0o755))
+                .expect("set unsafe replacement mode");
+            fs::write(private.join("foreign"), b"replacement")
+                .expect("populate unsafe replacement");
+            Ok(())
+        });
+
+        assert!(result.is_err(), "unsafe replacement was accepted");
+        let replacement = publication_directory_path(root.path());
+        assert_eq!(
+            fs::metadata(&replacement)
+                .expect("replacement metadata")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o755,
+            "unsafe replacement was chmodded"
+        );
+        assert_eq!(
+            fs::read(replacement.join("foreign")).expect("replacement retained"),
+            b"replacement"
+        );
+        assert!(displaced.is_dir(), "created stage was not displaced");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_directory_authentication_checks_effective_uid() {
+        let ownership_source = include_str!("path_ownership.rs");
+        let production_source = ownership_source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production ownership source");
+        assert!(
+            production_source.contains("libc::geteuid()"),
+            "opened publication directory must be owned by the effective UID"
+        );
+    }
+
+    #[cfg(unix)]
+    fn assert_publication_fault_leaves_no_original_debris(stage: PublicationDirectoryStage) {
+        let root = tempfile::tempdir().expect("temporary publication fault root");
+        let anchored = AnchoredDirectory::capture(root.path()).expect("capture parent");
+
+        let result = anchored.create_private_directory_with_fault(|current| {
+            if current == stage {
+                Err(io::Error::other("injected publication acquisition fault"))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(result.is_err(), "injected publication fault succeeded");
+        assert_eq!(
+            fs::read_dir(root.path())
+                .expect("list publication fault root")
+                .count(),
+            0,
+            "publication fault leaked the original stage"
+        );
+    }
+
+    #[cfg(unix)]
+    fn assert_publication_fault_preserves_replacement(stage: PublicationDirectoryStage) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("temporary publication fault replacement root");
+        let anchored = AnchoredDirectory::capture(root.path()).expect("capture parent");
+        let displaced = root.path().join("displaced-owned-stage");
+
+        let result = anchored.create_private_directory_with_fault(|current| {
+            if current != stage {
+                return Ok(());
+            }
+            let private = publication_directory_path(root.path());
+            fs::rename(&private, &displaced).expect("displace created stage");
+            fs::create_dir(&private).expect("install unsafe stage replacement");
+            fs::set_permissions(&private, fs::Permissions::from_mode(0o755))
+                .expect("set unsafe replacement mode");
+            fs::write(private.join("foreign"), b"replacement")
+                .expect("populate unsafe replacement");
+            Err(io::Error::other("injected publication acquisition fault"))
+        });
+
+        assert!(result.is_err(), "injected replacement fault succeeded");
+        let replacement = publication_directory_path(root.path());
+        assert_eq!(
+            fs::read(replacement.join("foreign")).expect("replacement retained"),
+            b"replacement"
+        );
+        assert_eq!(
+            fs::metadata(&replacement)
+                .expect("replacement metadata")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o755
+        );
+        assert!(displaced.is_dir(), "created stage was not displaced");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_openat_fault_removes_original_stage() {
+        assert_publication_fault_leaves_no_original_debris(PublicationDirectoryStage::Open);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_openat_fault_preserves_replacement() {
+        assert_publication_fault_preserves_replacement(PublicationDirectoryStage::Open);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_identity_fault_removes_original_stage() {
+        assert_publication_fault_leaves_no_original_debris(PublicationDirectoryStage::Identity);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_identity_fault_preserves_replacement() {
+        assert_publication_fault_preserves_replacement(PublicationDirectoryStage::Identity);
+    }
 
     #[cfg(unix)]
     #[test]

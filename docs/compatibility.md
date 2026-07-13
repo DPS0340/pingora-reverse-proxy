@@ -98,19 +98,31 @@ The non-owning raw-FD guard remains armed after table insertion until Pingora's
 listener construction has completed; successful adoption explicitly disarms
 it. UDS prebinding opens the canonical parent before bind and continues through
 its descriptor-backed stable path if the configured parent alias is replaced.
-The application sets mode 0660 through the retained parent descriptor with
-nofollow semantics and verifies the captured socket device, inode, and type
-both before and after that operation. Pingora then receives the anchored path
-through its explicit preconfigured-permissions API and performs no pathname
-chmod. Immediately before real readiness is forwarded, the configured parent
-is reopened and the basename is checked relative to it against both the
-captured parent and owned socket identities; an alias change therefore exits
-without readiness and cleans only the anchored socket. Immediately after
-`mkdirat`, private cleanup opens the new directory with
-`O_DIRECTORY|O_NOFOLLOW`, captures its descriptor identity, and arms cleanup
-before pathname verification. Initial-`statat` faults therefore remove the
-identity-matching empty namespace; open failures and foreign or unknown
-identities are preserved.
+Immediately after creating a cryptographically named stage with `mkdirat`, a
+provisional guard is armed. The subsequent `openat(O_DIRECTORY|O_NOFOLLOW)` is
+authenticated by `fstat`: before any chmod or child use, the opened object must
+be a directory owned by the process effective UID with exact initial mode 0700.
+Its descriptor identity is then retained, and pathname metadata is used only to
+confirm that the parent entry still names that authenticated identity. This
+owner check covers replacement by other UIDs even when the proxy itself is
+privileged; Unix permissions still cannot isolate an attacker sharing the
+effective UID.
+
+The socket is bound inside that authenticated private stage, verified by exact
+device, inode, and socket type, changed to mode 0660 with descriptor-relative
+`fchmodat` flags 0, and verified again for identity, type, and exact mode. A
+cross-directory no-clobber rename then publishes it; neither the application nor
+Pingora performs a public-path chmod. Before real readiness is forwarded, the
+configured parent is reopened and the basename is checked relative to it
+against both the captured parent and owned socket identities; an alias change
+therefore exits without readiness and cleans only the anchored socket.
+
+If opening or descriptor-identity capture fails, the provisional guard performs
+a descriptor-relative nofollow lookup and removes only an empty candidate that
+is still a directory owned by the effective UID with exact mode 0700. Unknown,
+foreign-owned, non-directory, or unsafe-mode replacements are preserved. After
+authentication, the identity guard owns cleanup and likewise avoids pathname
+adoption.
 
 | CHP long option | Classification | Configuration behavior and contract test |
 |---|---|---|

@@ -739,3 +739,34 @@ the established three vendor deltas: `src/listeners/l4.rs`,
 `src/listeners/mod.rs`, and `src/services/listening.rs`. Every other vendored
 file, including the license, generated and original manifests, lockfile, and
 package metadata, remains byte-identical. No Task 9 work was added.
+
+### Task 8 authenticated staging acquisition closure (2026-07-13)
+
+The final acquisition review found no remaining concrete defect. Opened stages
+are authenticated from descriptor metadata by directory type,
+effective UID, and exact mode 0700 before child use. A provisional guard is
+armed immediately after `mkdirat`; after authentication, an identity guard is
+armed before provisional cleanup is disarmed. Provisional cleanup fails closed
+on unknown metadata and preserves foreign-owned, non-directory, and unsafe-mode
+replacements. Same-UID exact-0700 interference remains inside the documented
+Unix trust boundary.
+
+The six new acquisition and staging contracts passed `6/6`, then `20/20`
+rounds (`120/120` contract executions). The prior raw-FD/private-namespace
+eight-contract group independently passed `20/20` rounds (`160/160` contract
+executions). The complete 51-test library harness passed `100/100` runs under
+Cargo's default parallel scheduler (`5,100/5,100` test executions). Focused
+TLS/Unix and WebSocket suites passed `22/22` and `4/4`.
+
+`PROPTEST_CASES=256 cargo test --all-targets --all-features` passed `262/262`:
+library `51`, binary `0`, API `33`, config `27`, proxy `69`, routes `11`, store
+`45`, TLS/Unix `22`, and WebSocket `4`. `PROPTEST_CASES=512 cargo test --test
+route_properties` passed `11/11`. Formatting, warnings-denied Clippy with
+`--all-targets --all-features --no-deps`, all-target/all-feature checking,
+whitespace validation, final diff review, and status review passed.
+
+The checksum-verified Pingora 0.8.1 registry comparison contains 114 files on
+each side and still reports exactly the established three vendor deltas:
+`src/listeners/l4.rs`, `src/listeners/mod.rs`, and
+`src/services/listening.rs`. No Task 9 implementation or unrelated refactor was
+added.
