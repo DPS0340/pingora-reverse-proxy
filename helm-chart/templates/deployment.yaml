@@ -1,3 +1,4 @@
+{{- include "pingora-reverse-proxy.validate" . -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -16,38 +17,203 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       labels:
-        {{- include "pingora-reverse-proxy.labels" . | nindent 8 }}
+        {{- include "pingora-reverse-proxy.selectorLabels" . | nindent 8 }}
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
+      automountServiceAccountToken: false
+      serviceAccountName: {{ include "pingora-reverse-proxy.serviceAccountName" . }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      serviceAccountName: {{ include "pingora-reverse-proxy.serviceAccountName" . }}
-      securityContext:
-        {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
-        - name: {{ .Chart.Name }}
+        - name: proxy
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --ip
+            - {{ .Values.listeners.public.ip | quote }}
+            - --port
+            - {{ .Values.listeners.public.port | quote }}
+            - --api-ip
+            - {{ .Values.listeners.api.ip | quote }}
+            - --api-port
+            - {{ .Values.listeners.api.port | quote }}
+            - --metrics-ip
+            - {{ .Values.listeners.metrics.ip | quote }}
+            - --metrics-port
+            - {{ .Values.listeners.metrics.port | quote }}
+            - --storage-backend
+            - {{ .Values.storage.backend | quote }}
+            {{- with .Values.tls.public.existingSecret }}
+            - --ssl-key
+            - /run/tls/public/{{ $.Values.tls.public.keyKey }}
+            - --ssl-cert
+            - /run/tls/public/{{ $.Values.tls.public.certKey }}
+            {{- with $.Values.tls.public.clientCAKey }}
+            - --ssl-ca
+            - /run/tls/public/{{ . }}
+            {{- end }}
+            {{- if $.Values.tls.public.requestCert }}
+            - --ssl-request-cert
+            {{- end }}
+            {{- if $.Values.tls.public.rejectUnauthorized }}
+            - --ssl-reject-unauthorized
+            {{- end }}
+            {{- end }}
+            {{- with .Values.tls.api.existingSecret }}
+            - --api-ssl-key
+            - /run/tls/api/{{ $.Values.tls.api.keyKey }}
+            - --api-ssl-cert
+            - /run/tls/api/{{ $.Values.tls.api.certKey }}
+            {{- with $.Values.tls.api.clientCAKey }}
+            - --api-ssl-ca
+            - /run/tls/api/{{ . }}
+            {{- end }}
+            {{- if $.Values.tls.api.requestCert }}
+            - --api-ssl-request-cert
+            {{- end }}
+            {{- if $.Values.tls.api.rejectUnauthorized }}
+            - --api-ssl-reject-unauthorized
+            {{- end }}
+            {{- end }}
+            {{- with .Values.tls.client.existingSecret }}
+            - --client-ssl-key
+            - /run/tls/client/{{ $.Values.tls.client.keyKey }}
+            - --client-ssl-cert
+            - /run/tls/client/{{ $.Values.tls.client.certKey }}
+            {{- with $.Values.tls.client.caKey }}
+            - --client-ssl-ca
+            - /run/tls/client/{{ . }}
+            {{- end }}
+            {{- end }}
+          env:
+            - name: CONFIGPROXY_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.existingSecret | quote }}
+                  key: {{ .Values.auth.tokenKey | quote }}
+            {{- if eq .Values.storage.backend "redis" }}
+            - name: PINGORA_REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.redis.auth.existingSecret | quote }}
+                  key: {{ .Values.redis.auth.urlKey | quote }}
+            - name: PINGORA_REDIS_ROUTE_KEY
+              value: {{ .Values.redis.routeKey | quote }}
+            - name: PINGORA_REDIS_OPERATION_TIMEOUT_MS
+              value: {{ .Values.redis.operationTimeoutMs | quote }}
+            {{- end }}
+            {{- if eq .Values.storage.backend "sidecar" }}
+            - name: PINGORA_SIDECAR_URL
+              value: {{ .Values.sidecar.endpoint | quote }}
+            - name: PINGORA_SIDECAR_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.sidecar.auth.existingSecret | quote }}
+                  key: {{ .Values.sidecar.auth.tokenKey | quote }}
+            - name: PINGORA_SIDECAR_CONNECT_TIMEOUT_MS
+              value: {{ .Values.sidecar.connectTimeoutMs | quote }}
+            - name: PINGORA_SIDECAR_REQUEST_TIMEOUT_MS
+              value: {{ .Values.sidecar.requestTimeoutMs | quote }}
+            {{- end }}
+            {{- with .Values.tls.public.passphraseKey }}
+            - name: CONFIGPROXY_SSL_KEY_PASSPHRASE
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.tls.public.existingSecret | quote }}
+                  key: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.tls.api.passphraseKey }}
+            - name: CONFIGPROXY_API_SSL_KEY_PASSPHRASE
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.tls.api.existingSecret | quote }}
+                  key: {{ . | quote }}
+            {{- end }}
           ports:
-            - name: http
-              containerPort: {{ .Values.service.port }}
+            - name: public
+              containerPort: {{ .Values.listeners.public.port }}
               protocol: TCP
+            - name: api
+              containerPort: {{ .Values.listeners.api.port }}
+              protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.listeners.metrics.port }}
+              protocol: TCP
+          {{- if .Values.probes.enabled }}
+          startupProbe:
+            httpGet:
+              path: /_chp_healthz
+              port: public
+              scheme: {{ ternary "HTTPS" "HTTP" (not (empty .Values.tls.public.existingSecret)) }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
+          readinessProbe:
+            httpGet:
+              path: /_chp_healthz
+              port: public
+              scheme: {{ ternary "HTTPS" "HTTP" (not (empty .Values.tls.public.existingSecret)) }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+          livenessProbe:
+            httpGet:
+              path: /_chp_healthz
+              port: public
+              scheme: {{ ternary "HTTPS" "HTTP" (not (empty .Values.tls.public.existingSecret)) }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+          {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-          {{- with .Values.volumeMounts }}
           volumeMounts:
-            {{- toYaml . | nindent 12 }}
-          {{- end }}
-      {{- with .Values.volumes }}
+            - name: tmp
+              mountPath: /tmp
+            {{- with .Values.tls.public.existingSecret }}
+            - name: tls-public
+              mountPath: /run/tls/public
+              readOnly: true
+            {{- end }}
+            {{- with .Values.tls.api.existingSecret }}
+            - name: tls-api
+              mountPath: /run/tls/api
+              readOnly: true
+            {{- end }}
+            {{- with .Values.tls.client.existingSecret }}
+            - name: tls-client
+              mountPath: /run/tls/client
+              readOnly: true
+            {{- end }}
       volumes:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ .Values.tmp.sizeLimit }}
+        {{- with .Values.tls.public.existingSecret }}
+        - name: tls-public
+          secret:
+            secretName: {{ . | quote }}
+        {{- end }}
+        {{- with .Values.tls.api.existingSecret }}
+        - name: tls-api
+          secret:
+            secretName: {{ . | quote }}
+        {{- end }}
+        {{- with .Values.tls.client.existingSecret }}
+        - name: tls-client
+          secret:
+            secretName: {{ . | quote }}
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*.*.*']
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+
+jobs:
+  verify-linux:
+    name: Authoritative Linux verification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install native and release-gate tools
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          timeout 300s sudo apt-get update
+          timeout 300s sudo apt-get install -y --no-install-recommends clang cmake libclang-dev libssl-dev pkg-config ruby
+          timeout 300s rustup component add clippy rustfmt
+          timeout 1200s cargo install --locked --version 1.56.0 just
+          timeout 1200s cargo install --locked --version 0.22.2 cargo-audit
+          timeout 1200s cargo install --locked --version 0.20.2 cargo-deny
+          curl --fail --location --silent --show-error --max-time 60 \
+            --output /tmp/helm.tar.gz https://get.helm.sh/helm-v3.18.3-linux-amd64.tar.gz
+          echo '6ec85f306dd8fe9eb05c61ba4593182b2afcfefb52f21add3fe043ebbdc48e39  /tmp/helm.tar.gz' | sha256sum --check
+          timeout 60s tar -xzf /tmp/helm.tar.gz -C /tmp
+          timeout 30s sudo install -m 0755 /tmp/linux-amd64/helm /usr/local/bin/helm
+
+      - name: Record resolved Rust toolchain
+        id: linux-toolchain
+        run: echo "rustc=$(timeout 15s rustc --version | sha256sum | cut -d' ' -f1)" >> "${GITHUB_OUTPUT}"
+
+      - name: Cache locked Cargo inputs and outputs
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: linux-cargo-${{ steps.linux-toolchain.outputs.rustc }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+
+      - name: Run authoritative release gate
+        run: ./scripts/verify.sh
+
+      - name: Upload failure evidence
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux-verification-failure-${{ github.run_id }}
+          if-no-files-found: ignore
+          retention-days: 14
+          path: |
+            .verification-logs/
+            **/*.proptest-regressions
+            proptest-regressions/
+
+  rust-macos:
+    name: macOS Rust checks
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install required native tools
+        run: |
+          set -Eeuo pipefail
+          python3 -c 'import subprocess; subprocess.run(["brew", "install", "cmake", "coreutils", "openssl@3", "pkg-config"], check=True, timeout=1200)'
+          gtimeout 300s rustup component add clippy rustfmt
+
+      - name: Record resolved Rust toolchain
+        id: macos-toolchain
+        run: echo "rustc=$(gtimeout 15s rustc --version | shasum -a 256 | cut -d' ' -f1)" >> "${GITHUB_OUTPUT}"
+
+      - name: Cache locked Cargo inputs and outputs
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: macos-cargo-${{ steps.macos-toolchain.outputs.rustc }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+
+      - name: Format, lint, and unit test
+        run: |
+          set -Eeuo pipefail
+          gtimeout 180s cargo fmt --all -- --check
+          gtimeout 1800s cargo clippy --locked --all-targets --all-features -- -D warnings
+          gtimeout 1800s cargo test --locked --lib --bins --all-features

@@ -8,7 +8,7 @@
 
 A dynamic HTTP and WebSocket reverse proxy built with [Pingora](https://github.com/cloudflare/pingora). It implements the route-management API and routing behavior expected by JupyterHub's [Configurable HTTP Proxy (CHP) 5.3.0](https://github.com/jupyterhub/configurable-http-proxy/tree/5.3.0), without requiring Node.js in the proxy process.
 
-> **Project status:** the CHP-compatible runtime, memory and Redis route stores, management API, TLS listeners, metrics, graceful shutdown, differential oracle, and JupyterHub 5.5 external-proxy flow are implemented and tested. The sidecar store implementation exists behind contracts but remains fail-closed in the executable. The checked-in Dockerfile and Helm chart are still being hardened for release; build from source for the current implementation.
+> **Project status:** the CHP-compatible runtime, memory, Redis, and HTTP sidecar route stores, hardened production image, production Helm chart, differential oracle, and JupyterHub 5.5 external-proxy flow are implemented and tested. See [Operations](docs/operations.md) before deploying.
 
 ## Why this project?
 
@@ -37,7 +37,7 @@ JupyterHub / operator ------------>| Axum management API  |--+
                                    | /api/routes          |  |
                                    +----------------------+  |
                                                               v
-Client ---> Pingora public proxy ---> RouteRegistry ---> memory or Redis store
+Client ---> Pingora public proxy ---> RouteRegistry ---> memory, Redis, or sidecar store
                   |                       |
                   |                       +---- activity tracking
                   v
@@ -210,7 +210,7 @@ Common options:
 | `--log-level` | `debug`, `info`, `warn`, or `error` | `info` |
 | `--storage-backend` | `memory`, `redis`, or `sidecar` | `memory` |
 
-Redis runtime selection requires `PINGORA_REDIS_URL`. Optional `PINGORA_REDIS_ROUTE_KEY` and `PINGORA_REDIS_OPERATION_TIMEOUT_MS` values select the hash key and positive operation deadline. Sidecar selection remains fail-closed until its runtime configuration is wired in Task 13.
+Redis runtime selection requires `PINGORA_REDIS_URL`. Optional `PINGORA_REDIS_ROUTE_KEY` and `PINGORA_REDIS_OPERATION_TIMEOUT_MS` values select the hash key and positive operation deadline. Sidecar selection requires a root HTTP(S) `PINGORA_SIDECAR_URL`, a non-empty `PINGORA_SIDECAR_BEARER_TOKEN`, and positive connect/request deadlines. The process loads the remote startup snapshot before binding listeners and fails closed if it cannot do so.
 
 ### Environment variables
 
@@ -222,6 +222,10 @@ Redis runtime selection requires `PINGORA_REDIS_URL`. Optional `PINGORA_REDIS_RO
 | `PINGORA_REDIS_URL` | Redis connection URL; required for `--storage-backend redis` and redacted from debug output. |
 | `PINGORA_REDIS_ROUTE_KEY` | Redis hash key; defaults to `pingora-reverse-proxy:routes:v1`. |
 | `PINGORA_REDIS_OPERATION_TIMEOUT_MS` | Positive Redis operation timeout; defaults to `2000`. |
+| `PINGORA_SIDECAR_URL` | Root HTTP(S) sidecar endpoint; required for the sidecar backend and redacted from debug output. |
+| `PINGORA_SIDECAR_BEARER_TOKEN` | Sidecar bearer credential; required and redacted from debug output. |
+| `PINGORA_SIDECAR_CONNECT_TIMEOUT_MS` | Positive sidecar connect timeout; defaults to `1000`. |
+| `PINGORA_SIDECAR_REQUEST_TIMEOUT_MS` | Positive sidecar request timeout; defaults to `2000`. |
 
 ## TLS and Unix sockets
 
@@ -253,7 +257,7 @@ Keep metrics on a private listener unless an authenticated monitoring layer prot
 | --- | --- | --- | --- |
 | Memory | yes | supported | process-local only |
 | Redis | yes | supported with explicit environment configuration | persistent Redis hash |
-| Sidecar | protocol implementation present | fail-closed until Task 13 | depends on sidecar |
+| Sidecar | yes | supported with explicit endpoint, token, and deadlines | depends on sidecar |
 
 The route registry uses fail-stop semantics when a remote mutation outcome is indeterminate. It does not guess whether a timed-out writer committed a change.
 
@@ -269,7 +273,7 @@ Equivalent commands:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets --all-features
 ```
 
@@ -278,32 +282,55 @@ Additional compatibility gates:
 ```bash
 just test-differential   # compare behavior with the pinned CHP 5.3.0 oracle
 just test-jupyterhub     # JupyterHub 5.5.0 external-proxy end-to-end test
+just test-container      # build and inspect the hardened production image
+just test-helm           # lint and structurally assert rendered chart variants
 ```
 
 Both integration gates require Docker. They create isolated resources and enforce teardown checks.
 
-## Deployment status
+## Container and Helm deployment
 
-A Dockerfile and Helm chart are present in the repository, but they predate the current release-hardening work. For now:
+Build the same production image exercised by the container gate:
 
-1. prefer `cargo build --locked --release`;
-2. run the binary under a process supervisor;
-3. bind the management and metrics listeners to private interfaces;
-4. set `CONFIGPROXY_AUTH_TOKEN` through a secret manager;
-5. terminate or configure TLS explicitly; and
-6. persist logs and scrape the dedicated metrics listener.
+```bash
+docker build --pull --tag pingora-reverse-proxy:0.2.0 .
+export CONFIGPROXY_AUTH_TOKEN="$(openssl rand -hex 32)"
+docker run --rm --read-only --tmpfs /tmp:rw,noexec,nosuid,nodev,uid=65532,gid=65532 \
+  --cap-drop ALL --security-opt no-new-privileges \
+  -e CONFIGPROXY_AUTH_TOKEN \
+  -p 8000:8000 -p 127.0.0.1:8001:8001 -p 127.0.0.1:8002:8002 \
+  pingora-reverse-proxy:0.2.0
+```
 
-Do not assume the current chart supplies readiness probes, hardened security contexts, or complete CLI configuration.
+The final image runs as UID/GID 65532, uses an exec-form entrypoint, contains CA certificates, and supports a read-only root filesystem with only `/tmp` writable. Do not put literal credentials in image arguments, chart values, or committed files.
+
+The chart requires an existing Secret for the management token and never renders its value:
+
+```bash
+kubectl create secret generic proxy-auth --from-literal=token="$CONFIGPROXY_AUTH_TOKEN"
+helm upgrade --install proxy ./helm-chart \
+  --set auth.existingSecret=proxy-auth \
+  --set image.repository=registry.example/pingora-reverse-proxy \
+  --set image.tag=0.2.0
+```
+
+Select Redis with `storage.backend=redis` plus `redis.auth.existingSecret`; select the sidecar with `storage.backend=sidecar`, `sidecar.endpoint`, and `sidecar.auth.existingSecret`. TLS keys, certificates, client CAs, and optional key passphrases are also existing-Secret references. The API is a ClusterIP service by default; restrict it further with NetworkPolicy appropriate to the cluster.
+
+CI runs `scripts/verify.sh` on Linux in the required gate order. Publishing occurs only after a successful CI run for a commit carrying exactly one SemVer tag, and publishes version and commit-SHA tags rather than `latest`.
+
+### Migrating from CHP
+
+Run the Rust proxy alongside CHP first. Reuse the management token through a secret provider, match path/host-routing and TLS settings, choose Redis or sidecar when routes must survive restart, and point JupyterHub's `api_url` at the private Rust API only after authenticated route output and representative HTTP/WebSocket traffic match. Keep CHP available for rollback until route reconciliation and graceful shutdown have been observed. The staged runbook and backend-specific backup/restore limits are in [Operations](docs/operations.md#deployment-rollback-and-migration).
 
 ## Compatibility boundaries
 
 This project targets observed CHP 5.3.0 behavior rather than every historical Node.js extension point.
 
 - arbitrary CHP storage modules cannot be loaded into the Rust process;
-- Redis runtime selection requires explicit validated environment configuration; sidecar runtime selection remains fail-closed until Task 13;
+- Redis and sidecar runtime selection require explicit validated environment configuration and an initial remote snapshot;
 - deprecated RC4 enablement is intentionally rejected;
 - `--client-ssl-request-cert` and `--client-ssl-reject-unauthorized` are rejected because CHP does not apply them to upstream TLS in the targeted contract;
-- deployment assets are not yet the release authority.
+- arbitrary sidecar protocols are not supported; the sidecar must implement the versioned HTTP contract documented in `docs/sidecar-store.md`.
 
 See the executable's `--help` output and the test suites for the current contract.
 

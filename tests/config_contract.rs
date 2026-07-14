@@ -632,12 +632,111 @@ fn validation_errors_are_explicit_and_non_panicking() {
 
 #[test]
 fn supported_storage_backends_are_typed() {
-    for (name, expected) in [
-        ("memory", StoreConfig::Memory),
-        ("sidecar", StoreConfig::Sidecar),
+    let cfg = parse_ok(["proxy", "--storage-backend", "memory"]);
+    assert_eq!(cfg.store, StoreConfig::Memory);
+}
+
+#[test]
+#[serial]
+fn sidecar_runtime_requires_an_endpoint_and_bearer_token() {
+    let _env = EnvGuard::unset(&[
+        "PINGORA_SIDECAR_URL",
+        "PINGORA_SIDECAR_BEARER_TOKEN",
+        "PINGORA_SIDECAR_CONNECT_TIMEOUT_MS",
+        "PINGORA_SIDECAR_REQUEST_TIMEOUT_MS",
+    ]);
+    let cli = Cli::try_parse_from(["proxy", "--storage-backend", "sidecar"]).unwrap();
+    let error = AppConfig::try_from(cli).unwrap_err().to_string();
+    assert!(
+        error.contains("PINGORA_SIDECAR_URL"),
+        "unexpected error: {error}"
+    );
+
+    let _url = EnvGuard::set(&[("PINGORA_SIDECAR_URL", "http://sidecar.example:8080/")]);
+    let cli = Cli::try_parse_from(["proxy", "--storage-backend", "sidecar"]).unwrap();
+    let error = AppConfig::try_from(cli).unwrap_err().to_string();
+    assert!(
+        error.contains("PINGORA_SIDECAR_BEARER_TOKEN"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+#[serial]
+fn sidecar_runtime_configuration_is_validated_and_redacted() {
+    const SIDECAR_URL: &str = "https://route-store.example:8443/";
+    const TOKEN: &str = "SIDECAR_TOKEN_SENTINEL_5731";
+    let _env = EnvGuard::set(&[
+        ("PINGORA_SIDECAR_URL", SIDECAR_URL),
+        ("PINGORA_SIDECAR_BEARER_TOKEN", TOKEN),
+        ("PINGORA_SIDECAR_CONNECT_TIMEOUT_MS", "750"),
+        ("PINGORA_SIDECAR_REQUEST_TIMEOUT_MS", "2250"),
+    ]);
+
+    let cfg = parse_ok(["proxy", "--storage-backend", "sidecar"]);
+    assert_eq!(cfg.store, StoreConfig::Sidecar);
+    let sidecar = cfg
+        .sidecar
+        .as_ref()
+        .expect("sidecar configuration is present");
+    assert_eq!(sidecar.url(), SIDECAR_URL);
+    assert_eq!(sidecar.bearer_token(), TOKEN);
+    assert_eq!(sidecar.connect_timeout().as_millis(), 750);
+    assert_eq!(sidecar.request_timeout().as_millis(), 2250);
+    let debug = format!("{cfg:?} {sidecar:?}");
+    assert!(debug.contains("<redacted>"));
+    assert!(!debug.contains(SIDECAR_URL));
+    assert!(!debug.contains(TOKEN));
+}
+
+#[test]
+#[serial]
+fn sidecar_runtime_rejects_invalid_endpoint_token_and_deadlines() {
+    for (values, expected) in [
+        (
+            vec![
+                ("PINGORA_SIDECAR_URL", "redis://sidecar.example/"),
+                ("PINGORA_SIDECAR_BEARER_TOKEN", "token"),
+            ],
+            "PINGORA_SIDECAR_URL",
+        ),
+        (
+            vec![
+                ("PINGORA_SIDECAR_URL", "http://sidecar.example:8080/"),
+                ("PINGORA_SIDECAR_BEARER_TOKEN", ""),
+            ],
+            "PINGORA_SIDECAR_BEARER_TOKEN",
+        ),
+        (
+            vec![
+                ("PINGORA_SIDECAR_URL", "http://sidecar.example:8080/"),
+                ("PINGORA_SIDECAR_BEARER_TOKEN", "token"),
+                ("PINGORA_SIDECAR_CONNECT_TIMEOUT_MS", "0"),
+            ],
+            "PINGORA_SIDECAR_CONNECT_TIMEOUT_MS",
+        ),
+        (
+            vec![
+                ("PINGORA_SIDECAR_URL", "http://sidecar.example:8080/"),
+                ("PINGORA_SIDECAR_BEARER_TOKEN", "token"),
+                ("PINGORA_SIDECAR_REQUEST_TIMEOUT_MS", "not-a-number"),
+            ],
+            "PINGORA_SIDECAR_REQUEST_TIMEOUT_MS",
+        ),
     ] {
-        let cfg = parse_ok(["proxy", "--storage-backend", name]);
-        assert_eq!(cfg.store, expected);
+        let _clear = EnvGuard::unset(&[
+            "PINGORA_SIDECAR_URL",
+            "PINGORA_SIDECAR_BEARER_TOKEN",
+            "PINGORA_SIDECAR_CONNECT_TIMEOUT_MS",
+            "PINGORA_SIDECAR_REQUEST_TIMEOUT_MS",
+        ]);
+        let _env = EnvGuard::set(&values);
+        let cli = Cli::try_parse_from(["proxy", "--storage-backend", "sidecar"]).unwrap();
+        let error = AppConfig::try_from(cli).unwrap_err().to_string();
+        assert!(
+            error.contains(expected),
+            "expected {expected:?} in {error:?}"
+        );
     }
 }
 

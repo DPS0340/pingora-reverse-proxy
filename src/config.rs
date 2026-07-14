@@ -13,6 +13,8 @@ use url::{Position, Url};
 const CHP_DEFAULT_KEEP_ALIVE_TIMEOUT_MS: u64 = 5000;
 const DEFAULT_REDIS_OPERATION_TIMEOUT_MS: u64 = 2000;
 const DEFAULT_REDIS_ROUTE_KEY: &str = "pingora-reverse-proxy:routes:v1";
+const DEFAULT_SIDECAR_CONNECT_TIMEOUT_MS: u64 = 1000;
+const DEFAULT_SIDECAR_REQUEST_TIMEOUT_MS: u64 = 2000;
 const CHP_5_3_0_DEFAULT_TLS_CIPHERS: &str = "ECDHE-RSA-AES128-GCM-SHA256:\
 ECDHE-ECDSA-AES128-GCM-SHA256:\
 ECDHE-RSA-AES256-GCM-SHA384:\
@@ -247,6 +249,46 @@ pub struct RedisRuntimeConfig {
     operation_timeout: Duration,
 }
 
+/// Validated sidecar runtime settings. Both the endpoint and bearer token are
+/// redacted because either may identify protected deployment infrastructure.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SidecarRuntimeConfig {
+    url: String,
+    bearer_token: String,
+    connect_timeout: Duration,
+    request_timeout: Duration,
+}
+
+impl SidecarRuntimeConfig {
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub fn bearer_token(&self) -> &str {
+        &self.bearer_token
+    }
+
+    pub fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
+
+    pub fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+}
+
+impl fmt::Debug for SidecarRuntimeConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SidecarRuntimeConfig")
+            .field("url", &"<redacted>")
+            .field("bearer_token", &"<redacted>")
+            .field("connect_timeout", &self.connect_timeout)
+            .field("request_timeout", &self.request_timeout)
+            .finish()
+    }
+}
+
 impl RedisRuntimeConfig {
     pub fn url(&self) -> &str {
         &self.url
@@ -314,6 +356,7 @@ pub struct AppConfig {
     pub log_level: LogLevel,
     pub store: StoreConfig,
     pub redis: Option<RedisRuntimeConfig>,
+    pub sidecar: Option<SidecarRuntimeConfig>,
     pub proxy: ProxyOptions,
 }
 
@@ -340,6 +383,7 @@ impl fmt::Debug for AppConfig {
             .field("log_level", &self.log_level)
             .field("store", &self.store)
             .field("redis", &self.redis)
+            .field("sidecar", &self.sidecar)
             .field("proxy", &self.proxy)
             .finish()
     }
@@ -360,7 +404,7 @@ pub enum ConfigError {
     )]
     InvalidTarget { kind: &'static str, value: String },
     #[error(
-        "unknown storage backend {0:?}; use memory, redis, or sidecar. Arbitrary Node storage modules cannot be loaded; use the planned sidecar protocol once implemented"
+        "unknown storage backend {0:?}; use memory, redis, or sidecar. Arbitrary Node storage modules cannot be loaded; use the versioned sidecar protocol"
     )]
     UnknownStorageBackend(String),
     #[error("--ssl-allow-rc4 is unsupported: OpenSSL security policy will not re-enable RC4")]
@@ -379,6 +423,16 @@ pub enum ConfigError {
     InvalidRedisRouteKey,
     #[error("PINGORA_REDIS_OPERATION_TIMEOUT_MS must be a positive integer")]
     InvalidRedisOperationTimeout,
+    #[error("--storage-backend sidecar requires non-empty PINGORA_SIDECAR_URL")]
+    MissingSidecarUrl,
+    #[error("PINGORA_SIDECAR_URL must be an HTTP(S) origin with a root path and no credentials, query, or fragment")]
+    InvalidSidecarUrl,
+    #[error("--storage-backend sidecar requires non-empty PINGORA_SIDECAR_BEARER_TOKEN")]
+    MissingSidecarBearerToken,
+    #[error("PINGORA_SIDECAR_CONNECT_TIMEOUT_MS must be a positive integer")]
+    InvalidSidecarConnectTimeout,
+    #[error("PINGORA_SIDECAR_REQUEST_TIMEOUT_MS must be a positive integer")]
+    InvalidSidecarRequestTimeout,
 }
 
 impl TryFrom<Cli> for AppConfig {
@@ -499,6 +553,7 @@ impl TryFrom<Cli> for AppConfig {
         let log_level = parse_log_level(cli.log_level)?;
         let store = parse_store(cli.storage_backend)?;
         let redis = parse_redis_runtime(store)?;
+        let sidecar = parse_sidecar_runtime(store)?;
         let custom_headers = parse_custom_headers(cli.custom_header)?;
 
         Ok(Self {
@@ -518,6 +573,7 @@ impl TryFrom<Cli> for AppConfig {
             log_level,
             store,
             redis,
+            sidecar,
             proxy: ProxyOptions {
                 x_forward: cli.x_forward,
                 prepend_path: cli.prepend_path,
@@ -723,6 +779,61 @@ fn parse_redis_runtime(store: StoreConfig) -> Result<Option<RedisRuntimeConfig>,
         route_key,
         operation_timeout,
     }))
+}
+
+fn parse_sidecar_runtime(store: StoreConfig) -> Result<Option<SidecarRuntimeConfig>, ConfigError> {
+    if store != StoreConfig::Sidecar {
+        return Ok(None);
+    }
+
+    let url = env_nonempty("PINGORA_SIDECAR_URL").ok_or(ConfigError::MissingSidecarUrl)?;
+    let parsed = Url::parse(&url).map_err(|_| ConfigError::InvalidSidecarUrl)?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(ConfigError::InvalidSidecarUrl);
+    }
+    let bearer_token = env_nonempty("PINGORA_SIDECAR_BEARER_TOKEN")
+        .ok_or(ConfigError::MissingSidecarBearerToken)?;
+    let connect_timeout = positive_duration_from_env(
+        "PINGORA_SIDECAR_CONNECT_TIMEOUT_MS",
+        DEFAULT_SIDECAR_CONNECT_TIMEOUT_MS,
+        ConfigError::InvalidSidecarConnectTimeout,
+    )?;
+    let request_timeout = positive_duration_from_env(
+        "PINGORA_SIDECAR_REQUEST_TIMEOUT_MS",
+        DEFAULT_SIDECAR_REQUEST_TIMEOUT_MS,
+        ConfigError::InvalidSidecarRequestTimeout,
+    )?;
+
+    Ok(Some(SidecarRuntimeConfig {
+        url,
+        bearer_token,
+        connect_timeout,
+        request_timeout,
+    }))
+}
+
+fn positive_duration_from_env(
+    name: &str,
+    default_ms: u64,
+    invalid: ConfigError,
+) -> Result<Duration, ConfigError> {
+    match env::var(name) {
+        Ok(value) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .map(Duration::from_millis)
+            .ok_or(invalid),
+        Err(env::VarError::NotPresent) => Ok(Duration::from_millis(default_ms)),
+        Err(env::VarError::NotUnicode(_)) => Err(invalid),
+    }
 }
 
 fn parse_custom_headers(values: Vec<String>) -> Result<BTreeMap<String, String>, ConfigError> {

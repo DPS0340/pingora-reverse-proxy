@@ -1,15 +1,24 @@
+{{- range $name, $service := .Values.services }}
+{{- if $service.enabled }}
+---
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "pingora-reverse-proxy.fullname" . }}
+  name: {{ include "pingora-reverse-proxy.fullname" $ }}-{{ $name }}
   labels:
-    {{- include "pingora-reverse-proxy.labels" . | nindent 4 }}
+    {{- include "pingora-reverse-proxy.labels" $ | nindent 4 }}
+  {{- with $service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
-  type: {{ .Values.service.type }}
+  type: {{ $service.type }}
   ports:
-    - port: {{ .Values.service.port }}
-      targetPort: http
+    - name: {{ $name }}
+      port: {{ $service.port }}
+      targetPort: {{ $name }}
       protocol: TCP
-      name: http
   selector:
-    {{- include "pingora-reverse-proxy.selectorLabels" . | nindent 4 }}
+    {{- include "pingora-reverse-proxy.selectorLabels" $ | nindent 4 }}
+{{- end }}
+{{- end }}

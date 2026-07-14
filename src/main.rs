@@ -28,6 +28,7 @@ use pingora_reverse_proxy::shutdown::{
 };
 use pingora_reverse_proxy::store::memory::MemoryStore;
 use pingora_reverse_proxy::store::redis::{RedisStore, RedisStoreConfig};
+use pingora_reverse_proxy::store::sidecar::{SidecarConfig, SidecarStore};
 use pingora_reverse_proxy::store::{Store, StoreError};
 use thiserror::Error;
 use tracing_subscriber::EnvFilter;
@@ -50,10 +51,10 @@ enum StartupError {
     Runtime(#[source] std::io::Error),
     #[error("failed to initialize Pingora: {0}")]
     Pingora(String),
-    #[error("storage backend {0:?} is not wired into the executable; sidecar runtime wiring remains fail-closed for Task 13")]
-    UnsupportedStore(StoreConfig),
     #[error("validated Redis runtime configuration is missing")]
     MissingRedisConfig,
+    #[error("validated sidecar runtime configuration is missing")]
+    MissingSidecarConfig,
     #[error("redirect listener requires a TCP public listener")]
     InvalidRedirectListener,
     #[error("public listener service failed during startup or execution")]
@@ -82,9 +83,6 @@ fn run() -> Result<(), StartupError> {
     // Crash/logging ownership must be final before the mutation redaction hook.
     install_route_mutation_panic_hook_at_startup();
 
-    if config.store == StoreConfig::Sidecar {
-        return Err(StartupError::UnsupportedStore(config.store));
-    }
     ensure_public_startup_supported()?;
     ensure_listener_paths_distinct(
         std::iter::once(&config.public_listener)
@@ -117,7 +115,21 @@ fn run() -> Result<(), StartupError> {
                     .map_err(StartupError::Store)?,
             )
         }
-        StoreConfig::Sidecar => return Err(StartupError::UnsupportedStore(config.store)),
+        StoreConfig::Sidecar => {
+            let sidecar = config
+                .sidecar
+                .as_ref()
+                .ok_or(StartupError::MissingSidecarConfig)?;
+            let sidecar_config = SidecarConfig::new(sidecar.url())
+                .with_bearer_token(sidecar.bearer_token())
+                .with_connect_timeout(sidecar.connect_timeout())
+                .with_request_timeout(sidecar.request_timeout());
+            Arc::new(
+                runtime
+                    .block_on(SidecarStore::connect(sidecar_config))
+                    .map_err(StartupError::Store)?,
+            )
+        }
     };
     let registry = runtime
         .block_on(RouteRegistry::load(store))

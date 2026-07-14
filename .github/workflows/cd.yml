@@ -1,63 +1,66 @@
-name: Build and push container image
+name: Publish verified container
+
 on:
-  push:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: read
 
 env:
   IMAGE_NAME: pingora-reverse-proxy
 
-permissions:
-  pages: write
-  contents: write
-  packages: write
-  id-token: write
-
 jobs:
-  build-and-push-container-image:
+  publish:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
     steps:
-      - name: checkout
-        uses: actions/checkout@v2
-
-      - name: Build image
-        run: docker build . --file Dockerfile --tag $IMAGE_NAME --label "runnumber=${GITHUB_RUN_ID}"
-
-      - name: Log in to registry
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u $ --password-stdin
-
-      - name: Push image
-        run: |
-          IMAGE_ID=ghcr.io/${{ github.repository_owner }}/$IMAGE_NAME
-          IMAGE_ID=$(echo $IMAGE_ID | tr '[A-Z]' '[a-z]')
-          VERSION=$(echo "${{ github.ref }}" | sed -e 's,.*/\(.*\),\1,')
-
-          VERSION=latest
-          echo IMAGE_ID=$IMAGE_ID
-          echo VERSION=$VERSION
-
-          docker tag $IMAGE_NAME $IMAGE_ID:$VERSION
-          docker push $IMAGE_ID:$VERSION
-
-  deploy-github-pages:
-    runs-on: ubuntu-24.04
-    needs: build-and-push-container-image
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: checkout
-        uses: actions/checkout@v2
-
-      - name: tar & index helm chart
-        run: |
-          helm package ./helm-chart
-          helm repo index ./
-
-      - name: Upload GitHub Pages artifact
-        uses: actions/upload-pages-artifact@v3.0.1
+      - name: Check out the verified commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          path: ./
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
 
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+      - name: Select a SemVer tag on the verified commit
+        id: release
+        shell: bash
+        env:
+          VERIFIED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -Eeuo pipefail
+          mapfile -t release_tags < <(git tag --points-at "${VERIFIED_SHA}" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$' || true)
+          if (( ${#release_tags[@]} != 1 )); then
+            echo "expected exactly one SemVer release tag on verified commit" >&2
+            exit 1
+          fi
+          echo "tag=${release_tags[0]}" >> "${GITHUB_OUTPUT}"
 
+      - name: Build and publish immutable image tags
+        shell: bash
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/pingora-docker-config
+          GHCR_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          VERIFIED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -m 0700 -p "${DOCKER_CONFIG}"
+          trap 'rm -rf -- "${DOCKER_CONFIG}"' EXIT
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${IMAGE_NAME}"
+          version="${RELEASE_TAG#v}"
+          sha_tag="sha-${VERIFIED_SHA}"
+          echo "${GHCR_TOKEN}" | timeout 30s docker login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+          timeout 1800s docker build --pull --label "org.opencontainers.image.revision=${VERIFIED_SHA}" --label "org.opencontainers.image.version=${version}" --tag "${image}:${version}" --tag "${image}:${sha_tag}" .
+          timeout 600s docker push "${image}:${version}"
+          timeout 600s docker push "${image}:${sha_tag}"
+          digest="$(timeout 30s docker image inspect --format '{{index .RepoDigests 0}}' "${image}:${version}")"
+          test -n "${digest}"
+          echo "Published ${digest}"
+          timeout 30s docker logout ghcr.io

@@ -1,0 +1,12 @@
+.git
+.github
+.superpowers
+docs
+helm-chart
+scripts
+target
+tests
+*.md
+compose.test.yml
+deny.toml
+justfile

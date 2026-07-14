@@ -1,0 +1,196 @@
+# Task 13 report: production image, chart, CI, and operations
+
+Date: 2026-07-14 (Asia/Seoul)
+
+Accepted parent: `e34a13ffb72b21194bb8b7166dd3912c5497ca90`
+
+## Scope and ownership
+
+Task 13 owns the production image/chart/release gates and the deployable closure of Task 12's intentionally fail-closed `sidecar` executable selection. Production Rust changes are limited to `src/config.rs` and `src/main.rs`: validated sidecar endpoint/token/deadlines are converted to `SidecarConfig`, `SidecarStore::connect` runs, and `RouteRegistry::load` completes before listener binding. Memory and Redis construction remain unchanged. Focused config and shipped-binary runtime tests cover this boundary.
+
+## Tool versions
+
+Local focused acceptance used:
+
+- `rustc 1.96.0 (ac68faa20 2026-05-25)`
+- `cargo 1.96.0 (30a34c682 2026-05-25)`
+- `just 1.56.0` (isolated at `/tmp/pingora-task13-tools/bin/just`)
+- Docker client `28.0.0`, server `29.5.2`, Linux/amd64
+- Helm `v3.18.3+g6838ebc`
+- Ruby `2.6.10p210`, Psych `3.1.0`
+- ShellCheck `0.11.0`
+- cargo-audit `0.22.2`
+- cargo-deny `0.20.2`
+
+The production builder resolves to Rust `1.85.1` from the pinned `rust:1.85-bookworm` manifest digest. The runtime is pinned `debian:bookworm-slim`.
+
+## Strict RED evidence
+
+Artifact tests and recipes were written before the production Dockerfile/chart implementation.
+
+Command:
+
+```text
+PATH=/tmp/pingora-task13-tools/bin:$PATH just test-container && just test-helm
+```
+
+Real old-artifact RED: after the bounded, repository-owned tar build context was established, the old single-stage image failed during its build because floating `debian:latest` resolved to trixie and the OpenResty package operation failed. The recipe exited nonzero and its exact owned image/container scan was empty after the cleanup trap. An earlier first attempt exposed the old repository's unbounded build context; that owned process was interrupted and its exact resources removed before the deterministic recipe was corrected, so it is not claimed as test RED.
+
+The chart RED was then captured independently:
+
+```text
+PATH=/tmp/pingora-task13-tools/bin:$PATH just test-helm
+```
+
+`helm lint --strict` passed the old chart, then the structural YAML assertion failed with `KeyError: key not found: "args"` on the old Deployment. This is the required real failure for absent listener/storage/security wiring; it was not fabricated.
+
+Sidecar regression tests were also added before production runtime wiring:
+
+```text
+cargo test --locked --test config_contract --test jupyterhub_e2e
+```
+
+Real RED: compilation failed with `E0609` because the accepted Task 12 `AppConfig` had no `sidecar` runtime field. This directly demonstrated that the shipped executable could not construct the sidecar path.
+
+## Production image and container evidence
+
+The Dockerfile is a multi-stage locked release build. Builder and runtime base manifests are pinned to:
+
+- `rust:1.85-bookworm@sha256:e51d0265072d2d9d5d320f6a44dde6b9ef13653b035098febd68cce8fa7c0bc4`
+- `debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818`
+
+The final stage contains the stripped release binary, Debian CA bundle, and runtime libraries only; build context source, Cargo, compilers, CMake, Git, Make, Bash, and debug/target trees are rejected by the rootfs assertion. It has exec-form `ENTRYPOINT`, explicit public/API/metrics command arguments, UID/GID `65532:65532`, no declared writable volume, and supports a read-only root with a bounded `/tmp` tmpfs.
+
+During GREEN iteration, the first complete image build exposed real Debian-slim paths (`/usr/bin/bash`, Bash metadata, and empty `/usr/src` directories) through the leakage test. The runtime layer now removes all Bash/dash/sh executables and source directories after package configuration. The subsequent final gate passed; this intermediate failure is why the final image is shell-free rather than merely lacking build tools.
+
+## Helm structural matrix
+
+Canonical recipe:
+
+```text
+PATH=/tmp/pingora-task13-tools/bin:$PATH just test-helm
+```
+
+GREEN: Helm 3.18.3 linted the chart with `--strict`, then five independently rendered YAML streams (`memory`, `redis`, `sidecar`, `tls`, and custom `resources`) were parsed with Ruby/Psych and asserted structurally. Assertions cover:
+
+- all three listener arguments and named public/API/metrics ports/services;
+- API ClusterIP by default;
+- management, Redis, and sidecar credentials only through `secretKeyRef`;
+- no rendered `Secret` resources or `latest` image;
+- storage-specific args/env and sidecar endpoint/deadlines;
+- public/API/client TLS args and read-only Secret mounts;
+- startup/readiness/liveness `/_chp_healthz` probes with finite timeouts;
+- CPU/memory requests and limits;
+- pod/container UID/GID 65532, non-root, `RuntimeDefault` seccomp, no privilege escalation, all capabilities dropped, read-only root, service-account token automount false;
+- writable memory-backed `/tmp` only.
+
+Fail-closed renders cover unknown storage, missing Redis/sidecar Secret refs, missing/credential-bearing sidecar endpoints, non-positive sidecar deadlines, and an enabled HTTP probe combined with mandatory public client certificates.
+
+Failure-path evidence:
+
+```text
+TMPDIR=<owned-empty-directory> HELM_GATE_INJECT_FAILURE=after-memory ./scripts/test-helm.sh
+```
+
+The gate exited `97` at the requested injection point and its trap removed the exact owned temporary render directory. No cluster resources are created by this gate.
+
+## Sidecar runtime GREEN
+
+Command:
+
+```text
+cargo test --locked --test config_contract --test jupyterhub_e2e
+```
+
+GREEN: `config_contract` 33/33 and `jupyterhub_e2e` 2/2. The binary regression starts an authenticated protocol fixture, launches the shipped executable with `--storage-backend sidecar`, waits for public health and an authenticated route snapshot, proves one startup health request and one snapshot request, and terminates cleanly. Configuration tests require an HTTP(S) root origin without credentials/query/fragment, a non-empty bearer token, and positive connect/request deadlines; debug output excludes endpoint and token sentinel values.
+
+## Verification, CI, and supply chain decisions
+
+`scripts/verify.sh` is executable, fails fast, requires and prints tool versions, writes per-phase non-secret logs, bounds each gate, and preserves exactly this order:
+
+1. format;
+2. clippy with warnings denied;
+3. all-target/all-feature tests with `PROPTEST_CASES=4096`;
+4. CHP differential;
+5. JupyterHub;
+6. production container;
+7. Helm;
+8. cargo-audit with warnings denied;
+9. cargo-deny.
+
+Locked flags are present on Cargo build/test inputs. Linux CI is authoritative, has `contents: read`, a 90-minute job bound, explicit native/Rust/Helm/just/audit/deny prerequisites, checksum-pinned Helm, exact cargo-tool versions, full-SHA GitHub actions, a Cargo cache keyed by lockfile/toolchain/config, and failure-only upload of gate logs/proptest regressions. The secondary macOS job installs native dependencies and runs genuine fmt/clippy/unit commands without `continue-on-error`.
+
+The old CD workflow published `latest` on every push with excessive Pages/content/OIDC/package permissions, stale actions, and a broken registry username. It was replaced. Publication now consumes only a successful `CI` `workflow_run` from a push, checks out its exact verified SHA, requires exactly one SemVer tag pointing at that SHA, grants `packages: write` only to the publish job, and pushes version plus full commit-SHA tags. It does not publish `latest`; OCI revision/version labels and the resulting repository digest are emitted.
+
+Implementation choices were checked against current primary documentation: Dockerfile reference and multi-stage builds (`docs.docker.com/reference/dockerfile`, `docs.docker.com/build/building/multi-stage/`), Docker read-only/tmpfs run behavior (`docs.docker.com/reference/cli/docker/container/run/`, `docs.docker.com/engine/storage/tmpfs/`), Kubernetes security contexts/probes/service accounts/seccomp (`kubernetes.io/docs/tasks/configure-pod-container/security-context/`, `kubernetes.io/docs/concepts/configuration/liveness-readiness-startup-probes/`, `kubernetes.io/docs/concepts/security/service-accounts/`, `kubernetes.io/docs/tutorials/security/seccomp/`), Helm template validation (`helm.sh/docs/v3/howto/charts_tips_and_tricks/`), GitHub secure action pinning (`docs.github.com/en/actions/reference/security/secure-use`), RustSec cargo-audit, and Embark cargo-deny.
+
+Workflow YAML parses successfully with Ruby/Psych. All new shell scripts pass `bash -n`; ShellCheck 0.11.0 reports no diagnostics. The Helm gate's injected failure proves its cleanup/failure semantics. The container gate has a corresponding `after-start` injection used after the canonical image build to prove exact container/image cleanup.
+
+## Security gate concerns assigned to Task 14
+
+Policy was not weakened and no advisory was ignored. On 2026-07-14:
+
+```text
+timeout 600 cargo audit --deny warnings
+```
+
+failed against 355 locked dependencies with four vulnerabilities: `idna 0.5.0` (`RUSTSEC-2024-0421`), `protobuf 2.28.0` (`RUSTSEC-2024-0437`), `ring 0.17.8` (`RUSTSEC-2025-0009`), and `tracing-subscriber 0.3.18` (`RUSTSEC-2025-0055`). It also denied warnings for unmaintained `adler`, `daemonize`, `derivative`, `paste`, and `rustls-pemfile`, unsound `rand 0.8.5` (`RUSTSEC-2026-0097`), and yanked `spin 0.9.8`.
+
+```text
+timeout 600 cargo deny check
+```
+
+also failed. In addition to the advisory blockers, license gathering could not establish the `ring 0.17.8` license at the configured 0.8 confidence threshold. Duplicate versions were warnings. These are pre-existing locked graph/Task 14 release blockers, not suppressed exceptions; therefore the complete `scripts/verify.sh` intentionally remains red until they are resolved.
+
+## Operations and migration
+
+`docs/operations.md` covers public health, authenticated API readiness, metrics, startup snapshot ordering, graceful signals, TCP/TLS/UDS configuration, memory/Redis/sidecar behavior, indeterminate fail-stop semantics, outage recovery, backup/restore ownership, Secret/TLS rotation, redaction, probes, resource/security assumptions, staged rollback, and CHP migration. README launch/JupyterHub/storage/TLS/UDS/container/Helm/CI instructions were updated only for behavior covered by source and focused gates.
+
+## Final focused acceptance
+
+Final production image command:
+
+```text
+PATH=/tmp/pingora-task13-tools/bin:$PATH just test-container
+```
+
+GREEN. The uncached pinned build completed its locked release profile in 17m02s on the local amd64 Docker VM. The canonical rerun reported:
+
+```text
+container gate passed: uid/gid=65532 read-only-root health/api/metrics ready cleanup-owned=<unique-run-id>
+```
+
+Image inspection asserted `User=65532:65532`, exact exec-form entrypoint and listener command, effective UID/GID 65532, read-only root, no-new-privileges, a successful write to bounded UID-owned `/tmp`, CA bundle, stripped release executable, no shell/build/source/debug paths, authenticated API `{}`, public health `{"status":"OK"}`, a metrics sample, graceful `SIGTERM` exit code 0, and removal of the exact named/labeled image and containers.
+
+Failure cleanup command:
+
+```text
+CONTAINER_GATE_INJECT_FAILURE=after-start PATH=/tmp/pingora-task13-tools/bin:$PATH just test-container
+```
+
+Expected nonzero result. The subsequent label scans returned no `io.pingora-reverse-proxy.test-owner` containers or images.
+
+Final chart command:
+
+```text
+PATH=/tmp/pingora-task13-tools/bin:$PATH just test-helm
+```
+
+GREEN: `helm lint --strict`, five structurally parsed valid renders, and seven fail-closed render classes. Final output: `helm gate passed: lint plus memory/redis/sidecar/tls/resources and fail-closed cases`.
+
+Final focused runtime/static commands:
+
+```text
+cargo test --locked --test config_contract --test jupyterhub_e2e
+cargo fmt --all -- --check
+timeout 1800 cargo clippy --locked --all-targets --all-features -- -D warnings
+timeout 1200 cargo check --locked --all-targets --all-features
+bash -n scripts/test-container.sh scripts/test-helm.sh scripts/verify.sh helm-chart/01-install.sh
+shellcheck -x scripts/test-container.sh scripts/test-helm.sh scripts/verify.sh helm-chart/01-install.sh
+ruby -e 'require "yaml"; ARGV.each { |path| YAML.parse_file(path) }' .github/workflows/ci.yml .github/workflows/cd.yml
+git diff --check
+```
+
+All passed. Rust counts were 33/33 config-contract tests and 2/2 shipped-binary/JupyterHub artifact tests; the only emitted Rust warning is the accepted vendored Pingora OpenSSL deprecation, which does not evade the project's `-D warnings` checks. ShellCheck returned no diagnostics; both workflows parsed; diff check was empty. Final read-only Docker scans showed zero Task 13 test-owned containers and images.
+
+The complete `scripts/verify.sh` was not claimed green: as assigned to Task 14, it reaches policy gates that intentionally fail on the inherited advisory/license blockers listed above. Task 13 acceptance is the focused image/chart, sidecar runtime, static, syntax, cleanup, and diff set documented here.
