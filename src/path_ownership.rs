@@ -528,7 +528,8 @@ fn posix_acl_xattr_error_is_definitively_absent(error: rustix::io::Errno) -> boo
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn authenticate_directory_acl(directory: &File) -> io::Result<()> {
     for name in ["system.posix_acl_access", "system.posix_acl_default"] {
-        match rustix::fs::fgetxattr(directory, name, Vec::new()) {
+        let mut value = Vec::<u8>::new();
+        match rustix::fs::fgetxattr(directory, name, &mut value) {
             Ok(_) | Err(rustix::io::Errno::RANGE) => {
                 return Err(io::Error::other("boundary directory has a POSIX ACL"));
             }
