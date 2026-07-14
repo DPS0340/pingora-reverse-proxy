@@ -4,12 +4,15 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::{ArgAction, Parser};
 use thiserror::Error;
 use url::{Position, Url};
 
 const CHP_DEFAULT_KEEP_ALIVE_TIMEOUT_MS: u64 = 5000;
+const DEFAULT_REDIS_OPERATION_TIMEOUT_MS: u64 = 2000;
+const DEFAULT_REDIS_ROUTE_KEY: &str = "pingora-reverse-proxy:routes:v1";
 const CHP_5_3_0_DEFAULT_TLS_CIPHERS: &str = "ECDHE-RSA-AES128-GCM-SHA256:\
 ECDHE-ECDSA-AES128-GCM-SHA256:\
 ECDHE-RSA-AES256-GCM-SHA384:\
@@ -235,6 +238,40 @@ pub enum StoreConfig {
     Sidecar,
 }
 
+/// Validated Redis runtime settings. The URL may contain credentials and is
+/// therefore always redacted from debug output.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RedisRuntimeConfig {
+    url: String,
+    route_key: String,
+    operation_timeout: Duration,
+}
+
+impl RedisRuntimeConfig {
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub fn route_key(&self) -> &str {
+        &self.route_key
+    }
+
+    pub fn operation_timeout(&self) -> Duration {
+        self.operation_timeout
+    }
+}
+
+impl fmt::Debug for RedisRuntimeConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RedisRuntimeConfig")
+            .field("url", &"<redacted>")
+            .field("route_key", &self.route_key)
+            .field("operation_timeout", &self.operation_timeout)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
     Debug,
@@ -276,6 +313,7 @@ pub struct AppConfig {
     pub auth_token: Option<String>,
     pub log_level: LogLevel,
     pub store: StoreConfig,
+    pub redis: Option<RedisRuntimeConfig>,
     pub proxy: ProxyOptions,
 }
 
@@ -301,6 +339,7 @@ impl fmt::Debug for AppConfig {
             )
             .field("log_level", &self.log_level)
             .field("store", &self.store)
+            .field("redis", &self.redis)
             .field("proxy", &self.proxy)
             .finish()
     }
@@ -332,6 +371,14 @@ pub enum ConfigError {
     ApiPortOverflow,
     #[error("{0} is unsupported because CHP 5.3.0 does not apply it to upstream TLS connections")]
     UnsupportedClientTlsFlag(&'static str),
+    #[error("--storage-backend redis requires non-empty PINGORA_REDIS_URL")]
+    MissingRedisUrl,
+    #[error("PINGORA_REDIS_URL must be a valid Redis URL")]
+    InvalidRedisUrl,
+    #[error("PINGORA_REDIS_ROUTE_KEY must be non-empty UTF-8 when set")]
+    InvalidRedisRouteKey,
+    #[error("PINGORA_REDIS_OPERATION_TIMEOUT_MS must be a positive integer")]
+    InvalidRedisOperationTimeout,
 }
 
 impl TryFrom<Cli> for AppConfig {
@@ -451,6 +498,7 @@ impl TryFrom<Cli> for AppConfig {
         let error_target = parse_error_target(cli.error_target)?;
         let log_level = parse_log_level(cli.log_level)?;
         let store = parse_store(cli.storage_backend)?;
+        let redis = parse_redis_runtime(store)?;
         let custom_headers = parse_custom_headers(cli.custom_header)?;
 
         Ok(Self {
@@ -469,6 +517,7 @@ impl TryFrom<Cli> for AppConfig {
             auth_token: env_nonempty("CONFIGPROXY_AUTH_TOKEN"),
             log_level,
             store,
+            redis,
             proxy: ProxyOptions {
                 x_forward: cli.x_forward,
                 prepend_path: cli.prepend_path,
@@ -640,6 +689,40 @@ fn parse_store(value: Option<String>) -> Result<StoreConfig, ConfigError> {
             value.unwrap_or_default(),
         )),
     }
+}
+
+fn parse_redis_runtime(store: StoreConfig) -> Result<Option<RedisRuntimeConfig>, ConfigError> {
+    if store != StoreConfig::Redis {
+        return Ok(None);
+    }
+
+    let url = env_nonempty("PINGORA_REDIS_URL").ok_or(ConfigError::MissingRedisUrl)?;
+    if redis::parse_redis_url(&url).is_none() {
+        return Err(ConfigError::InvalidRedisUrl);
+    }
+    let route_key = match env::var("PINGORA_REDIS_ROUTE_KEY") {
+        Ok(value) if !value.is_empty() => value,
+        Ok(_) => return Err(ConfigError::InvalidRedisRouteKey),
+        Err(env::VarError::NotPresent) => DEFAULT_REDIS_ROUTE_KEY.to_owned(),
+        Err(env::VarError::NotUnicode(_)) => return Err(ConfigError::InvalidRedisRouteKey),
+    };
+    let operation_timeout = match env::var("PINGORA_REDIS_OPERATION_TIMEOUT_MS") {
+        Ok(value) => Duration::from_millis(
+            value
+                .parse::<u64>()
+                .ok()
+                .filter(|timeout| *timeout > 0)
+                .ok_or(ConfigError::InvalidRedisOperationTimeout)?,
+        ),
+        Err(env::VarError::NotPresent) => Duration::from_millis(DEFAULT_REDIS_OPERATION_TIMEOUT_MS),
+        Err(env::VarError::NotUnicode(_)) => return Err(ConfigError::InvalidRedisOperationTimeout),
+    };
+
+    Ok(Some(RedisRuntimeConfig {
+        url,
+        route_key,
+        operation_timeout,
+    }))
 }
 
 fn parse_custom_headers(values: Vec<String>) -> Result<BTreeMap<String, String>, ConfigError> {

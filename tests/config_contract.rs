@@ -26,6 +26,17 @@ impl EnvGuard {
         }
         Self { original }
     }
+
+    fn unset(names: &[&'static str]) -> Self {
+        let original = names
+            .iter()
+            .map(|name| (*name, std::env::var_os(name)))
+            .collect();
+        for name in names {
+            std::env::remove_var(name);
+        }
+        Self { original }
+    }
 }
 
 impl Drop for EnvGuard {
@@ -400,7 +411,7 @@ fn proxy_and_process_options_match_chp_surface() {
         "--proxy-timeout",
         "2000",
         "--storage-backend",
-        "redis",
+        "memory",
         "--keep-alive-timeout",
         "3000",
     ]);
@@ -417,7 +428,7 @@ fn proxy_and_process_options_match_chp_surface() {
     assert_eq!(cfg.redirect_to, Some(8443));
     assert_eq!(cfg.pid_file, Some(PathBuf::from("/tmp/proxy.pid")));
     assert_eq!(cfg.log_level, LogLevel::Debug);
-    assert_eq!(cfg.store, StoreConfig::Redis);
+    assert_eq!(cfg.store, StoreConfig::Memory);
     assert!(!cfg.proxy.x_forward);
     assert!(!cfg.proxy.prepend_path);
     assert!(!cfg.proxy.include_prefix);
@@ -623,11 +634,88 @@ fn validation_errors_are_explicit_and_non_panicking() {
 fn supported_storage_backends_are_typed() {
     for (name, expected) in [
         ("memory", StoreConfig::Memory),
-        ("redis", StoreConfig::Redis),
         ("sidecar", StoreConfig::Sidecar),
     ] {
         let cfg = parse_ok(["proxy", "--storage-backend", name]);
         assert_eq!(cfg.store, expected);
+    }
+}
+
+#[test]
+#[serial]
+fn redis_runtime_requires_an_explicit_url() {
+    let _env = EnvGuard::unset(&[
+        "PINGORA_REDIS_URL",
+        "PINGORA_REDIS_ROUTE_KEY",
+        "PINGORA_REDIS_OPERATION_TIMEOUT_MS",
+    ]);
+    let cli = Cli::try_parse_from(["proxy", "--storage-backend", "redis"]).unwrap();
+    let error = AppConfig::try_from(cli).unwrap_err().to_string();
+    assert!(
+        error.contains("PINGORA_REDIS_URL"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+#[serial]
+fn redis_runtime_configuration_is_validated_and_redacted() {
+    const REDIS_URL: &str = "redis://:REDIS_PASSWORD_SENTINEL@redis.example:6379/0";
+    let _env = EnvGuard::set(&[
+        ("PINGORA_REDIS_URL", REDIS_URL),
+        (
+            "PINGORA_REDIS_ROUTE_KEY",
+            "pingora-reverse-proxy:routes:v1:test",
+        ),
+        ("PINGORA_REDIS_OPERATION_TIMEOUT_MS", "2750"),
+    ]);
+
+    let cfg = parse_ok(["proxy", "--storage-backend", "redis"]);
+    assert_eq!(cfg.store, StoreConfig::Redis);
+    let redis = cfg.redis.as_ref().expect("Redis configuration is present");
+    assert_eq!(redis.url(), REDIS_URL);
+    assert_eq!(redis.route_key(), "pingora-reverse-proxy:routes:v1:test");
+    assert_eq!(redis.operation_timeout().as_millis(), 2750);
+    let debug = format!("{cfg:?} {redis:?}");
+    assert!(debug.contains("<redacted>"));
+    assert!(!debug.contains("REDIS_PASSWORD_SENTINEL"));
+}
+
+#[test]
+#[serial]
+fn redis_runtime_rejects_invalid_url_key_and_timeout() {
+    for (values, expected) in [
+        (
+            vec![("PINGORA_REDIS_URL", "https://redis.example")],
+            "PINGORA_REDIS_URL",
+        ),
+        (
+            vec![
+                ("PINGORA_REDIS_URL", "redis://redis.example:6379"),
+                ("PINGORA_REDIS_ROUTE_KEY", ""),
+            ],
+            "PINGORA_REDIS_ROUTE_KEY",
+        ),
+        (
+            vec![
+                ("PINGORA_REDIS_URL", "redis://redis.example:6379"),
+                ("PINGORA_REDIS_OPERATION_TIMEOUT_MS", "0"),
+            ],
+            "PINGORA_REDIS_OPERATION_TIMEOUT_MS",
+        ),
+    ] {
+        let _clear = EnvGuard::unset(&[
+            "PINGORA_REDIS_URL",
+            "PINGORA_REDIS_ROUTE_KEY",
+            "PINGORA_REDIS_OPERATION_TIMEOUT_MS",
+        ]);
+        let _env = EnvGuard::set(&values);
+        let cli = Cli::try_parse_from(["proxy", "--storage-backend", "redis"]).unwrap();
+        let error = AppConfig::try_from(cli).unwrap_err().to_string();
+        assert!(
+            error.contains(expected),
+            "expected {expected:?} in {error:?}"
+        );
     }
 }
 

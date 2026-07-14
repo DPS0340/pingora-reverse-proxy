@@ -28,6 +28,7 @@ CLEANUP_TIMEOUT = 120
 READINESS_TIMEOUT = 45
 HTTP_TIMEOUT = 4
 PROCESS_GRACE = 15
+VERSION_PROBE_TIMEOUT = 120
 LOG_TAIL_BYTES = 64 * 1024
 PINNED_PACKAGES = {
     "ipykernel": "6.30.1",
@@ -169,32 +170,42 @@ def cleanup_docker_run(
             failures.append(str(error))
 
     image = env["JUPYTERHUB_E2E_IMAGE"]
-    inspect = subprocess.run(
-        ["docker", "image", "inspect", image],
-        check=False,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        timeout=30,
-    )
-    if inspect.returncode == 0:
-        removed = subprocess.run(
-            ["docker", "image", "rm", "-f", image],
-            check=False,
-            capture_output=True,
-            timeout=60,
-        )
-        if removed.returncode != 0:
-            failures.append(f"failed to remove run image {image}")
-    if (
-        subprocess.run(
+    try:
+        inspect = subprocess.run(
             ["docker", "image", "inspect", image],
             check=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=30,
-        ).returncode
-        == 0
-    ):
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        failures.append(f"failed to inspect run image {image}: {error}")
+        return failures
+    if inspect.returncode == 0:
+        try:
+            removed = subprocess.run(
+                ["docker", "image", "rm", "-f", image],
+                check=False,
+                capture_output=True,
+                timeout=60,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            failures.append(f"failed to remove run image {image}: {error}")
+            return failures
+        if removed.returncode != 0:
+            failures.append(f"failed to remove run image {image}")
+    try:
+        final_inspect = subprocess.run(
+            ["docker", "image", "inspect", image],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        failures.append(f"failed final run image scan {image}: {error}")
+        return failures
+    if final_inspect.returncode == 0:
         failures.append(f"run image remains: {image}")
     return failures
 
@@ -210,6 +221,9 @@ def supervisor_main() -> int:
         backends = (selection,)
     else:
         raise GateError("STORE_BACKEND must be memory or redis")
+    failure_probe = os.environ.get("JUPYTERHUB_E2E_INJECT_FAILURE")
+    if failure_probe not in {None, "after-redis-ready"}:
+        raise GateError("unsupported JUPYTERHUB_E2E_INJECT_FAILURE value")
 
     project = f"jupyterhub-e2e-{os.getpid()}-{secrets.token_hex(4)}"
     image = f"pingora-jupyterhub-e2e:{project}"
@@ -267,6 +281,8 @@ def supervisor_main() -> int:
                     if time.monotonic() >= deadline:
                         raise GateError("Redis did not become ready within 30s")
                     time.sleep(0.2)
+                if failure_probe == "after-redis-ready":
+                    raise GateError("injected failure after Redis readiness")
             for backend in backends:
                 print(f"=== JupyterHub 5.5.0 E2E backend={backend} ===", flush=True)
                 runner.run(
@@ -385,9 +401,9 @@ def wait_for(description: str, function, timeout: float = READINESS_TIMEOUT):
 
 
 class ScenarioRuntime:
-    def __init__(self, root: Path, helper: Path, backend: str) -> None:
+    def __init__(self, root: Path, proxy_binary: Path, backend: str) -> None:
         self.root = root
-        self.helper = helper
+        self.proxy_binary = proxy_binary
         self.backend = backend
         self.run_id = f"task12-{uuid.uuid4().hex}"
         self.proxy_token = secrets.token_urlsafe(32)
@@ -488,17 +504,27 @@ class ExternalProxy:
             {
                 "CONFIGPROXY_AUTH_TOKEN": self.runtime.proxy_token,
                 "JUPYTERHUB_E2E_RUN_ID": self.runtime.run_id,
-                "JUPYTERHUB_HOST_ROUTING": "1" if self.host_routing else "0",
-                "JUPYTERHUB_PROXY_API_PORT": str(self.api_port),
-                "JUPYTERHUB_PROXY_HELPER": "1",
-                "JUPYTERHUB_PROXY_PORT": str(self.public_port),
-                "JUPYTERHUB_REDIS_ROUTE_KEY": self.route_key,
-                "STORE_BACKEND": self.runtime.backend,
+                "PINGORA_REDIS_ROUTE_KEY": self.route_key,
             }
         )
+        command = [
+            str(self.runtime.proxy_binary),
+            "--ip",
+            "127.0.0.1",
+            "--port",
+            str(self.public_port),
+            "--api-ip",
+            "127.0.0.1",
+            "--api-port",
+            str(self.api_port),
+            "--storage-backend",
+            self.runtime.backend,
+        ]
+        if self.host_routing:
+            command.append("--host-routing")
         self.process = self.runtime.start_process(
             self.name,
-            [str(self.runtime.helper), "--exact", "jupyterhub_proxy_helper", "--nocapture"],
+            command,
             env,
             self.runtime.root,
         )
@@ -715,6 +741,67 @@ def expect_status(response, expected: int | tuple[int, ...], description: str) -
         raise GateError(
             f"{description}: expected {statuses}, got {response.status_code}: {body}"
         )
+
+
+def assert_command_version(
+    command: list[str],
+    expected: str,
+    description: str,
+    *,
+    timeout: float,
+) -> None:
+    """Wait for a potentially cold version probe under one overall deadline."""
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + timeout
+    while process.poll() is None:
+        if time.monotonic() >= deadline:
+            terminate_group(process)
+            raise GateError(f"timed out waiting for {description} version probe")
+        time.sleep(0.05)
+    stdout, stderr = process.communicate()
+    if process.returncode != 0:
+        detail = stderr.strip() or stdout.strip() or f"exit {process.returncode}"
+        raise GateError(f"{description} version probe failed: {detail}")
+    actual = stdout.strip()
+    if actual != expected:
+        raise GateError(f"{description} is {actual!r}, expected {expected!r}")
+
+
+def stable_route_data(route: object) -> dict[str, object] | None:
+    if not isinstance(route, dict):
+        return None
+    return {key: value for key, value in route.items() if key != "last_activity"}
+
+
+def reconcile_missing_route(
+    hub,
+    proxy,
+    route_key: str,
+    expected_data: dict[str, object],
+    *,
+    timeout: float = READINESS_TIMEOUT,
+) -> None:
+    if route_key in proxy.routes():
+        raise GateError(f"reconciliation precondition failed: {route_key!r} is present")
+    reconcile = hub.api("POST", "/proxy")
+    expect_status(reconcile, 200, "Hub proxy reconciliation")
+
+    def exact_route_restored():
+        route = stable_route_data(proxy.routes().get(route_key))
+        return route if route == expected_data else None
+
+    wait_for(
+        f"exact route data for {route_key!r} after reconciliation",
+        exact_route_restored,
+        timeout=timeout,
+    )
 
 
 def create_and_start_users(hub: Hub, proxy: ExternalProxy) -> None:
@@ -954,6 +1041,10 @@ def path_routing_scenarios(runtime: ScenarioRuntime, recorder: Recorder) -> None
         recorder.passed(scenario)
 
     session = sessions["river"]
+    reconciliation_key = "/user/river"
+    reconciliation_data = stable_route_data(proxy.routes().get(reconciliation_key))
+    if reconciliation_data is None:
+        raise GateError("cannot capture the river route before restart")
     recorder.passed("login")
     tree_url = f"{hub.public_url}/user/river/tree"
     single_user_page(session, tree_url)
@@ -982,8 +1073,21 @@ def path_routing_scenarios(runtime: ScenarioRuntime, recorder: Recorder) -> None
         missing = sorted(expected_routes.difference(restarted_routes))
         raise GateError(f"Redis proxy restart did not load persisted routes: {missing}")
     recorder.passed("proxy_restart_backend_state")
-    reconcile = hub.api("POST", "/proxy")
-    expect_status(reconcile, 200, "Hub proxy reconciliation")
+
+    if runtime.backend == "redis":
+        expect_status(
+            proxy.api("DELETE", "/api/routes/user/river"),
+            204,
+            "remove persisted river route before reconciliation",
+        )
+    if reconciliation_key in proxy.routes():
+        raise GateError("selected reconciliation route is still present")
+    reconcile_missing_route(
+        hub,
+        proxy,
+        reconciliation_key,
+        reconciliation_data,
+    )
     wait_for(
         "all routes after reconciliation",
         lambda: expected_routes.issubset(proxy.routes()),
@@ -1055,24 +1159,24 @@ def assert_pinned_runtime(recorder: Recorder) -> None:
         actual = version(package)
         if actual != expected:
             raise GateError(f"{package} is {actual}, expected {expected}")
-    probe = subprocess.run(
+    assert_command_version(
         ["jupyterhub-singleuser", "--version"],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=15,
+        "5.5.0",
+        "single-user entry point",
+        timeout=VERSION_PROBE_TIMEOUT,
     )
-    if probe.stdout.strip() != "5.5.0":
-        raise GateError(f"single-user entry point is {probe.stdout.strip()!r}")
     recorder.passed("pinned_python_runtime")
 
 
-def scenario_main(helper: Path) -> int:
+def scenario_main(proxy_binary: Path) -> int:
     backend = os.environ.get("STORE_BACKEND", "")
     if backend not in {"memory", "redis"}:
         raise GateError("scenario STORE_BACKEND must be memory or redis")
-    if backend == "redis" and not os.environ.get("TEST_REDIS_URL"):
-        raise GateError("Redis scenario requires TEST_REDIS_URL")
+    if backend == "redis" and not os.environ.get("PINGORA_REDIS_URL"):
+        raise GateError("Redis scenario requires PINGORA_REDIS_URL")
+    proxy_binary = proxy_binary.resolve()
+    if not proxy_binary.is_file() or not os.access(proxy_binary, os.X_OK):
+        raise GateError(f"proxy binary is not executable: {proxy_binary}")
     recorder = Recorder()
     assert_pinned_runtime(recorder)
     root_path: Path | None = None
@@ -1080,7 +1184,7 @@ def scenario_main(helper: Path) -> int:
     try:
         with tempfile.TemporaryDirectory(prefix=f"jupyterhub-e2e-{backend}-") as root:
             root_path = Path(root)
-            runtime = ScenarioRuntime(root_path, helper.resolve(), backend)
+            runtime = ScenarioRuntime(root_path, proxy_binary, backend)
             try:
                 path_routing_scenarios(runtime, recorder)
                 host_routing_scenario(runtime, recorder)
@@ -1109,18 +1213,18 @@ def scenario_main(helper: Path) -> int:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--scenario", action="store_true")
-    parser.add_argument("--proxy-helper", type=Path)
+    parser.add_argument("--proxy-binary", type=Path)
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     if args.scenario:
-        if args.proxy_helper is None:
-            raise GateError("--scenario requires --proxy-helper")
-        return scenario_main(args.proxy_helper)
-    if args.proxy_helper is not None:
-        raise GateError("--proxy-helper is valid only with --scenario")
+        if args.proxy_binary is None:
+            raise GateError("--scenario requires --proxy-binary")
+        return scenario_main(args.proxy_binary)
+    if args.proxy_binary is not None:
+        raise GateError("--proxy-binary is valid only with --scenario")
     return supervisor_main()
 
 

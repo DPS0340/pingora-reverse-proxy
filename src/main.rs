@@ -27,6 +27,7 @@ use pingora_reverse_proxy::shutdown::{
     SHUTDOWN_GRACE_PERIOD_SECONDS, TERMINAL_MUTATION_DRAIN_TIMEOUT,
 };
 use pingora_reverse_proxy::store::memory::MemoryStore;
+use pingora_reverse_proxy::store::redis::{RedisStore, RedisStoreConfig};
 use pingora_reverse_proxy::store::{Store, StoreError};
 use thiserror::Error;
 use tracing_subscriber::EnvFilter;
@@ -49,8 +50,10 @@ enum StartupError {
     Runtime(#[source] std::io::Error),
     #[error("failed to initialize Pingora: {0}")]
     Pingora(String),
-    #[error("storage backend {0:?} is not implemented yet")]
+    #[error("storage backend {0:?} is not wired into the executable; sidecar runtime wiring remains fail-closed for Task 13")]
     UnsupportedStore(StoreConfig),
+    #[error("validated Redis runtime configuration is missing")]
+    MissingRedisConfig,
     #[error("redirect listener requires a TCP public listener")]
     InvalidRedirectListener,
     #[error("public listener service failed during startup or execution")]
@@ -79,7 +82,7 @@ fn run() -> Result<(), StartupError> {
     // Crash/logging ownership must be final before the mutation redaction hook.
     install_route_mutation_panic_hook_at_startup();
 
-    if config.store != StoreConfig::Memory {
+    if config.store == StoreConfig::Sidecar {
         return Err(StartupError::UnsupportedStore(config.store));
     }
     ensure_public_startup_supported()?;
@@ -98,7 +101,24 @@ fn run() -> Result<(), StartupError> {
         .enable_all()
         .build()
         .map_err(StartupError::Runtime)?;
-    let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+    let store: Arc<dyn Store> = match config.store {
+        StoreConfig::Memory => Arc::new(MemoryStore::new()),
+        StoreConfig::Redis => {
+            let redis = config
+                .redis
+                .as_ref()
+                .ok_or(StartupError::MissingRedisConfig)?;
+            let store_config = RedisStoreConfig::new(redis.url())
+                .with_key(redis.route_key())
+                .with_operation_timeout(redis.operation_timeout());
+            Arc::new(
+                runtime
+                    .block_on(RedisStore::connect(store_config))
+                    .map_err(StartupError::Store)?,
+            )
+        }
+        StoreConfig::Sidecar => return Err(StartupError::UnsupportedStore(config.store)),
+    };
     let registry = runtime
         .block_on(RouteRegistry::load(store))
         .map_err(StartupError::Store)?;

@@ -8,7 +8,7 @@
 
 A dynamic HTTP and WebSocket reverse proxy built with [Pingora](https://github.com/cloudflare/pingora). It implements the route-management API and routing behavior expected by JupyterHub's [Configurable HTTP Proxy (CHP) 5.3.0](https://github.com/jupyterhub/configurable-http-proxy/tree/5.3.0), without requiring Node.js in the proxy process.
 
-> **Project status:** the CHP-compatible runtime, in-memory route store, management API, TLS listeners, metrics, graceful shutdown, differential oracle, and JupyterHub 5.5 external-proxy flow are implemented and tested. Redis and sidecar store implementations exist behind contracts, but the executable currently starts only with `--storage-backend memory`. The checked-in Dockerfile and Helm chart are still being hardened for release; build from source for the current implementation.
+> **Project status:** the CHP-compatible runtime, memory and Redis route stores, management API, TLS listeners, metrics, graceful shutdown, differential oracle, and JupyterHub 5.5 external-proxy flow are implemented and tested. The sidecar store implementation exists behind contracts but remains fail-closed in the executable. The checked-in Dockerfile and Helm chart are still being hardened for release; build from source for the current implementation.
 
 ## Why this project?
 
@@ -37,7 +37,7 @@ JupyterHub / operator ------------>| Axum management API  |--+
                                    | /api/routes          |  |
                                    +----------------------+  |
                                                               v
-Client ---> Pingora public proxy ---> RouteRegistry ---> in-memory store
+Client ---> Pingora public proxy ---> RouteRegistry ---> memory or Redis store
                   |                       |
                   |                       +---- activity tracking
                   v
@@ -210,7 +210,7 @@ Common options:
 | `--log-level` | `debug`, `info`, `warn`, or `error` | `info` |
 | `--storage-backend` | `memory`, `redis`, or `sidecar` | `memory` |
 
-The parser accepts `redis` and `sidecar` so their contracts can be exercised, but the current executable fails closed at startup for either value. Use `memory` until runtime wiring is released.
+Redis runtime selection requires `PINGORA_REDIS_URL`. Optional `PINGORA_REDIS_ROUTE_KEY` and `PINGORA_REDIS_OPERATION_TIMEOUT_MS` values select the hash key and positive operation deadline. Sidecar selection remains fail-closed until its runtime configuration is wired in Task 13.
 
 ### Environment variables
 
@@ -219,6 +219,9 @@ The parser accepts `redis` and `sidecar` so their contracts can be exercised, bu
 | `CONFIGPROXY_AUTH_TOKEN` | Management API token. |
 | `CONFIGPROXY_SSL_KEY_PASSPHRASE` | Passphrase for the public-listener private key. |
 | `CONFIGPROXY_API_SSL_KEY_PASSPHRASE` | Passphrase for the management-listener private key. |
+| `PINGORA_REDIS_URL` | Redis connection URL; required for `--storage-backend redis` and redacted from debug output. |
+| `PINGORA_REDIS_ROUTE_KEY` | Redis hash key; defaults to `pingora-reverse-proxy:routes:v1`. |
+| `PINGORA_REDIS_OPERATION_TIMEOUT_MS` | Positive Redis operation timeout; defaults to `2000`. |
 
 ## TLS and Unix sockets
 
@@ -249,8 +252,8 @@ Keep metrics on a private listener unless an authenticated monitoring layer prot
 | Backend | Contract implementation | Executable runtime | Persistence |
 | --- | --- | --- | --- |
 | Memory | yes | supported | process-local only |
-| Redis | yes | not wired yet | backend implementation is tested |
-| Sidecar | protocol implementation present | not wired yet | depends on sidecar |
+| Redis | yes | supported with explicit environment configuration | persistent Redis hash |
+| Sidecar | protocol implementation present | fail-closed until Task 13 | depends on sidecar |
 
 The route registry uses fail-stop semantics when a remote mutation outcome is indeterminate. It does not guess whether a timed-out writer committed a change.
 
@@ -297,7 +300,7 @@ Do not assume the current chart supplies readiness probes, hardened security con
 This project targets observed CHP 5.3.0 behavior rather than every historical Node.js extension point.
 
 - arbitrary CHP storage modules cannot be loaded into the Rust process;
-- Redis and sidecar runtime selection is not yet enabled;
+- Redis runtime selection requires explicit validated environment configuration; sidecar runtime selection remains fail-closed until Task 13;
 - deprecated RC4 enablement is intentionally rejected;
 - `--client-ssl-request-cert` and `--client-ssl-reject-unauthorized` are rejected because CHP does not apply them to upstream TLS in the targeted contract;
 - deployment assets are not yet the release authority.

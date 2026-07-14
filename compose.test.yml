@@ -105,15 +105,18 @@ services:
         RUN --mount=type=cache,id=pingora-jupyterhub-e2e-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
             --mount=type=cache,id=pingora-jupyterhub-e2e-cargo-git,target=/usr/local/cargo/git,sharing=locked \
             --mount=type=cache,id=pingora-jupyterhub-e2e-target,target=/workspace/target,sharing=locked \
-            cargo test --locked --test jupyterhub_e2e --no-run \
-                --message-format=json-render-diagnostics > /tmp/cargo-messages.json \
-            && test_binary="$$(python3 -c 'import json, sys; paths = [message["executable"] for line in sys.stdin if (message := json.loads(line)).get("reason") == "compiler-artifact" and message["target"]["name"] == "jupyterhub_e2e" and message.get("executable")]; assert len(paths) == 1, paths; print(paths[0])' < /tmp/cargo-messages.json)" \
-            && install -m 0755 "$$test_binary" /usr/local/bin/jupyterhub-e2e-test \
-            && rm /tmp/cargo-messages.json \
+            cargo build --locked \
+            && install -m 0755 /workspace/target/debug/pingora-reverse-proxy /usr/local/bin/pingora-reverse-proxy \
+            && cargo test --locked --lib path_ownership::tests::posix_acl_probe_accepts_a_directory_without_extended_acls -- --exact \
+            && python3 scripts/test_jupyterhub_e2e.py -v \
             && python3 -m pip check
     init: true
     environment:
-      JUPYTERHUB_E2E_RUN: "1"
       STORE_BACKEND: "${STORE_BACKEND:-memory}"
-      TEST_REDIS_URL: "redis://redis:6379"
-    command: ["/usr/local/bin/jupyterhub-e2e-test", "--nocapture"]
+      PINGORA_REDIS_URL: "redis://redis:6379"
+    command:
+      - "python3"
+      - "scripts/jupyterhub-e2e.py"
+      - "--scenario"
+      - "--proxy-binary"
+      - "/usr/local/bin/pingora-reverse-proxy"

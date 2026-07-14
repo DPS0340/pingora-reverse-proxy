@@ -1409,6 +1409,16 @@ mod tests {
         ));
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn posix_acl_probe_accepts_a_directory_without_extended_acls() {
+        let root = tempfile::tempdir().expect("temporary ACL probe directory");
+        let directory = fs::File::open(root.path()).expect("open ACL probe directory");
+
+        super::authenticate_directory_acl(&directory)
+            .expect("a fresh private directory has no POSIX ACL xattrs");
+    }
+
     #[cfg(unix)]
     #[test]
     fn unsafe_canonical_ancestor_is_rejected_before_staging() {
