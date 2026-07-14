@@ -22,7 +22,7 @@ Closure commits, in order:
 - `4800d766fabdf387297af9a79c9d777b840faba5` — review-closure evidence update.
 - `6e7022c11870e88c3bdd9f23c544e0755e38c81b` — closure-report commit identity binding.
 - `f1111e1e602c6b355f2155f69d12c0019a8380e5` — avoid a redundant post-KILL process-group signal.
-- `WORKFLOW_SCHEMA_CLOSURE_COMMIT_TO_BE_FILLED` — final workflow-schema validation and focused release regression.
+- `6afeb5a9e37b97d0e75900c28b3efa5d303db202` — final workflow-schema validation and focused release regression.
 
 ### Workflow-schema closure RED and GREEN
 
