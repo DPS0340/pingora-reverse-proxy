@@ -69,6 +69,40 @@ test result: ok. 1 passed; 0 failed
 
 Helm now sets the non-CHP internal `PINGORA_REQUIRE_AUTH_TOKEN=true` policy, while raw CHP-compatible CLI behavior remains optional-auth by default. Public/API strict client rejection requires request mode and a non-empty CA in both chart validation and direct runtime parsing. The chart requires exactly one replica, uses `Recreate`, supports digest-pinned images, and models upstream private-CA trust independently from optional client identity.
 
+### Verifier and container-script RED evidence
+
+Focused process-tree and container-boundary regressions were added before their helpers. Their old-code RED results were:
+
+```text
+./scripts/test-verify.sh
+.../python: can't open file '.../scripts/run-bounded.py': [Errno 2] No such file or directory
+exit 1
+
+./scripts/test-container-script.sh
+./scripts/test-container-script.sh: line 10: .../scripts/build-container-context.sh: No such file or directory
+exit 127
+```
+
+The verifier regression creates a nested child that retains the log pipe, asserts TERM-triggered resource cleanup, exercises a TERM-ignoring KILL fallback with an elapsed bound, verifies ordinary exit-code propagation and log capture, and locks the nine canonical phases in order. The container regression places an untracked 0600 secret sentinel under `src/`, inspects the constructed context, and injects container/image scan and removal failures through an exact fake-Docker command log.
+
+Verifier/container-script GREEN:
+
+```text
+./scripts/test-verify.sh
+...
+verify process-tree gate passed: TERM cleanup, KILL bound, logs, status, and nine-phase order
+
+./scripts/test-container-script.sh
+...
+container script gate passed: allowlisted context sentinel and fail-closed exact cleanup
+
+bash -n scripts/test-container.sh scripts/test-container-script.sh scripts/test-verify.sh scripts/build-container-context.sh scripts/cleanup-container-resources.sh scripts/verify.sh
+shellcheck -x scripts/test-container.sh scripts/test-container-script.sh scripts/test-verify.sh scripts/build-container-context.sh scripts/cleanup-container-resources.sh scripts/verify.sh
+python3 -m py_compile scripts/run-bounded.py
+```
+
+All exited zero; ShellCheck 0.11.0 emitted no diagnostics. The bounded runner creates a dedicated process session, streams combined output itself, sends TERM to the entire group at the phase deadline, waits 15 seconds for repository cleanup traps, and then sends KILL to the group. The container context is made only from tracked Dockerfile/build inputs, and `.dockerignore` independently defaults to excluding everything. Cleanup treats every Docker scan/removal error as a gate failure and verifies the exact owner label after removal.
+
 ## Scope and ownership
 
 Task 13 owns the production image/chart/release gates and the deployable closure of Task 12's intentionally fail-closed `sidecar` executable selection. Production Rust changes are limited to `src/config.rs` and `src/main.rs`: validated sidecar endpoint/token/deadlines are converted to `SidecarConfig`, `SidecarStore::connect` runs, and `RouteRegistry::load` completes before listener binding. Memory and Redis construction remain unchanged. Focused config and shipped-binary runtime tests cover this boundary.

@@ -19,6 +19,12 @@ test-jupyterhub:
 test-container:
     ./scripts/test-container.sh
 
+test-container-script:
+    ./scripts/test-container-script.sh
+
+test-verify:
+    ./scripts/test-verify.sh
+
 test-helm:
     ./scripts/test-helm.sh
 

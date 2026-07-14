@@ -26,6 +26,7 @@ require() {
 for tool in cargo rustc just docker helm; do
   require "${tool}"
 done
+require python3
 "${TIMEOUT}" 15s cargo audit --version >/dev/null 2>&1 || {
   echo "verify: cargo-audit is required" >&2
   exit 1
@@ -50,7 +51,11 @@ run_phase() {
   shift 2
   local log="${LOG_DIR}/${phase}.log"
   echo "verify: phase ${phase}"
-  "${TIMEOUT}" --foreground "${limit}" "$@" 2>&1 | tee "${log}"
+  python3 "${ROOT_DIR}/scripts/run-bounded.py" \
+    --timeout "${limit}" \
+    --kill-after 15s \
+    --log "${log}" \
+    -- "$@"
 }
 
 # Release-gate order is contractual. Do not reorder these phases.

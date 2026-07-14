@@ -3,6 +3,7 @@ set -euo pipefail
 
 TIMEOUT_BIN=${TIMEOUT_BIN:-timeout}
 BUILD_TIMEOUT=${CONTAINER_BUILD_TIMEOUT_SECONDS:-1800}
+ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 RUN_ID="task13-container-$(date +%s)-$$"
 IMAGE="pingora-reverse-proxy:${RUN_ID}"
 CONTAINER="${RUN_ID}"
@@ -12,7 +13,31 @@ TMP_CONTAINER="${RUN_ID}-tmp"
 OWNER_LABEL="io.pingora-reverse-proxy.test-owner=${RUN_ID}"
 TOKEN="task13-container-token-${RUN_ID}"
 TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/pingora-container-test.XXXXXX")
+SENTINEL="$ROOT_DIR/src/task13-untracked-secret-sentinel-${RUN_ID}.pem"
 INJECT_FAILURE=${CONTAINER_GATE_INJECT_FAILURE:-}
+CLEANUP_ENABLED=0
+
+cleanup() {
+  local primary_status=$?
+  local cleanup_status=0
+  trap - EXIT
+
+  if (( CLEANUP_ENABLED )); then
+    "$ROOT_DIR/scripts/cleanup-container-resources.sh" \
+      "$TIMEOUT_BIN" "$OWNER_LABEL" "$IMAGE" \
+      "$CONTAINER" "$UID_CONTAINER" "$GID_CONTAINER" "$TMP_CONTAINER" || cleanup_status=1
+  fi
+  rm -f "$SENTINEL"
+  rm -rf "$TMP_DIR"
+
+  if (( primary_status != 0 )); then
+    exit "$primary_status"
+  fi
+  exit "$cleanup_status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 if [[ -n "$INJECT_FAILURE" && "$INJECT_FAILURE" != "after-start" ]]; then
   printf 'unsupported CONTAINER_GATE_INJECT_FAILURE: %s\n' "$INJECT_FAILURE" >&2
@@ -26,42 +51,26 @@ require_command() {
   }
 }
 
-cleanup() {
-  local primary_status=$?
-  local cleanup_status=0
-  trap - EXIT INT TERM
-
-  "$TIMEOUT_BIN" 30 docker rm -f \
-    "$CONTAINER" "$UID_CONTAINER" "$GID_CONTAINER" "$TMP_CONTAINER" \
-    >/dev/null 2>&1 || true
-  if "$TIMEOUT_BIN" 30 docker ps -aq --filter "label=${OWNER_LABEL}" | grep -q .; then
-    printf 'owned containers remained after cleanup: %s\n' "$RUN_ID" >&2
-    cleanup_status=1
-  fi
-  "$TIMEOUT_BIN" 60 docker image rm -f "$IMAGE" >/dev/null 2>&1 || true
-  if "$TIMEOUT_BIN" 30 docker image inspect "$IMAGE" >/dev/null 2>&1; then
-    printf 'owned image remained after cleanup: %s\n' "$IMAGE" >&2
-    cleanup_status=1
-  fi
-  rm -rf "$TMP_DIR"
-
-  if (( primary_status != 0 || cleanup_status != 0 )); then
-    exit 1
-  fi
-}
-trap cleanup EXIT INT TERM
-
 require_command docker
 require_command curl
 require_command tar
 require_command "$TIMEOUT_BIN"
+require_command git
+CLEANUP_ENABLED=1
+cd "$ROOT_DIR"
 
-tar --exclude .git --exclude target -cf - . | \
-  "$TIMEOUT_BIN" "$BUILD_TIMEOUT" docker build \
+install -m 0600 /dev/null "$SENTINEL"
+"$ROOT_DIR/scripts/build-container-context.sh" "$TMP_DIR/context.tar"
+if tar -tf "$TMP_DIR/context.tar" | grep -Fq "${SENTINEL#"$ROOT_DIR/"}"; then
+  echo "untracked secret sentinel entered the container build context" >&2
+  exit 1
+fi
+
+"$TIMEOUT_BIN" "$BUILD_TIMEOUT" docker build \
     --pull \
     --label "$OWNER_LABEL" \
     --tag "$IMAGE" \
-    -
+    - <"$TMP_DIR/context.tar"
 
 test "$("$TIMEOUT_BIN" 30 docker image inspect --format '{{.Config.User}}' "$IMAGE")" = "65532:65532"
 test "$("$TIMEOUT_BIN" 30 docker image inspect --format '{{json .Config.Entrypoint}}' "$IMAGE")" = '["/usr/local/bin/pingora-reverse-proxy"]'
