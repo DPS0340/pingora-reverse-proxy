@@ -4,6 +4,7 @@ image:
   repository: ghcr.io/dps0340/pingora-reverse-proxy
   pullPolicy: IfNotPresent
   tag: "0.2.0"
+  digest: ""
 
 imagePullSecrets: []
 nameOverride: ""
@@ -83,10 +84,13 @@ tls:
     requestCert: false
     rejectUnauthorized: false
   client:
-    existingSecret: ""
-    certKey: tls.crt
-    keyKey: tls.key
-    caKey: ""
+    ca:
+      existingSecret: ""
+      key: ca.crt
+    identity:
+      existingSecret: ""
+      certKey: tls.crt
+      keyKey: tls.key
 
 probes:
   enabled: true

@@ -8,11 +8,25 @@ Expand the name of the chart.
 {{/* Fail closed for deployment combinations that cannot satisfy the runtime contract. */}}
 {{- define "pingora-reverse-proxy.validate" -}}
 {{- $backend := .Values.storage.backend -}}
+{{- if ne (int .Values.replicaCount) 1 -}}
+{{- fail "replicaCount must be exactly 1 until cross-process route propagation is implemented" -}}
+{{- end -}}
 {{- if not (has $backend (list "memory" "redis" "sidecar")) -}}
 {{- fail "storage.backend must be one of memory, redis, or sidecar" -}}
 {{- end -}}
 {{- $_ := required "auth.existingSecret is required" .Values.auth.existingSecret -}}
 {{- $_ := required "auth.tokenKey is required" .Values.auth.tokenKey -}}
+{{- $hasTag := not (empty .Values.image.tag) -}}
+{{- $hasDigest := not (empty .Values.image.digest) -}}
+{{- if and $hasTag $hasDigest -}}
+{{- fail "image.tag and image.digest are mutually exclusive" -}}
+{{- end -}}
+{{- if not (or $hasTag $hasDigest) -}}
+{{- fail "exactly one of image.tag or image.digest must be set" -}}
+{{- end -}}
+{{- if and $hasDigest (not (regexMatch "^sha256:[0-9a-f]{64}$" .Values.image.digest)) -}}
+{{- fail "image.digest must match sha256 followed by 64 lowercase hexadecimal characters" -}}
+{{- end -}}
 {{- if eq $backend "redis" -}}
 {{- $_ := required "redis.auth.existingSecret is required for Redis storage" .Values.redis.auth.existingSecret -}}
 {{- $_ := required "redis.auth.urlKey is required for Redis storage" .Values.redis.auth.urlKey -}}
@@ -37,6 +51,18 @@ Expand the name of the chart.
 {{- if and (or .Values.tls.api.clientCAKey .Values.tls.api.passphraseKey .Values.tls.api.requestCert .Values.tls.api.rejectUnauthorized) (not .Values.tls.api.existingSecret) -}}
 {{- fail "tls.api.existingSecret is required when API TLS options are set" -}}
 {{- end -}}
+{{- if and .Values.tls.public.existingSecret (or (empty .Values.tls.public.certKey) (empty .Values.tls.public.keyKey)) -}}
+{{- fail "tls.public.certKey and tls.public.keyKey must be non-empty when TLS is enabled" -}}
+{{- end -}}
+{{- if and .Values.tls.api.existingSecret (or (empty .Values.tls.api.certKey) (empty .Values.tls.api.keyKey)) -}}
+{{- fail "tls.api.certKey and tls.api.keyKey must be non-empty when TLS is enabled" -}}
+{{- end -}}
+{{- if and .Values.tls.public.rejectUnauthorized (or (not .Values.tls.public.requestCert) (empty .Values.tls.public.clientCAKey)) -}}
+{{- fail "tls.public.rejectUnauthorized requires requestCert=true and a non-empty clientCAKey" -}}
+{{- end -}}
+{{- if and .Values.tls.api.rejectUnauthorized (or (not .Values.tls.api.requestCert) (empty .Values.tls.api.clientCAKey)) -}}
+{{- fail "tls.api.rejectUnauthorized requires requestCert=true and a non-empty clientCAKey" -}}
+{{- end -}}
 {{- if and .Values.probes.enabled .Values.tls.public.rejectUnauthorized -}}
 {{- fail "probes.enabled must be false when public TLS requires a client certificate" -}}
 {{- end -}}
@@ -45,6 +71,12 @@ Expand the name of the chart.
 {{- end -}}
 {{- if and .Values.tls.api.requestCert (not .Values.tls.api.clientCAKey) -}}
 {{- fail "tls.api.clientCAKey is required when API client certificates are requested" -}}
+{{- end -}}
+{{- if and .Values.tls.client.ca.existingSecret (empty .Values.tls.client.ca.key) -}}
+{{- fail "tls.client.ca.key must be non-empty when upstream CA trust is enabled" -}}
+{{- end -}}
+{{- if and .Values.tls.client.identity.existingSecret (or (empty .Values.tls.client.identity.certKey) (empty .Values.tls.client.identity.keyKey)) -}}
+{{- fail "tls.client.identity.certKey and keyKey must be non-empty when client identity is enabled" -}}
 {{- end -}}
 {{- end -}}
 

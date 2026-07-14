@@ -433,6 +433,16 @@ pub enum ConfigError {
     InvalidSidecarConnectTimeout,
     #[error("PINGORA_SIDECAR_REQUEST_TIMEOUT_MS must be a positive integer")]
     InvalidSidecarRequestTimeout,
+    #[error("{reject_flag} requires {request_flag} and {ca_flag}")]
+    InvalidListenerTlsPolicy {
+        reject_flag: &'static str,
+        request_flag: &'static str,
+        ca_flag: &'static str,
+    },
+    #[error("PINGORA_REQUIRE_AUTH_TOKEN must be true or false")]
+    InvalidRequiredAuthPolicy,
+    #[error("required management authentication token is missing or empty")]
+    MissingRequiredAuthToken,
 }
 
 impl TryFrom<Cli> for AppConfig {
@@ -466,6 +476,22 @@ impl TryFrom<Cli> for AppConfig {
             &cli.client_ssl_key,
             &cli.client_ssl_cert,
             "--client-ssl-key and --client-ssl-cert",
+        )?;
+        validate_listener_tls_policy(
+            cli.ssl_reject_unauthorized,
+            cli.ssl_request_cert,
+            cli.ssl_ca.as_ref(),
+            "--ssl-reject-unauthorized",
+            "--ssl-request-cert",
+            "--ssl-ca",
+        )?;
+        validate_listener_tls_policy(
+            cli.api_ssl_reject_unauthorized,
+            cli.api_ssl_request_cert,
+            cli.api_ssl_ca.as_ref(),
+            "--api-ssl-reject-unauthorized",
+            "--api-ssl-request-cert",
+            "--api-ssl-ca",
         )?;
 
         let redirect_port = nonzero_port(cli.redirect_port);
@@ -555,6 +581,11 @@ impl TryFrom<Cli> for AppConfig {
         let redis = parse_redis_runtime(store)?;
         let sidecar = parse_sidecar_runtime(store)?;
         let custom_headers = parse_custom_headers(cli.custom_header)?;
+        let auth_token = env_nonempty("CONFIGPROXY_AUTH_TOKEN");
+        let require_auth_token = parse_required_auth_policy()?;
+        if require_auth_token && auth_token.is_none() {
+            return Err(ConfigError::MissingRequiredAuthToken);
+        }
 
         Ok(Self {
             public_listener,
@@ -569,7 +600,7 @@ impl TryFrom<Cli> for AppConfig {
             redirect_port,
             redirect_to,
             pid_file: cli.pid_file,
-            auth_token: env_nonempty("CONFIGPROXY_AUTH_TOKEN"),
+            auth_token,
             log_level,
             store,
             redis,
@@ -593,6 +624,33 @@ impl TryFrom<Cli> for AppConfig {
                 ),
             },
         })
+    }
+}
+
+fn validate_listener_tls_policy(
+    reject_unauthorized: bool,
+    request_cert: bool,
+    ca: Option<&PathBuf>,
+    reject_flag: &'static str,
+    request_flag: &'static str,
+    ca_flag: &'static str,
+) -> Result<(), ConfigError> {
+    if reject_unauthorized && (!request_cert || ca.is_none_or(|path| path.as_os_str().is_empty())) {
+        return Err(ConfigError::InvalidListenerTlsPolicy {
+            reject_flag,
+            request_flag,
+            ca_flag,
+        });
+    }
+    Ok(())
+}
+
+fn parse_required_auth_policy() -> Result<bool, ConfigError> {
+    match env::var_os("PINGORA_REQUIRE_AUTH_TOKEN") {
+        None => Ok(false),
+        Some(value) if value == "true" => Ok(true),
+        Some(value) if value == "false" => Ok(false),
+        Some(_) => Err(ConfigError::InvalidRequiredAuthPolicy),
     }
 }
 

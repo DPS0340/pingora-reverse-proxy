@@ -4,6 +4,71 @@ Date: 2026-07-14 (Asia/Seoul)
 
 Accepted parent: `e34a13ffb72b21194bb8b7166dd3912c5497ca90`
 
+## Independent review closure (2026-07-15)
+
+Closure starts from the original Task 13 commit `122d0a24ae16f072d007aff85bd6d0ebd62bc962`. The independent specification and security/operations reports were reconciled against the frozen review package and current source. Every High, Medium, and Low finding was reproduced or confirmed by direct source inspection; none was dismissed as false. Exact closure commit SHAs and final GREEN evidence are recorded below after those commits exist.
+
+### Runtime and Helm RED evidence
+
+The smallest runtime and chart regressions were added before implementation. On the original implementation, this command failed as follows:
+
+```text
+cargo test --locked --test config_contract --test jupyterhub_e2e
+...
+running 35 tests
+test listener_rejection_requires_certificate_request_and_ca ... FAILED
+test internal_required_auth_policy_rejects_missing_empty_and_invalid_values ... FAILED
+...
+test result: FAILED. 33 passed; 2 failed
+```
+
+Both failures were real `unwrap_err()` failures on accepted `AppConfig` values: listener rejection was accepted without request/CA, and `PINGORA_REQUIRE_AUTH_TOKEN=true` with no token was ignored.
+
+The bounded shipped-binary regression independently failed:
+
+```text
+cargo test --locked --test jupyterhub_e2e shipped_binary_required_auth_policy_fails_before_listener_binding -- --exact
+...
+binary did not reject the empty required auth token
+test result: FAILED. 0 passed; 1 failed
+```
+
+An initial version of that regression used `Command::output` and correctly exposed that the old binary kept running, but the test itself had no bound. It was terminated, its exact three owned processes were removed, and the regression was corrected to use a three-second poll plus `ChildGuard` before the quoted RED run. That interrupted harness attempt is not claimed as RED evidence.
+
+The expanded chart matrix failed immediately on the old Deployment:
+
+```text
+just test-helm
+...
+scripts/assert-helm.rb:10:in `assert': deployment strategy must be Recreate (RuntimeError)
+error: recipe `test-helm` failed on line 23 with exit code 1
+```
+
+Runtime/Helm GREEN:
+
+```text
+cargo test --locked --test config_contract --test jupyterhub_e2e
+...
+test result: ok. 35 passed; 0 failed
+test result: ok. 3 passed; 0 failed
+
+just test-helm
+...
+helm gate passed: exact single-replica/Recreate storage, TLS, digest, upgrade, and fail-closed matrix
+```
+
+The existing real TLS behavioral tests were rerun because they already exercise the review's requested handshake matrix:
+
+```text
+cargo test --locked --test tls_unix_contract strict_client_certificates_reject_absent_and_untrusted_but_accept_trusted_everywhere -- --exact
+test result: ok. 1 passed; 0 failed
+
+cargo test --locked --test tls_unix_contract optional_client_certificates_accept_absent_untrusted_and_trusted_for_public_and_api -- --exact
+test result: ok. 1 passed; 0 failed
+```
+
+Helm now sets the non-CHP internal `PINGORA_REQUIRE_AUTH_TOKEN=true` policy, while raw CHP-compatible CLI behavior remains optional-auth by default. Public/API strict client rejection requires request mode and a non-empty CA in both chart validation and direct runtime parsing. The chart requires exactly one replica, uses `Recreate`, supports digest-pinned images, and models upstream private-CA trust independently from optional client identity.
+
 ## Scope and ownership
 
 Task 13 owns the production image/chart/release gates and the deployable closure of Task 12's intentionally fail-closed `sidecar` executable selection. Production Rust changes are limited to `src/config.rs` and `src/main.rs`: validated sidecar endpoint/token/deadlines are converted to `SidecarConfig`, `SidecarStore::connect` runs, and `RouteRegistry::load` completes before listener binding. Memory and Redis construction remain unchanged. Focused config and shipped-binary runtime tests cover this boundary.

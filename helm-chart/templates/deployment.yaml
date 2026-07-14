@@ -7,6 +7,8 @@ metadata:
     {{- include "pingora-reverse-proxy.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "pingora-reverse-proxy.selectorLabels" . | nindent 6 }}
@@ -33,7 +35,7 @@ spec:
       {{- end }}
       containers:
         - name: proxy
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: {{ if .Values.image.digest }}"{{ .Values.image.repository }}@{{ .Values.image.digest }}"{{ else }}"{{ .Values.image.repository }}:{{ .Values.image.tag }}"{{ end }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
@@ -84,15 +86,15 @@ spec:
             - --api-ssl-reject-unauthorized
             {{- end }}
             {{- end }}
-            {{- with .Values.tls.client.existingSecret }}
+            {{- with .Values.tls.client.identity.existingSecret }}
             - --client-ssl-key
-            - /run/tls/client/{{ $.Values.tls.client.keyKey }}
+            - /run/tls/client-identity/{{ $.Values.tls.client.identity.keyKey }}
             - --client-ssl-cert
-            - /run/tls/client/{{ $.Values.tls.client.certKey }}
-            {{- with $.Values.tls.client.caKey }}
-            - --client-ssl-ca
-            - /run/tls/client/{{ . }}
+            - /run/tls/client-identity/{{ $.Values.tls.client.identity.certKey }}
             {{- end }}
+            {{- with .Values.tls.client.ca.existingSecret }}
+            - --client-ssl-ca
+            - /run/tls/client-ca/{{ $.Values.tls.client.ca.key }}
             {{- end }}
           env:
             - name: CONFIGPROXY_AUTH_TOKEN
@@ -100,6 +102,8 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.auth.existingSecret | quote }}
                   key: {{ .Values.auth.tokenKey | quote }}
+            - name: PINGORA_REQUIRE_AUTH_TOKEN
+              value: "true"
             {{- if eq .Values.storage.backend "redis" }}
             - name: PINGORA_REDIS_URL
               valueFrom:
@@ -189,9 +193,14 @@ spec:
               mountPath: /run/tls/api
               readOnly: true
             {{- end }}
-            {{- with .Values.tls.client.existingSecret }}
-            - name: tls-client
-              mountPath: /run/tls/client
+            {{- with .Values.tls.client.identity.existingSecret }}
+            - name: tls-client-identity
+              mountPath: /run/tls/client-identity
+              readOnly: true
+            {{- end }}
+            {{- with .Values.tls.client.ca.existingSecret }}
+            - name: tls-client-ca
+              mountPath: /run/tls/client-ca
               readOnly: true
             {{- end }}
       volumes:
@@ -209,8 +218,13 @@ spec:
           secret:
             secretName: {{ . | quote }}
         {{- end }}
-        {{- with .Values.tls.client.existingSecret }}
-        - name: tls-client
+        {{- with .Values.tls.client.identity.existingSecret }}
+        - name: tls-client-identity
+          secret:
+            secretName: {{ . | quote }}
+        {{- end }}
+        {{- with .Values.tls.client.ca.existingSecret }}
+        - name: tls-client-ca
           secret:
             secretName: {{ . | quote }}
         {{- end }}

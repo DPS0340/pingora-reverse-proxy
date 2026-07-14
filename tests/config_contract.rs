@@ -307,6 +307,38 @@ fn all_supported_tls_options_are_preserved() {
 }
 
 #[test]
+fn listener_rejection_requires_certificate_request_and_ca() {
+    for (args, expected) in [
+        (
+            vec![
+                "proxy",
+                "--ssl-key",
+                "public.key",
+                "--ssl-cert",
+                "public.crt",
+                "--ssl-reject-unauthorized",
+            ],
+            "--ssl-reject-unauthorized requires --ssl-request-cert and --ssl-ca",
+        ),
+        (
+            vec![
+                "proxy",
+                "--api-ssl-key",
+                "api.key",
+                "--api-ssl-cert",
+                "api.crt",
+                "--api-ssl-request-cert",
+                "--api-ssl-reject-unauthorized",
+            ],
+            "--api-ssl-reject-unauthorized requires --api-ssl-request-cert and --api-ssl-ca",
+        ),
+    ] {
+        let cli = Cli::try_parse_from(args).expect("listener TLS flags parse");
+        assert_eq!(AppConfig::try_from(cli).unwrap_err().to_string(), expected);
+    }
+}
+
+#[test]
 fn client_certificate_request_flags_are_rejected_instead_of_ignored() {
     for flag in [
         "--client-ssl-request-cert",
@@ -848,6 +880,46 @@ fn chp_environment_variables_are_consumed() {
         cfg.api_tls.unwrap().key_passphrase.as_deref(),
         Some("api-passphrase")
     );
+}
+
+#[test]
+#[serial]
+fn internal_required_auth_policy_rejects_missing_empty_and_invalid_values() {
+    for (policy, token, expected) in [
+        (
+            Some("true"),
+            None,
+            "required management authentication token is missing or empty",
+        ),
+        (
+            Some("true"),
+            Some(""),
+            "required management authentication token is missing or empty",
+        ),
+        (
+            Some("sometimes"),
+            Some("token"),
+            "PINGORA_REQUIRE_AUTH_TOKEN must be true or false",
+        ),
+    ] {
+        let _clear = EnvGuard::unset(&["PINGORA_REQUIRE_AUTH_TOKEN", "CONFIGPROXY_AUTH_TOKEN"]);
+        let mut values = Vec::new();
+        if let Some(policy) = policy {
+            values.push(("PINGORA_REQUIRE_AUTH_TOKEN", policy));
+        }
+        if let Some(token) = token {
+            values.push(("CONFIGPROXY_AUTH_TOKEN", token));
+        }
+        let _env = EnvGuard::set(&values);
+        let cli = Cli::try_parse_from(["proxy"]).unwrap();
+        assert_eq!(AppConfig::try_from(cli).unwrap_err().to_string(), expected);
+    }
+
+    let _env = EnvGuard::set(&[
+        ("PINGORA_REQUIRE_AUTH_TOKEN", "true"),
+        ("CONFIGPROXY_AUTH_TOKEN", "token"),
+    ]);
+    assert_eq!(parse_ok(["proxy"]).auth_token.as_deref(), Some("token"));
 }
 
 #[test]
