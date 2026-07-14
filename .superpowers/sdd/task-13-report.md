@@ -19,7 +19,7 @@ Closure commits, in order:
 - `2d07b4b54b702f9fa4ec226f5769668c21aa0282` — process-isolated auth environment cases.
 - `51febd769f192e7c0bd432dca160a0a093b65878` — legacy and OCI-layout saved-image identity verification.
 - `b7e03f9335839d6fecc4e9ba25d4312b48d31c0c` — warning-free shared sidecar startup barrier.
-- `REPORT_COMMIT_TO_BE_FILLED` — this review-closure evidence update.
+- `4800d766fabdf387297af9a79c9d777b840faba5` — review-closure evidence update.
 
 ### Runtime and Helm RED evidence
 
