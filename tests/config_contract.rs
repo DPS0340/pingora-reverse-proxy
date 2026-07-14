@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::process::Command;
 
 use clap::{CommandFactory, Parser};
 use pingora_reverse_proxy::config::{AppConfig, Cli, ListenerConfig, LogLevel, StoreConfig};
@@ -907,41 +908,52 @@ fn chp_environment_variables_are_consumed() {
 #[test]
 #[serial]
 fn internal_required_auth_policy_rejects_missing_empty_and_invalid_values() {
-    for (policy, token, expected) in [
-        (
-            Some("true"),
-            None,
-            "required management authentication token is missing or empty",
-        ),
-        (
-            Some("true"),
-            Some(""),
-            "required management authentication token is missing or empty",
-        ),
-        (
-            Some("sometimes"),
-            Some("token"),
-            "PINGORA_REQUIRE_AUTH_TOKEN must be true or false",
-        ),
-    ] {
-        let _clear = EnvGuard::unset(&["PINGORA_REQUIRE_AUTH_TOKEN", "CONFIGPROXY_AUTH_TOKEN"]);
-        let mut values = Vec::new();
-        if let Some(policy) = policy {
-            values.push(("PINGORA_REQUIRE_AUTH_TOKEN", policy));
-        }
-        if let Some(token) = token {
-            values.push(("CONFIGPROXY_AUTH_TOKEN", token));
-        }
-        let _env = EnvGuard::set(&values);
+    if let Ok(case) = std::env::var("PINGORA_CONFIG_CONTRACT_AUTH_CASE") {
         let cli = Cli::try_parse_from(["proxy"]).unwrap();
-        assert_eq!(AppConfig::try_from(cli).unwrap_err().to_string(), expected);
+        match case.as_str() {
+            "missing" | "empty" => assert_eq!(
+                AppConfig::try_from(cli).unwrap_err().to_string(),
+                "required management authentication token is missing or empty"
+            ),
+            "invalid" => assert_eq!(
+                AppConfig::try_from(cli).unwrap_err().to_string(),
+                "PINGORA_REQUIRE_AUTH_TOKEN must be true or false"
+            ),
+            "valid" => assert_eq!(
+                AppConfig::try_from(cli).unwrap().auth_token.as_deref(),
+                Some("token")
+            ),
+            other => panic!("unknown auth contract subprocess case: {other}"),
+        }
+        return;
     }
 
-    let _env = EnvGuard::set(&[
-        ("PINGORA_REQUIRE_AUTH_TOKEN", "true"),
-        ("CONFIGPROXY_AUTH_TOKEN", "token"),
-    ]);
-    assert_eq!(parse_ok(["proxy"]).auth_token.as_deref(), Some("token"));
+    for (case, policy, token) in [
+        ("missing", "true", None),
+        ("empty", "true", Some("")),
+        ("invalid", "sometimes", Some("token")),
+        ("valid", "true", Some("token")),
+    ] {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "internal_required_auth_policy_rejects_missing_empty_and_invalid_values",
+            ])
+            .env("PINGORA_CONFIG_CONTRACT_AUTH_CASE", case)
+            .env("PINGORA_REQUIRE_AUTH_TOKEN", policy)
+            .env_remove("CONFIGPROXY_AUTH_TOKEN");
+        if let Some(token) = token {
+            command.env("CONFIGPROXY_AUTH_TOKEN", token);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "auth contract subprocess {case} failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]
