@@ -6,7 +6,20 @@ Accepted parent: `e34a13ffb72b21194bb8b7166dd3912c5497ca90`
 
 ## Independent review closure (2026-07-15)
 
-Closure starts from the original Task 13 commit `122d0a24ae16f072d007aff85bd6d0ebd62bc962`. The independent specification and security/operations reports were reconciled against the frozen review package and current source. Every High, Medium, and Low finding was reproduced or confirmed by direct source inspection; none was dismissed as false. Exact closure commit SHAs and final GREEN evidence are recorded below after those commits exist.
+Closure starts from the original Task 13 commit `122d0a24ae16f072d007aff85bd6d0ebd62bc962`. The independent specification and security/operations reports were reconciled against the frozen review package and current source. Every High, Medium, and Low finding was reproduced or confirmed by direct source inspection; none was dismissed as false. Two additional suspected sibling cases proved false at the directly tested parser/template boundaries and are documented below.
+
+Closure commits, in order:
+
+- `e330a56425698ecde16e2cd2355124ecf58ac340` — fail-closed runtime, listener TLS, single-replica/Recreate, digest, and chart invariants.
+- `a358b4e5fa6a842a124797f75111946d6104f06b` — bounded process groups and fail-closed container context/cleanup.
+- `e4557dfef39ae060f43a0aabf60f13a2694c15b0` — exact tested-image artifact and serialized no-rebuild promotion.
+- `17ce25fa1c2f27696fd87d75b72c54adac21b429` — single-replica operations, credential, rotation, backup, rollback, and migration documentation.
+- `a567140cecc0993a5d07ead11e7ffe7b36eb28eb` — fail-closed sibling parser/template regressions.
+- `9df3ba7788a3f04f59fa627ec0e06ef2f1fe5d9d` — deterministic process-tree scheduling bounds.
+- `2d07b4b54b702f9fa4ec226f5769668c21aa0282` — process-isolated auth environment cases.
+- `51febd769f192e7c0bd432dca160a0a093b65878` — legacy and OCI-layout saved-image identity verification.
+- `b7e03f9335839d6fecc4e9ba25d4312b48d31c0c` — warning-free shared sidecar startup barrier.
+- `REPORT_COMMIT_TO_BE_FILLED` — this review-closure evidence update.
 
 ### Runtime and Helm RED evidence
 
@@ -49,7 +62,7 @@ Runtime/Helm GREEN:
 ```text
 cargo test --locked --test config_contract --test jupyterhub_e2e
 ...
-test result: ok. 35 passed; 0 failed
+test result: ok. 36 passed; 0 failed
 test result: ok. 3 passed; 0 failed
 
 just test-helm
@@ -68,6 +81,18 @@ test result: ok. 1 passed; 0 failed
 ```
 
 Helm now sets the non-CHP internal `PINGORA_REQUIRE_AUTH_TOKEN=true` policy, while raw CHP-compatible CLI behavior remains optional-auth by default. Public/API strict client rejection requires request mode and a non-empty CA in both chart validation and direct runtime parsing. The chart requires exactly one replica, uses `Recreate`, supports digest-pinned images, and models upstream private-CA trust independently from optional client identity.
+
+The first final combined Rust invocation also exposed a real test-isolation failure. The new auth-policy regression changed process-global environment while ordinary configuration cases ran concurrently:
+
+```text
+cargo test --locked --test config_contract --test jupyterhub_e2e
+...
+config validation failed: required management authentication token is missing or empty
+...
+test result: FAILED. 25 passed; 11 failed
+```
+
+The auth matrix now runs in exact child test processes with per-command environment. The same required command subsequently passed 36/36 and 3/3 repeatedly; no global policy value leaks into sibling tests.
 
 ### Verifier and container-script RED evidence
 
@@ -119,7 +144,7 @@ Release-policy GREEN:
 
 ```text
 ./scripts/test-release.sh
-verified_image_id=sha256:b8bed7d9428761ffd1a180b81fabf6ab0215adc8fcf3777ea547552525b463b8
+verified_image_id=sha256:bc5857ac9458293d5111ab85c952172cd7f56bceb4e3014ddc4cafac8927b313
 release gate passed: strict SemVer, collision-free tags, exact archive identity, and no-rebuild promotion
 
 bash -n scripts/test-container.sh scripts/test-release.sh scripts/image-artifact.sh
@@ -131,6 +156,56 @@ ruby -e 'require "yaml"; ARGV.each { |path| YAML.parse_file(path) }' .github/wor
 All exited zero and ShellCheck emitted no diagnostics. CI now saves the image only after that same image passes the real container behavior gate, records independently checked archive/manifest/config/image-ID/revision/platform metadata, and uploads both under an artifact name derived only from the verified SHA. CD downloads by the triggering workflow run ID and head SHA, revalidates every identity and checksum, loads the archive, and never rebuilds. Publication is globally serialized; strict version/SHA tags are refused if already present; the release Git tag is fetched and rechecked immediately before candidate push and final manifest promotion. Final tags point at the candidate registry digest, and GitHub publishes a registry-linked build-provenance attestation. No `latest` tag is produced.
 
 SemVer build metadata maps `+` to `_`. This mapping is collision-free because `_` is invalid in every SemVer identifier but valid in a Docker tag; prerelease dots/hyphens and build identifiers otherwise remain unchanged.
+
+The real-image artifact pass discovered two current-engine save-layout assumptions after the production container behavior checks had succeeded. Both failures were retained as release regressions:
+
+```text
+unsafe image config path
+error: recipe `test-container` failed on line 20 with exit code 1
+
+saved image config does not match the inspected image ID
+error: recipe `test-container` failed on line 20 with exit code 1
+```
+
+Docker's containerd image store emitted `blobs/sha256/<digest>` config paths and reported the OCI manifest-list digest as `.Id`, while the legacy archive shape uses `<config-digest>.json` and the config digest as `.Id`. The verifier now accepts only those two safe config-path shapes. It independently hashes the config bytes; when image ID differs from config digest, it also requires the exact image-identity blob, verifies that blob's digest, and requires one exact reference from `index.json`. The deterministic release fixture exercises this OCI-layout case. A real create/verify/load pass on implementation HEAD reported:
+
+```text
+source_sha=b7e03f9335839d6fecc4e9ba25d4312b48d31c0c
+image_id=sha256:48ea3dcc6c60a602a0e9b007faa0391095df06a25cf9f08047727eb22f819b03
+archive_sha256=0ed53d721e10a859495238b6bcdba517d773b5aa4904ae4581e282c000b38de2
+manifest_sha256=2fadb22009db060a45411b3b98acb3366b0222b6827f848858a1c34183eb6cd1
+config_sha256=40fbdac2c0182eca7488b7efff385de7b69c419fec1df040e8fec0cdde8d083f
+revision_label=b7e03f9335839d6fecc4e9ba25d4312b48d31c0c
+```
+
+One earlier real-image attempt is deliberately not claimed green: after about 15 minutes the local Colima daemon disconnected during the release build with `failed to solve: Unavailable: error reading from server: EOF`. Cleanup then failed closed because both Docker residue scans returned `Cannot connect to the Docker daemon`. The VM manager confirmed the VM stopped; its stale state was cleared, the same profile was restarted, and the full gate was rerun from a fresh artifact directory. No artifact was produced by the failed attempt.
+
+### Closure implementation-HEAD acceptance
+
+On committed implementation HEAD `b7e03f9335839d6fecc4e9ba25d4312b48d31c0c`, these required gates exited zero:
+
+```text
+just test-release
+just test-verify
+just test-container-script
+just test-helm
+cargo test --locked --test config_contract --test jupyterhub_e2e
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo check --locked --all-targets --all-features
+cargo test --locked --test tls_unix_contract strict_client_certificates_reject_absent_and_untrusted_but_accept_trusted_everywhere -- --exact
+cargo test --locked --test tls_unix_contract optional_client_certificates_accept_absent_untrusted_and_trusted_for_public_and_api -- --exact
+bash -n <all ten shell scripts changed from e34a13f>
+shellcheck -x <all ten shell scripts changed from e34a13f>
+ruby -e 'require "yaml"; ARGV.each { |path| YAML.parse_file(path) }' .github/workflows/ci.yml .github/workflows/cd.yml
+ruby -c scripts/release-policy.rb
+python3 -m py_compile scripts/run-bounded.py
+git diff --check e34a13ffb72b21194bb8b7166dd3912c5497ca90..HEAD
+```
+
+Results were 36/36 configuration contracts, 3/3 shipped-binary/JupyterHub contracts, both real TLS matrices 1/1, and exact success diagnostics from release, process-tree, container-script, and Helm gates. ShellCheck 0.11.0 emitted no diagnostics. `cargo clippy -D warnings` first found the startup barrier wrapper dead in the separately compiled `store_contract` support module; the barrier was refactored to use the fixture's already shared gated-fault path, after which all-target clippy passed without an allow attribute.
+
+The implementation-HEAD real-image command and independent artifact verify/load both exited zero. The real injected `CONTAINER_GATE_INJECT_FAILURE=after-start` run returned the expected 97, and exact container-label, image-label, and `task13-container-*` name scans were empty. The injected Helm run returned 97 and left its dedicated `TMPDIR` empty. The fake-Docker matrix separately proved that container/image scan failures and removal failures fail the gate and use exact labels/names.
 
 ### Review-discovered sibling probes that were false
 
