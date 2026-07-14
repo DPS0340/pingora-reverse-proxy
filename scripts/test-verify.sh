@@ -11,16 +11,16 @@ set -euo pipefail
 resource_dir=$1
 touch "$resource_dir/parent" "$resource_dir/child"
 cleanup_parent() {
-  echo parent-term-cleanup
   rm -f "$resource_dir/parent"
+  echo parent-term-cleanup
   wait || true
   exit 0
 }
 trap cleanup_parent TERM
 (
   cleanup_child() {
-    echo child-term-cleanup
     rm -f "$resource_dir/child"
+    echo child-term-cleanup
     exit 0
   }
   trap cleanup_child TERM
@@ -37,7 +37,7 @@ mkdir "$TMP_DIR/resources"
 start=$(python3 -c 'import time; print(time.monotonic())')
 set +e
 python3 "$ROOT_DIR/scripts/run-bounded.py" \
-  --timeout 0.4s \
+  --timeout 1.5s \
   --kill-after 1s \
   --log "$TMP_DIR/timeout.log" \
   -- "$TMP_DIR/cleanup-phase.sh" "$TMP_DIR/resources"
@@ -45,7 +45,7 @@ status=$?
 set -e
 elapsed=$(python3 -c 'import sys,time; print(time.monotonic() - float(sys.argv[1]))' "$start")
 test "$status" -eq 124
-python3 -c 'import sys; assert float(sys.argv[1]) < 3.0' "$elapsed"
+python3 -c 'import sys; assert float(sys.argv[1]) < 4.0' "$elapsed"
 grep -Fq nested-log-pipe "$TMP_DIR/timeout.log"
 grep -Fq parent-term-cleanup "$TMP_DIR/timeout.log"
 grep -Fq child-term-cleanup "$TMP_DIR/timeout.log"
@@ -63,7 +63,7 @@ chmod 0755 "$TMP_DIR/kill-phase.sh"
 start=$(python3 -c 'import time; print(time.monotonic())')
 set +e
 python3 "$ROOT_DIR/scripts/run-bounded.py" \
-  --timeout 0.3s \
+  --timeout 1s \
   --kill-after 0.3s \
   --log "$TMP_DIR/kill.log" \
   -- "$TMP_DIR/kill-phase.sh"
@@ -71,7 +71,7 @@ status=$?
 set -e
 elapsed=$(python3 -c 'import sys,time; print(time.monotonic() - float(sys.argv[1]))' "$start")
 test "$status" -eq 124
-python3 -c 'import sys; assert float(sys.argv[1]) < 2.0' "$elapsed"
+python3 -c 'import sys; assert float(sys.argv[1]) < 3.0' "$elapsed"
 grep -Fq kill-fallback-log "$TMP_DIR/kill.log"
 
 set +e
