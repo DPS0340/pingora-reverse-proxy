@@ -52,7 +52,12 @@ async fn shipped_binary_loads_authenticated_sidecar_before_listener_readiness() 
     const TOKEN: &str = "SIDECAR_RUNTIME_TOKEN_SENTINEL_8246";
     let fixture = sidecar_support::SidecarFixture::start_with_token(Some(TOKEN)).await;
     let snapshot_gate = sidecar_support::FaultGate::new();
-    fixture.block_snapshot(snapshot_gate.clone()).await;
+    fixture
+        .push_fault(
+            sidecar_support::SNAPSHOT,
+            sidecar_support::Fault::LoseReplyGate(snapshot_gate.clone()),
+        )
+        .await;
     let public_reservation =
         std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve public port");
     let api_reservation = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve API port");

@@ -98,7 +98,6 @@ struct FixtureControls {
     health_content_type: Option<String>,
     snapshot_body: Option<Vec<u8>>,
     snapshot_content_type: Option<String>,
-    snapshot_gate: Option<FaultGate>,
 }
 
 struct FixtureState {
@@ -297,10 +296,6 @@ impl SidecarFixture {
 
     pub async fn set_snapshot_content_type(&self, content_type: &str) {
         self.state.controls.lock().await.snapshot_content_type = Some(content_type.to_owned());
-    }
-
-    pub async fn block_snapshot(&self, gate: FaultGate) {
-        self.state.controls.lock().await.snapshot_gate = Some(gate);
     }
 
     pub async fn requests(&self) -> Vec<RecordedRequest> {
@@ -668,6 +663,10 @@ async fn precommit_fault(state: &FixtureState, operation: &'static str) -> Optio
                 Body::empty(),
             ))
         }
+        Some(Fault::LoseReplyGate(gate)) => {
+            gate.block_response().await;
+            None
+        }
         Some(Fault::Timeout) => std::future::pending::<Option<Response>>().await,
         Some(Fault::MalformedBody) => Some(json_response(StatusCode::OK, &json!({"broken": true}))),
         Some(
@@ -685,7 +684,6 @@ async fn precommit_fault(state: &FixtureState, operation: &'static str) -> Optio
         }
         Some(
             Fault::LoseReply
-            | Fault::LoseReplyGate(_)
             | Fault::MissingProtocol
             | Fault::DuplicateProtocol
             | Fault::WrongProtocol
@@ -760,10 +758,6 @@ async fn snapshot(
     }
     if let Some(response) = precommit_fault(&state, SNAPSHOT).await {
         return response;
-    }
-    let gate = state.controls.lock().await.snapshot_gate.take();
-    if let Some(gate) = gate {
-        gate.block_response().await;
     }
     let routes: BTreeMap<_, _> = state
         .routes
