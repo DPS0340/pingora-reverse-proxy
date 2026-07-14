@@ -304,23 +304,34 @@ docker run --rm --read-only --tmpfs /tmp:rw,noexec,nosuid,nodev,uid=65532,gid=65
 
 The final image runs as UID/GID 65532, uses an exec-form entrypoint, contains CA certificates, and supports a read-only root filesystem with only `/tmp` writable. Do not put literal credentials in image arguments, chart values, or committed files.
 
-The chart requires an existing Secret for the management token and never renders its value:
+The chart requires an existing non-empty Secret for the management token and never renders its value. Create it from a permission-restricted file so the live token is never an argv element:
 
 ```bash
-kubectl create secret generic proxy-auth --from-literal=token="$CONFIGPROXY_AUTH_TOKEN"
+umask 077
+auth_file=$(mktemp)
+trap 'rm -f "$auth_file"' EXIT INT TERM
+openssl rand -hex 32 >"$auth_file"
+chmod 0600 "$auth_file"
+kubectl create secret generic proxy-auth --from-file="token=$auth_file"
+rm -f "$auth_file"
+trap - EXIT INT TERM
+
 helm upgrade --install proxy ./helm-chart \
   --set auth.existingSecret=proxy-auth \
   --set image.repository=registry.example/pingora-reverse-proxy \
-  --set image.tag=0.2.0
+  --set image.tag= \
+  --set image.digest=sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 ```
 
-Select Redis with `storage.backend=redis` plus `redis.auth.existingSecret`; select the sidecar with `storage.backend=sidecar`, `sidecar.endpoint`, and `sidecar.auth.existingSecret`. TLS keys, certificates, client CAs, and optional key passphrases are also existing-Secret references. The API is a ClusterIP service by default; restrict it further with NetworkPolicy appropriate to the cluster.
+Prefer an external secret manager/CSI driver instead of a local file where the cluster supports one. If a local file is used, keep it mode 0600, exclude it from backups and support bundles, and remove it immediately after the Secret is created. Select Redis with `storage.backend=redis` plus `redis.auth.existingSecret`; select the sidecar with `storage.backend=sidecar`, `sidecar.endpoint`, and `sidecar.auth.existingSecret`. Listener identities and client CAs are existing-Secret references. Upstream private-CA trust uses `tls.client.ca`; optional upstream client identity uses the independent `tls.client.identity` block.
 
-CI runs `scripts/verify.sh` on Linux in the required gate order. Publishing occurs only after a successful CI run for a commit carrying exactly one SemVer tag, and publishes version and commit-SHA tags rather than `latest`.
+The chart intentionally accepts exactly one replica and uses Deployment strategy `Recreate`. Route changes update only the receiving process's in-memory snapshot; Redis and sidecar persistence do not yet propagate mutations to another live process. Every chart upgrade and credential/certificate rotation therefore has a controlled outage. The API is a ClusterIP service by default; restrict it further with NetworkPolicy appropriate to the cluster.
+
+CI runs `scripts/verify.sh` on Linux in the required gate order. It archives the exact production image exercised by the container gate and records checksums for the archive, saved manifest, image config, image ID, platform, and revision label. Publishing occurs only after a successful CI run for a commit carrying exactly one strict SemVer 2.0 tag. CD verifies and loads those bytes without rebuilding, refuses existing version/SHA tags, promotes the checked registry digest, and publishes provenance. It never publishes `latest`. Deploy by the reported digest; version and commit tags are discovery aids, not immutability boundaries.
 
 ### Migrating from CHP
 
-Run the Rust proxy alongside CHP first. Reuse the management token through a secret provider, match path/host-routing and TLS settings, choose Redis or sidecar when routes must survive restart, and point JupyterHub's `api_url` at the private Rust API only after authenticated route output and representative HTTP/WebSocket traffic match. Keep CHP available for rollback until route reconciliation and graceful shutdown have been observed. The staged runbook and backend-specific backup/restore limits are in [Operations](docs/operations.md#deployment-rollback-and-migration).
+Run the Rust proxy on separate, non-serving listeners first. Reuse the management token through a secret provider, match path/host-routing and TLS settings, choose Redis or sidecar when routes must survive restart, and compare authenticated route output plus representative HTTP/WebSocket traffic. For cutover, pause route writers, reconcile the chosen proxy, and switch the JupyterHub API URL and public traffic in one controlled window; two independently mutable live route tables are not safe. Keep CHP deployable for rollback, but reconcile it before returning traffic. The outage, rollback, and backend-specific backup/restore limits are in [Operations](docs/operations.md#deployment-rollback-and-migration).
 
 ## Compatibility boundaries
 

@@ -187,7 +187,7 @@ The Dockerfile is a multi-stage locked release build. Builder and runtime base m
 - `rust:1.85-bookworm@sha256:e51d0265072d2d9d5d320f6a44dde6b9ef13653b035098febd68cce8fa7c0bc4`
 - `debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818`
 
-The final stage contains the stripped release binary, Debian CA bundle, and runtime libraries only; build context source, Cargo, compilers, CMake, Git, Make, Bash, and debug/target trees are rejected by the rootfs assertion. It has exec-form `ENTRYPOINT`, explicit public/API/metrics command arguments, UID/GID `65532:65532`, no declared writable volume, and supports a read-only root with a bounded `/tmp` tmpfs.
+The final stage contains the stripped release binary, Debian CA bundle, required shared libraries, and ordinary utilities supplied by the minimal Debian packages; it is not claimed to contain “runtime libraries only.” Build context source, Cargo, compilers, CMake, Git, Make, Bash, and debug/target trees are rejected by the rootfs assertion. It has exec-form `ENTRYPOINT`, explicit public/API/metrics command arguments, UID/GID `65532:65532`, no declared writable volume, and supports a read-only root with a bounded `/tmp` tmpfs.
 
 During GREEN iteration, the first complete image build exposed real Debian-slim paths (`/usr/bin/bash`, Bash metadata, and empty `/usr/src` directories) through the leakage test. The runtime layer now removes all Bash/dash/sh executables and source directories after package configuration. The subsequent final gate passed; this intermediate failure is why the final image is shell-free rather than merely lacking build tools.
 
@@ -199,7 +199,7 @@ Canonical recipe:
 PATH=/tmp/pingora-task13-tools/bin:$PATH just test-helm
 ```
 
-GREEN: Helm 3.18.3 linted the chart with `--strict`, then five independently rendered YAML streams (`memory`, `redis`, `sidecar`, `tls`, and custom `resources`) were parsed with Ruby/Psych and asserted structurally. Assertions cover:
+GREEN: Helm 3.18.3 linted the chart with `--strict`; independently rendered storage, TLS, upstream-CA, digest, upgrade-strategy, and resource YAML streams were parsed with Ruby/Psych and asserted structurally. Assertions cover:
 
 - all three listener arguments and named public/API/metrics ports/services;
 - API ClusterIP by default;
@@ -212,7 +212,7 @@ GREEN: Helm 3.18.3 linted the chart with `--strict`, then five independently ren
 - pod/container UID/GID 65532, non-root, `RuntimeDefault` seccomp, no privilege escalation, all capabilities dropped, read-only root, service-account token automount false;
 - writable memory-backed `/tmp` only.
 
-Fail-closed renders cover unknown storage, missing Redis/sidecar Secret refs, missing/credential-bearing sidecar endpoints, non-positive sidecar deadlines, and an enabled HTTP probe combined with mandatory public client certificates.
+Fail-closed renders cover unknown storage, missing Redis/sidecar Secret refs, missing/credential-bearing sidecar endpoints, non-positive sidecar deadlines, every backend at more than one replica, ineffective listener mTLS, empty TLS keys, partial upstream identity, invalid tag/digest combinations, and an enabled HTTP probe combined with mandatory public client certificates. Each case matches its exact Helm diagnostic.
 
 Failure-path evidence:
 
@@ -248,9 +248,9 @@ GREEN: `config_contract` 33/33 and `jupyterhub_e2e` 2/2. The binary regression s
 
 Locked flags are present on Cargo build/test inputs. Linux CI is authoritative, has `contents: read`, a 90-minute job bound, explicit native/Rust/Helm/just/audit/deny prerequisites, checksum-pinned Helm, exact cargo-tool versions, full-SHA GitHub actions, a Cargo cache keyed by lockfile/toolchain/config, and failure-only upload of gate logs/proptest regressions. The secondary macOS job installs native dependencies and runs genuine fmt/clippy/unit commands without `continue-on-error`.
 
-The old CD workflow published `latest` on every push with excessive Pages/content/OIDC/package permissions, stale actions, and a broken registry username. It was replaced. Publication now consumes only a successful `CI` `workflow_run` from a push, checks out its exact verified SHA, requires exactly one SemVer tag pointing at that SHA, grants `packages: write` only to the publish job, and pushes version plus full commit-SHA tags. It does not publish `latest`; OCI revision/version labels and the resulting repository digest are emitted.
+The old CD workflow published `latest` on every push with excessive Pages/content/OIDC/package permissions, stale actions, and a broken registry username. It was replaced. Publication now consumes only a successful same-repository `CI` push run, checks out and rechecks its exact verified SHA, requires exactly one strict SemVer 2.0 release tag, downloads only the SHA/run-bound tested image artifact, verifies and loads it, and promotes its registry digest without rebuilding. Publication is serialized and refuses existing version/full-SHA tags. It does not publish `latest`; the digest, source revision, artifact checksums, and provenance attestation are emitted.
 
-Implementation choices were checked against current primary documentation: Dockerfile reference and multi-stage builds (`docs.docker.com/reference/dockerfile`, `docs.docker.com/build/building/multi-stage/`), Docker read-only/tmpfs run behavior (`docs.docker.com/reference/cli/docker/container/run/`, `docs.docker.com/engine/storage/tmpfs/`), Kubernetes security contexts/probes/service accounts/seccomp (`kubernetes.io/docs/tasks/configure-pod-container/security-context/`, `kubernetes.io/docs/concepts/configuration/liveness-readiness-startup-probes/`, `kubernetes.io/docs/concepts/security/service-accounts/`, `kubernetes.io/docs/tutorials/security/seccomp/`), Helm template validation (`helm.sh/docs/v3/howto/charts_tips_and_tricks/`), GitHub secure action pinning (`docs.github.com/en/actions/reference/security/secure-use`), RustSec cargo-audit, and Embark cargo-deny.
+Implementation choices were checked against current primary documentation: Dockerfile reference and multi-stage builds (`docs.docker.com/reference/dockerfile`, `docs.docker.com/build/building/multi-stage/`), Docker read-only/tmpfs run behavior (`docs.docker.com/reference/cli/docker/container/run/`, `docs.docker.com/engine/storage/tmpfs/`), Docker save/load and immutable digest behavior (`docs.docker.com/reference/cli/docker/image/save/`, `docs.docker.com/reference/cli/docker/image/load/`, `docs.docker.com/dhi/core-concepts/digests/`), Kubernetes security contexts/probes/service accounts/seccomp (`kubernetes.io/docs/tasks/configure-pod-container/security-context/`, `kubernetes.io/docs/concepts/configuration/liveness-readiness-startup-probes/`, `kubernetes.io/docs/concepts/security/service-accounts/`, `kubernetes.io/docs/tutorials/security/seccomp/`), Helm template validation (`helm.sh/docs/v3/howto/charts_tips_and_tricks/`), SemVer 2.0 (`semver.org/`), GitHub workflow artifacts, `workflow_run`, concurrency, artifact attestations, and secure action pinning (`docs.github.com/en/actions/concepts/workflows-and-actions/workflow-artifacts`, `docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows`, `docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency`, `docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations/using-artifact-attestations-to-establish-provenance-for-builds`, `docs.github.com/en/actions/reference/security/secure-use`), RustSec cargo-audit, and Embark cargo-deny.
 
 Workflow YAML parses successfully with Ruby/Psych. All new shell scripts pass `bash -n`; ShellCheck 0.11.0 reports no diagnostics. The Helm gate's injected failure proves its cleanup/failure semantics. The container gate has a corresponding `after-start` injection used after the canonical image build to prove exact container/image cleanup.
 
@@ -304,7 +304,7 @@ Final chart command:
 PATH=/tmp/pingora-task13-tools/bin:$PATH just test-helm
 ```
 
-GREEN: `helm lint --strict`, five structurally parsed valid renders, and seven fail-closed render classes. Final output: `helm gate passed: lint plus memory/redis/sidecar/tls/resources and fail-closed cases`.
+GREEN: `helm lint --strict` plus the storage, TLS, upstream-CA, digest, upgrade-strategy, resource, and exact fail-closed matrices. Final output: `helm gate passed: exact single-replica/Recreate storage, TLS, digest, upgrade, and fail-closed matrix`.
 
 Final focused runtime/static commands:
 
@@ -319,6 +319,6 @@ ruby -e 'require "yaml"; ARGV.each { |path| YAML.parse_file(path) }' .github/wor
 git diff --check
 ```
 
-All passed. Rust counts were 33/33 config-contract tests and 2/2 shipped-binary/JupyterHub artifact tests; the only emitted Rust warning is the accepted vendored Pingora OpenSSL deprecation, which does not evade the project's `-D warnings` checks. ShellCheck returned no diagnostics; both workflows parsed; diff check was empty. Final read-only Docker scans showed zero Task 13 test-owned containers and images.
+All original Task 13 focused checks passed. Review-closure counts and exact final-HEAD commands supersede the original 33/33 and 2/2 counts and are recorded in the closure section. The only emitted Rust warning is the accepted vendored Pingora OpenSSL deprecation, which does not evade the project's `-D warnings` checks. ShellCheck returned no diagnostics; both workflows parsed; diff check was empty. Final read-only Docker scans showed zero Task 13 test-owned containers and images.
 
 The complete `scripts/verify.sh` was not claimed green: as assigned to Task 14, it reaches policy gates that intentionally fail on the inherited advisory/license blockers listed above. Task 13 acceptance is the focused image/chart, sidecar runtime, static, syntax, cleanup, and diff set documented here.
