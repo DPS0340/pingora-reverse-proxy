@@ -135,7 +135,11 @@ def main() -> int:
             signal.signal(signal.SIGINT, previous_int)
             signal.signal(signal.SIGTERM, previous_term)
             selector.close()
-            if group_exists(process_group):
+            # A successful group KILL is final. On macOS, probing the drained
+            # group again can briefly report an unsignalable (EPERM) zombie
+            # group, so do not issue a redundant second KILL after the pipe
+            # has closed and the direct child has been reaped.
+            if not kill_sent and group_exists(process_group):
                 signal_group(process_group, signal.SIGKILL)
             status = process.wait()
 
