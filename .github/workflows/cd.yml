@@ -11,7 +11,6 @@ permissions:
 concurrency:
   group: pingora-container-publication
   cancel-in-progress: false
-  queue: max
 
 env:
   IMAGE_NAME: pingora-reverse-proxy
@@ -62,7 +61,7 @@ jobs:
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
           name: verified-image-${{ github.event.workflow_run.head_sha }}
-          path: ${{ runner.temp }}/verified-image
+          path: ${{ runner.temp }}/pingora-verified-image
           github-token: ${{ github.token }}
           run-id: ${{ github.event.workflow_run.id }}
 
@@ -75,12 +74,12 @@ jobs:
         run: |
           set -Eeuo pipefail
           scripts/image-artifact.sh verify \
-            "${RUNNER_TEMP}/verified-image/image.tar" \
-            "${RUNNER_TEMP}/verified-image/metadata.env" \
+            "${RUNNER_TEMP}/pingora-verified-image/image.tar" \
+            "${RUNNER_TEMP}/pingora-verified-image/metadata.env" \
             "${VERIFIED_SHA}" \
-            "${VERIFIED_RUN_ID}" | tee "${RUNNER_TEMP}/verified-image/verification.log"
+            "${VERIFIED_RUN_ID}" | tee "${RUNNER_TEMP}/pingora-verified-image/verification.log"
           grep -E '^verified_image_id=sha256:[0-9a-f]{64}$' \
-            "${RUNNER_TEMP}/verified-image/verification.log" >> "${GITHUB_OUTPUT}"
+            "${RUNNER_TEMP}/pingora-verified-image/verification.log" >> "${GITHUB_OUTPUT}"
 
       - name: Authenticate to GHCR
         shell: bash
@@ -89,7 +88,7 @@ jobs:
           GHCR_TOKEN: ${{ github.token }}
         run: |
           set -Eeuo pipefail
-          mkdir -m 0700 -p "${DOCKER_CONFIG}"
+          install -d -m 0700 "${DOCKER_CONFIG}"
           echo "${GHCR_TOKEN}" | timeout 30s docker login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
 
       - name: Recheck release authority and promote the exact manifest
@@ -177,10 +176,12 @@ jobs:
           test "${promotion_digest}" = "${candidate_digest}"
           test "$(remote_digest "${image}:${VERSION_TAG}")" = "${candidate_digest}"
           test "$(remote_digest "${image}:${sha_tag}")" = "${candidate_digest}"
-          echo "image=${image}" >> "${GITHUB_OUTPUT}"
-          echo "digest=${candidate_digest}" >> "${GITHUB_OUTPUT}"
-          echo "version_ref=${image}:${VERSION_TAG}" >> "${GITHUB_OUTPUT}"
-          echo "sha_ref=${image}:${sha_tag}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "image=${image}"
+            echo "digest=${candidate_digest}"
+            echo "version_ref=${image}:${VERSION_TAG}"
+            echo "sha_ref=${image}:${sha_tag}"
+          } >> "${GITHUB_OUTPUT}"
 
       - name: Attest published image provenance
         id: attest
@@ -193,9 +194,11 @@ jobs:
       - name: Report digest and provenance
         shell: bash
         run: |
-          echo "Release: ${{ steps.release.outputs.release_tag }}" >> "${GITHUB_STEP_SUMMARY}"
-          echo "Verified source: ${{ github.event.workflow_run.head_sha }}" >> "${GITHUB_STEP_SUMMARY}"
-          echo "Published digest: ${{ steps.publish.outputs.digest }}" >> "${GITHUB_STEP_SUMMARY}"
-          echo "Version ref: ${{ steps.publish.outputs.version_ref }}" >> "${GITHUB_STEP_SUMMARY}"
-          echo "Commit ref: ${{ steps.publish.outputs.sha_ref }}" >> "${GITHUB_STEP_SUMMARY}"
-          echo "Attestation: ${{ steps.attest.outputs.attestation-url }}" >> "${GITHUB_STEP_SUMMARY}"
+          {
+            echo "Release: ${{ steps.release.outputs.release_tag }}"
+            echo "Verified source: ${{ github.event.workflow_run.head_sha }}"
+            echo "Published digest: ${{ steps.publish.outputs.digest }}"
+            echo "Version ref: ${{ steps.publish.outputs.version_ref }}"
+            echo "Commit ref: ${{ steps.publish.outputs.sha_ref }}"
+            echo "Attestation: ${{ steps.attest.outputs.attestation-url }}"
+          } >> "${GITHUB_STEP_SUMMARY}"

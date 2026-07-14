@@ -141,6 +141,59 @@ grep -Fq 'CONTAINER_GATE_IMAGE_ARCHIVE:' "$ROOT_DIR/.github/workflows/ci.yml"
 grep -Fq "run-id: \${{ github.event.workflow_run.id }}" "$ROOT_DIR/.github/workflows/cd.yml"
 grep -Fq "name: verified-image-\${{ github.event.workflow_run.head_sha }}" "$ROOT_DIR/.github/workflows/cd.yml"
 grep -Fq 'scripts/image-artifact.sh verify' "$ROOT_DIR/.github/workflows/cd.yml"
+ruby -ryaml - "$ROOT_DIR/.github/workflows/ci.yml" "$ROOT_DIR/.github/workflows/cd.yml" <<'RUBY'
+def assert(condition, message)
+  raise message unless condition
+end
+
+ci = YAML.safe_load(File.read(ARGV.fetch(0)), aliases: true)
+cd = YAML.safe_load(File.read(ARGV.fetch(1)), aliases: true)
+linux = ci.fetch('jobs').fetch('verify-linux')
+linux_env = linux.fetch('env')
+archive = '/tmp/pingora-verified-image/image.tar'
+metadata = '/tmp/pingora-verified-image/metadata.env'
+assert(linux_env.fetch('CONTAINER_GATE_IMAGE_ARCHIVE') == archive,
+       'authoritative artifact archive path must be a static Linux-safe absolute path')
+assert(linux_env.fetch('CONTAINER_GATE_IMAGE_METADATA') == metadata,
+       'authoritative artifact metadata path must be a static Linux-safe absolute path')
+
+linux_steps = linux.fetch('steps')
+install_index = linux_steps.index { |step| step['name'] == 'Install actionlint' }
+lint_index = linux_steps.index { |step| step['name'] == 'Check workflow schemas' }
+verify_index = linux_steps.index { |step| step['name'] == 'Run authoritative release gate' }
+assert(install_index && lint_index && verify_index && install_index < lint_index && lint_index < verify_index,
+       'checksum-pinned workflow schema checking must run before the authoritative release gate')
+install_script = linux_steps.fetch(install_index).fetch('run')
+assert(install_script.include?('actionlint_1.7.12_linux_amd64.tar.gz'),
+       'actionlint install must pin the Linux amd64 v1.7.12 archive')
+assert(install_script.include?('8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8'),
+       'actionlint archive checksum must match the official v1.7.12 release')
+assert(linux_steps.fetch(lint_index).fetch('run').include?('actionlint .github/workflows/ci.yml .github/workflows/cd.yml'),
+       'authoritative workflow schema check must cover CI and CD')
+
+upload = linux_steps.find { |step| step['name'] == 'Upload exact verified production image' }
+upload_paths = upload.fetch('with').fetch('path').lines.map(&:strip).reject(&:empty?)
+assert(upload_paths == ['${{ env.CONTAINER_GATE_IMAGE_ARCHIVE }}',
+                        '${{ env.CONTAINER_GATE_IMAGE_METADATA }}'],
+       'artifact upload must consume the same archive and metadata paths as verification')
+
+concurrency = cd.fetch('concurrency')
+assert(concurrency.keys.sort == ['cancel-in-progress', 'group'],
+       'publication concurrency must use only supported group and cancel-in-progress keys')
+assert(concurrency.fetch('group') == 'pingora-container-publication' &&
+       concurrency.fetch('cancel-in-progress') == false,
+       'publication must remain serialized without canceling an active publication')
+
+publish_steps = cd.fetch('jobs').fetch('publish').fetch('steps')
+download = publish_steps.find { |step| step['name'] == 'Download exact image from the verified workflow run' }
+assert(download.fetch('with').fetch('path') == '${{ runner.temp }}/pingora-verified-image',
+       'download path must preserve the verified artifact directory contract')
+candidate = publish_steps.find { |step| step['name'] == 'Verify and load the tested image bytes' }
+candidate_script = candidate.fetch('run')
+assert(candidate_script.include?('${RUNNER_TEMP}/pingora-verified-image/image.tar') &&
+       candidate_script.include?('${RUNNER_TEMP}/pingora-verified-image/metadata.env'),
+       'CD verification must consume the downloaded archive and metadata paths')
+RUBY
 if grep -Eq 'docker (build([[:space:]]|$)|buildx build([[:space:]]|$))' "$ROOT_DIR/.github/workflows/cd.yml"; then
   echo "CD rebuilds instead of promoting the tested image" >&2
   exit 1

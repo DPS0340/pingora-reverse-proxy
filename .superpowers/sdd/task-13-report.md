@@ -22,6 +22,47 @@ Closure commits, in order:
 - `4800d766fabdf387297af9a79c9d777b840faba5` — review-closure evidence update.
 - `6e7022c11870e88c3bdd9f23c544e0755e38c81b` — closure-report commit identity binding.
 - `f1111e1e602c6b355f2155f69d12c0019a8380e5` — avoid a redundant post-KILL process-group signal.
+- `WORKFLOW_SCHEMA_CLOSURE_COMMIT_TO_BE_FILLED` — final workflow-schema validation and focused release regression.
+
+### Workflow-schema closure RED and GREEN
+
+On clean starting HEAD `a7c3b71b9d7954449b958e028494938e9e8627ee`, globally installed actionlint 1.7.12 reproduced six real workflow diagnostics:
+
+```text
+actionlint .github/workflows/ci.yml .github/workflows/cd.yml
+.github/workflows/ci.yml:22:41: context "runner" is not allowed here ... [expression]
+.github/workflows/ci.yml:23:42: context "runner" is not allowed here ... [expression]
+.github/workflows/cd.yml:14:3: unexpected key "queue" for "concurrency" section ... [syntax-check]
+.github/workflows/cd.yml:90:9: shellcheck reported issue ... SC2174 ... [shellcheck]
+.github/workflows/cd.yml:106:9: shellcheck reported issue ... SC2129 ... [shellcheck]
+.github/workflows/cd.yml:195:9: shellcheck reported issue ... SC2129 ... [shellcheck]
+exit 1
+```
+
+The focused release regression was strengthened before the workflow fix. After correcting a Ruby 2.6/Psych 3.1 test-harness incompatibility (`YAML.safe_load_file` is unavailable there), its real RED was the intended path invariant:
+
+```text
+just test-release
+...
+authoritative artifact archive path must be a static Linux-safe absolute path (RuntimeError)
+error: recipe `test-release` failed on line 29 with exit code 1
+```
+
+CI now uses `/tmp/pingora-verified-image` consistently for the verifier outputs and artifact upload; CD downloads that SHA/run-bound artifact into the matching runner-temporary directory and verifies the same two filenames. The authoritative Linux job installs actionlint 1.7.12 from the official release archive, verifies SHA-256 `8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8`, and checks both workflows before `scripts/verify.sh`. CD keeps `group: pingora-container-publication` with `cancel-in-progress: false`, creates the Docker configuration directory at mode 0700 with `install -d`, and groups GitHub output/summary redirects. No action permissions or action pins changed.
+
+GREEN on the closure candidate:
+
+```text
+actionlint .github/workflows/ci.yml .github/workflows/cd.yml
+exit 0 (no diagnostics)
+
+just test-release
+verified_image_id=sha256:bc5857ac9458293d5111ab85c952172cd7f56bceb4e3014ddc4cafac8927b313
+release gate passed: strict SemVer, collision-free tags, exact archive identity, and no-rebuild promotion
+exit 0
+```
+
+The controller-only real-image wrapper is not a product failure. The real production image build, runtime behavior, export, and independent artifact verify/load each emitted PASS before the controller cleanup wrapper attempted to assign zsh's reserved `status` variable and returned 1. The exact owned residue was subsequently removed. This wrapper issue requires no repository source change and is not claimed as a failed image, runtime, export, or verify/load gate.
 
 ### Runtime and Helm RED evidence
 
