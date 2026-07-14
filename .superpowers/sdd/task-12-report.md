@@ -365,3 +365,170 @@ Concerns: none. The vendored deprecation warning and retained BuildKit caches
 are established non-blocking conditions, and the debug-profile image is the
 documented bounded-build choice after the measured release attempt exceeded the
 one-hour limit.
+
+---
+
+## Acceptance re-review closure (2026-07-14)
+
+This section supersedes the prior review closure for the four findings in
+`/tmp/pingora-task12-rereview.md` against clean baseline
+`1d21da3fd29d81839078111e539473047fb54fc4`.
+
+Status: DONE
+
+### Pinned JupyterHub 5.5.0 scheduling diagnosis
+
+The exact pinned `jupyterhub/app.py` source establishes two startup writers:
+
+- `initialize()` starts `init_spawners()` and waits at most the configured
+  `init_spawners_timeout` (default 10 seconds). If that expires, it schedules
+  `finish_init_spawners()`, which waits for both spawner initialization and
+  `_start_future`, then calls `proxy.check_routes()` after normal startup.
+- `start()` awaits its normal `proxy.check_routes()` before logging
+  `JupyterHub is now running, internal Hub API ...`; only after that log call
+  does it resolve `_start_future`.
+
+The old readiness check stopped at direct Hub API readiness plus `Not starting
+proxy`. The Hub API begins listening before the normal startup route check, and
+the default spawner timeout permitted the second writer to run after the old
+readiness observation. `last_activity_interval = 0` disabled only the periodic
+writer, not either startup writer.
+
+The harness now sets `c.JupyterHub.init_spawners_timeout = -1`, which pinned
+5.5.0 defines as waiting forever for initialization and therefore prevents the
+background `finish_init_spawners()` branch. `Hub.start()` additionally waits
+for both `Initialized N spawners ...` and the full-start marker. Consequently,
+the normal startup `check_routes()` is complete and no late initialization
+writer exists before either restart-persistence sample or the deliberate
+reconciliation operation. With `last_activity_interval = 0`, only the real
+`POST /hub/api/proxy` can satisfy the missing-route reconciliation observation.
+The wait is a log/condition barrier under the existing deadline; elapsed sleeps
+are not used as correctness evidence.
+
+### Root cause and closure by finding
+
+1. **MEDIUM — live Hub writer was not fenced.** The old API-ready condition was
+   earlier than JupyterHub's normal startup route check and allowed its bounded
+   spawner initialization to schedule a later route check. The infinite
+   initialization barrier plus the two exact completion markers now fence both
+   startup writers. Focused tests prove API/listener markers alone are
+   insufficient and prove the generated configuration disables background
+   spawner initialization. The canonical restart and explicit reconciliation
+   scenarios passed behind this barrier for both backends.
+
+2. **MEDIUM — Redis restart persistence checked only keys.** Immediately before
+   the product-binary restart, the harness captures the complete stable JSON
+   table for exactly `/` and all four user routes. Immediately after restart it
+   compares the entire reloaded stable table for missing, extra, and changed
+   records. It then loads the real single-user page through the persisted
+   `/user/river` route before deleting that route. Only after the persistence
+   scenario is recorded does the separate explicit reconciliation scenario
+   begin. A focused regression proves a valid-looking record with a changed
+   target fails metadata equality.
+
+3. **LOW — scenario membership was not enforced.** `REQUIRED_SCENARIOS` now
+   contains the exact 18 names. `Recorder.require_complete()` requires set
+   equality before summary construction or successful return. Focused missing
+   and extra scenario regressions both fail closed.
+
+4. **LOW — Hub inherited Redis credentials.** The Hub now receives an explicit
+   allowlist of process essentials plus its required JupyterHub variables;
+   `PINGORA_REDIS_URL`, route key, timeout, and unrelated parent variables are
+   absent, so local-process single-user children cannot inherit them. The proxy
+   still receives the Redis configuration it needs. Diagnostics redact the
+   complete Redis URL, credential-bearing authority, raw username/password, and
+   URL-decoded username/password. Sentinel tests prove the password is absent
+   from both the Hub environment and rendered diagnostics.
+
+### Deterministic RED evidence
+
+The focused tests were added before the harness implementation. After fixing a
+test-only class-placement mistake, the exact command produced this real RED:
+
+```text
+$ python3 scripts/test_jupyterhub_e2e.py -v
+Ran 12 tests in 0.767s
+FAILED (failures=1, errors=6)
+exit 1
+```
+
+The six errors were missing `build_hub_environment`, `environment_secrets`,
+`hub_startup_complete`, `assert_persisted_routes`, and
+`REQUIRED_SCENARIOS` (used by two tests). The failure showed the generated Hub
+configuration did not contain `c.JupyterHub.init_spawners_timeout = -1`. The
+five pre-existing version/reconciliation regressions passed. No implementation
+change preceded this RED.
+
+### GREEN and required gate evidence
+
+After the minimal harness implementation, the exact focused command passed:
+
+```text
+$ python3 scripts/test_jupyterhub_e2e.py -v
+Ran 12 tests in 0.981s
+OK
+exit 0
+```
+
+All required local commands passed on the closure worktree:
+
+```text
+python3 scripts/test_jupyterhub_e2e.py -v                         PASS 12/12
+cargo test --locked --test config_contract                       PASS 30/30
+cargo test --locked --test jupyterhub_e2e                        PASS 2/2
+cargo fmt --all -- --check                                       PASS
+cargo clippy --locked --all-targets --all-features -- -D warnings PASS
+cargo check --locked --all-targets --all-features                PASS
+git diff --check                                                  PASS
+```
+
+The only Rust warning remained the established vendored Pingora OpenSSL
+`Asn1StringRef::as_utf8` deprecation; both warnings-denied Clippy and check
+commands exited zero.
+
+The exact canonical command was:
+
+```text
+python3 scripts/jupyterhub-e2e.py
+```
+
+Result: exit 0 for owned project `jupyterhub-e2e-21653-659991b3`. The image
+test layer passed the Linux ACL probe, all 12 focused Python regressions, and
+`pip check`; its changed layer completed in 44.1 seconds. Memory recorded and
+then equality-validated the exact required 18/18 scenarios. Redis independently
+recorded and equality-validated the same 18/18 scenarios. In Redis,
+`proxy_restart_backend_state` passed only after all five stable records matched
+and live persisted-route traffic succeeded; `proxy_route_reconciliation` was
+recorded later, after deletion and the real Hub API request.
+
+### Cleanup proof
+
+- Both backend summaries included `run_owned_cleanup`, which is recorded only
+  after the scenario's marked process scan is empty and its unique temporary
+  state directory no longer exists.
+- Compose removed the run's Redis container and network. Exact post-run scans
+  for label `com.docker.compose.project=jupyterhub-e2e-21653-659991b3` returned
+  zero containers, networks, and volumes; image
+  `pingora-jupyterhub-e2e:jupyterhub-e2e-21653-659991b3` was absent.
+- A host-wide temporary-directory scan also showed one older build context
+  born at 21:17 KST, before this canonical run. It is not labeled or owned by
+  this run and was preserved rather than deleting unrelated evidence.
+- Reusable BuildKit cache mounts remain intentionally outside per-run cleanup.
+
+### Final five-axis self-review
+
+- **Correctness:** both pinned startup writers are fenced; full stable Redis
+  state, target usability, explicit reconciliation, and exact scenario
+  membership are separately asserted.
+- **Readability/architecture:** the changes remain harness-local helpers and
+  tests; no product/runtime abstraction or Task 13 asset was added.
+- **Security:** Hub/single-user environments are least-privilege and Redis URL
+  credentials are redacted from diagnostics.
+- **Performance:** no new unbounded work or product-path I/O was introduced;
+  all polling remains condition-based under existing deadlines.
+- **Verification:** focused, Rust contract, format, lint, check, canonical
+  memory/Redis, and cleanup gates all passed.
+
+Concerns: none. The pre-existing vendored deprecation warning, reusable
+BuildKit caches, and unrelated older temporary build context are outside this
+run's ownership and do not weaken Task 12 evidence.

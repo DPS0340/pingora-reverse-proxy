@@ -19,7 +19,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlsplit
 
 
 BUILD_TIMEOUT = 3600
@@ -39,10 +39,73 @@ PINNED_PACKAGES = {
     "websocket-client": "1.8.0",
 }
 USERS = ("river", "秀樹", "has@", "space user")
+REQUIRED_SCENARIOS = frozenset(
+    {
+        "pinned_python_runtime",
+        "proxy_api_add_get_delete",
+        "external_proxy_configuration",
+        "hub_root_route",
+        "hub_user_api_add_get",
+        "escaped_route_river",
+        "escaped_route_unicode",
+        "escaped_route_at_sign",
+        "escaped_route_space",
+        "login",
+        "single_user_page",
+        "kernel_websocket_message_flow",
+        "hub_restart_existing_route_usable",
+        "proxy_restart_backend_state",
+        "proxy_route_reconciliation",
+        "hub_user_api_delete",
+        "host_routing",
+        "run_owned_cleanup",
+    }
+)
+HUB_INHERITED_ENVIRONMENT = (
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "NO_PROXY",
+    "no_proxy",
+    "TZ",
+)
 
 
 class GateError(RuntimeError):
     pass
+
+
+def redact_text(text: str, secrets_to_redact: tuple[str, ...]) -> str:
+    for secret in secrets_to_redact:
+        if secret:
+            text = text.replace(secret, "<redacted>")
+    return text
+
+
+def environment_secrets(
+    environment: dict[str, str], generated: tuple[str, ...]
+) -> tuple[str, ...]:
+    values = {value for value in generated if value}
+    redis_url = environment.get("PINGORA_REDIS_URL")
+    if redis_url:
+        values.add(redis_url)
+        parsed = urlsplit(redis_url)
+        for value in (parsed.netloc, parsed.username, parsed.password):
+            if value:
+                values.add(value)
+                values.add(unquote(value))
+    return tuple(sorted(values, key=len, reverse=True))
+
+
+def build_hub_environment(
+    inherited: dict[str, str], required: dict[str, str]
+) -> dict[str, str]:
+    environment = {
+        name: inherited[name] for name in HUB_INHERITED_ENVIRONMENT if name in inherited
+    }
+    environment.update(required)
+    return environment
 
 
 def compose_command() -> list[str]:
@@ -365,10 +428,7 @@ class ManagedProcess:
             size = stream.tell()
             stream.seek(max(0, size - LOG_TAIL_BYTES))
             text = stream.read().decode("utf-8", "replace")
-        for secret in self.secrets:
-            if secret:
-                text = text.replace(secret, "<redacted>")
-        return text
+        return redact_text(text, self.secrets)
 
     def stop_group(self) -> None:
         terminate_group(self.process)
@@ -409,7 +469,10 @@ class ScenarioRuntime:
         self.proxy_token = secrets.token_urlsafe(32)
         self.api_token = secrets.token_urlsafe(32)
         self.password = secrets.token_urlsafe(24)
-        self.secrets = (self.proxy_token, self.api_token, self.password)
+        self.secrets = environment_secrets(
+            os.environ,
+            (self.proxy_token, self.api_token, self.password),
+        )
         self.processes: list[ManagedProcess] = []
         self.lingering_groups: set[int] = set()
 
@@ -641,6 +704,7 @@ c.JupyterHub.pid_file = ""
 c.JupyterHub.cleanup_servers = False
 c.JupyterHub.cleanup_proxy = False
 c.JupyterHub.last_activity_interval = 0
+c.JupyterHub.init_spawners_timeout = -1
 c.ConfigurableHTTPProxy.should_start = False
 c.ConfigurableHTTPProxy.api_url = {self.proxy.api_url!r}
 c.ConfigurableHTTPProxy.auth_token = os.environ["CONFIGPROXY_AUTH_TOKEN"]
@@ -658,8 +722,8 @@ c.JupyterHub.subdomain_host = {subdomain_host!r}
         self.config.write_text(config, encoding="utf-8")
 
     def start(self) -> None:
-        env = os.environ.copy()
-        env.update(
+        env = build_hub_environment(
+            os.environ,
             {
                 "CONFIGPROXY_AUTH_TOKEN": self.runtime.proxy_token,
                 "HOME": str(self.directory),
@@ -667,7 +731,7 @@ c.JupyterHub.subdomain_host = {subdomain_host!r}
                 "JUPYTERHUB_E2E_API_TOKEN": self.runtime.api_token,
                 "JUPYTERHUB_E2E_RUN_ID": self.runtime.run_id,
                 "JUPYTER_RUNTIME_DIR": str(self.directory / "runtime"),
-            }
+            },
         )
         (self.directory / "runtime").mkdir(exist_ok=True)
         self.process = self.runtime.start_process(
@@ -694,6 +758,10 @@ c.JupyterHub.subdomain_host = {subdomain_host!r}
         wait_for(
             f"{self.name} external-proxy confirmation",
             lambda: "Not starting proxy" in self.process.tail() if self.process else False,
+        )
+        wait_for(
+            f"{self.name} completed startup route reconciliation",
+            lambda: hub_startup_complete(self.process.tail()) if self.process else False,
         )
 
     def stop_for_restart(self) -> None:
@@ -728,6 +796,22 @@ class Recorder:
             raise GateError(f"scenario recorded twice: {scenario}")
         self.scenarios.append(scenario)
         print(f"PASS {scenario}", flush=True)
+
+    def require_complete(self) -> list[str]:
+        actual = set(self.scenarios)
+        missing = sorted(REQUIRED_SCENARIOS - actual)
+        extra = sorted(actual - REQUIRED_SCENARIOS)
+        if missing or extra:
+            raise GateError(f"scenario set mismatch: missing={missing}, extra={extra}")
+        return sorted(actual)
+
+
+def hub_startup_complete(log_tail: str) -> bool:
+    return (
+        "Initialized " in log_tail
+        and " spawners in " in log_tail
+        and "JupyterHub is now running," in log_tail
+    )
 
 
 def escaped_user(name: str) -> str:
@@ -778,6 +862,28 @@ def stable_route_data(route: object) -> dict[str, object] | None:
     if not isinstance(route, dict):
         return None
     return {key: value for key, value in route.items() if key != "last_activity"}
+
+
+def stable_routes(routes: dict[str, object]) -> dict[str, object]:
+    return {key: stable_route_data(value) for key, value in routes.items()}
+
+
+def assert_persisted_routes(
+    expected: dict[str, object], reloaded: dict[str, object]
+) -> None:
+    actual = stable_routes(reloaded)
+    if actual != expected:
+        missing = sorted(set(expected) - set(actual))
+        extra = sorted(set(actual) - set(expected))
+        changed = sorted(
+            key
+            for key in set(expected) & set(actual)
+            if expected[key] != actual[key]
+        )
+        raise GateError(
+            "persisted route metadata mismatch: "
+            f"missing={missing}, extra={extra}, changed={changed}"
+        )
 
 
 def reconcile_missing_route(
@@ -1042,9 +1148,13 @@ def path_routing_scenarios(runtime: ScenarioRuntime, recorder: Recorder) -> None
 
     session = sessions["river"]
     reconciliation_key = "/user/river"
-    reconciliation_data = stable_route_data(proxy.routes().get(reconciliation_key))
-    if reconciliation_data is None:
-        raise GateError("cannot capture the river route before restart")
+    expected_routes = {
+        "/",
+        "/user/river",
+        "/user/秀樹",
+        "/user/has@",
+        "/user/space user",
+    }
     recorder.passed("login")
     tree_url = f"{hub.public_url}/user/river/tree"
     single_user_page(session, tree_url)
@@ -1058,20 +1168,23 @@ def path_routing_scenarios(runtime: ScenarioRuntime, recorder: Recorder) -> None
     single_user_page(session, tree_url)
     recorder.passed("hub_restart_existing_route_usable")
 
+    persisted_route_data = stable_routes(proxy.routes())
+    if set(persisted_route_data) != expected_routes:
+        raise GateError(
+            "pre-restart route table mismatch: "
+            f"expected={sorted(expected_routes)}, actual={sorted(persisted_route_data)}"
+        )
+    reconciliation_data = persisted_route_data.get(reconciliation_key)
+    if not isinstance(reconciliation_data, dict):
+        raise GateError("cannot capture the stable river route before proxy restart")
+
     proxy.restart()
     restarted_routes = proxy.routes()
-    expected_routes = {
-        "/",
-        "/user/river",
-        "/user/秀樹",
-        "/user/has@",
-        "/user/space user",
-    }
     if runtime.backend == "memory" and restarted_routes:
         raise GateError("memory proxy restart unexpectedly retained routes")
-    if runtime.backend == "redis" and not expected_routes.issubset(restarted_routes):
-        missing = sorted(expected_routes.difference(restarted_routes))
-        raise GateError(f"Redis proxy restart did not load persisted routes: {missing}")
+    if runtime.backend == "redis":
+        assert_persisted_routes(persisted_route_data, restarted_routes)
+        single_user_page(session, tree_url)
     recorder.passed("proxy_restart_backend_state")
 
     if runtime.backend == "redis":
@@ -1201,10 +1314,11 @@ def scenario_main(proxy_binary: Path) -> int:
     finally:
         if runtime is not None and runtime.leaked_pids():
             runtime.cleanup()
+    verified_scenarios = recorder.require_complete()
     summary = {
         "backend": backend,
         "jupyterhub": "5.5.0",
-        "scenarios": sorted(recorder.scenarios),
+        "scenarios": verified_scenarios,
     }
     print(f"JUPYTERHUB_E2E_SUMMARY={json.dumps(summary, ensure_ascii=False, sort_keys=True)}")
     return 0
