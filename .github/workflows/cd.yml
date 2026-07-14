@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: pingora-container-publication
+  cancel-in-progress: false
+  queue: max
+
 env:
   IMAGE_NAME: pingora-reverse-proxy
 
@@ -15,11 +20,15 @@ jobs:
   publish:
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'push'
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
+      actions: read
+      attestations: write
       contents: read
+      id-token: write
       packages: write
     steps:
       - name: Check out the verified commit
@@ -28,39 +37,165 @@ jobs:
           ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 0
 
-      - name: Select a SemVer tag on the verified commit
+      - name: Select one strict SemVer release tag
         id: release
         shell: bash
         env:
           VERIFIED_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -Eeuo pipefail
-          mapfile -t release_tags < <(git tag --points-at "${VERIFIED_SHA}" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$' || true)
+          [[ ${VERIFIED_SHA} =~ ^[0-9a-f]{40}$ ]]
+          mapfile -t tags_at_sha < <(git tag --points-at "${VERIFIED_SHA}")
+          release_tags=()
+          for tag in "${tags_at_sha[@]}"; do
+            if ruby scripts/release-policy.rb "${tag}" >/dev/null 2>&1; then
+              release_tags+=("${tag}")
+            fi
+          done
           if (( ${#release_tags[@]} != 1 )); then
-            echo "expected exactly one SemVer release tag on verified commit" >&2
+            echo "expected exactly one release tag on verified commit" >&2
             exit 1
           fi
-          echo "tag=${release_tags[0]}" >> "${GITHUB_OUTPUT}"
+          ruby scripts/release-policy.rb "${release_tags[0]}" >> "${GITHUB_OUTPUT}"
 
-      - name: Build and publish immutable image tags
+      - name: Download exact image from the verified workflow run
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: verified-image-${{ github.event.workflow_run.head_sha }}
+          path: ${{ runner.temp }}/verified-image
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.workflow_run.id }}
+
+      - name: Verify and load the tested image bytes
+        id: candidate
+        shell: bash
+        env:
+          VERIFIED_SHA: ${{ github.event.workflow_run.head_sha }}
+          VERIFIED_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -Eeuo pipefail
+          scripts/image-artifact.sh verify \
+            "${RUNNER_TEMP}/verified-image/image.tar" \
+            "${RUNNER_TEMP}/verified-image/metadata.env" \
+            "${VERIFIED_SHA}" \
+            "${VERIFIED_RUN_ID}" | tee "${RUNNER_TEMP}/verified-image/verification.log"
+          grep -E '^verified_image_id=sha256:[0-9a-f]{64}$' \
+            "${RUNNER_TEMP}/verified-image/verification.log" >> "${GITHUB_OUTPUT}"
+
+      - name: Authenticate to GHCR
         shell: bash
         env:
           DOCKER_CONFIG: ${{ runner.temp }}/pingora-docker-config
           GHCR_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
-          VERIFIED_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -Eeuo pipefail
           mkdir -m 0700 -p "${DOCKER_CONFIG}"
-          trap 'rm -rf -- "${DOCKER_CONFIG}"' EXIT
-          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${IMAGE_NAME}"
-          version="${RELEASE_TAG#v}"
-          sha_tag="sha-${VERIFIED_SHA}"
           echo "${GHCR_TOKEN}" | timeout 30s docker login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
-          timeout 1800s docker build --pull --label "org.opencontainers.image.revision=${VERIFIED_SHA}" --label "org.opencontainers.image.version=${version}" --tag "${image}:${version}" --tag "${image}:${sha_tag}" .
-          timeout 600s docker push "${image}:${version}"
-          timeout 600s docker push "${image}:${sha_tag}"
-          digest="$(timeout 30s docker image inspect --format '{{index .RepoDigests 0}}' "${image}:${version}")"
-          test -n "${digest}"
-          echo "Published ${digest}"
-          timeout 30s docker logout ghcr.io
+
+      - name: Recheck release authority and promote the exact manifest
+        id: publish
+        shell: bash
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/pingora-docker-config
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+          VERSION_TAG: ${{ steps.release.outputs.docker_tag }}
+          VERIFIED_IMAGE_ID: ${{ steps.candidate.outputs.verified_image_id }}
+          VERIFIED_SHA: ${{ github.event.workflow_run.head_sha }}
+          WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
+          WORKFLOW_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          set -Eeuo pipefail
+          trap 'timeout 30s docker logout ghcr.io >/dev/null 2>&1 || true; rm -rf -- "${DOCKER_CONFIG}"' EXIT
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${IMAGE_NAME}"
+          sha_tag="sha-${VERIFIED_SHA}"
+          candidate_tag="candidate-${VERIFIED_SHA}-${WORKFLOW_RUN_ID}-${WORKFLOW_RUN_ATTEMPT}"
+          [[ ${VERIFIED_SHA} =~ ^[0-9a-f]{40}$ ]]
+          [[ ${WORKFLOW_RUN_ID} =~ ^[0-9]+$ ]]
+          [[ ${WORKFLOW_RUN_ATTEMPT} =~ ^[0-9]+$ ]]
+
+          recheck_release_tag() {
+            timeout 60s git fetch --force --no-tags origin \
+              "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+            test "$(git rev-list -n 1 "${RELEASE_TAG}")" = "${VERIFIED_SHA}"
+          }
+
+          remote_digest() {
+            local reference=$1 output error_file
+            error_file=$(mktemp "${RUNNER_TEMP}/remote-manifest.XXXXXX")
+            if output=$(timeout 60s docker buildx imagetools inspect \
+              "${reference}" --format '{{json .Manifest}}' 2>"${error_file}"); then
+              rm -f "${error_file}"
+              ruby -rjson -e '
+                digest = JSON.parse(STDIN.read).fetch("digest")
+                abort "invalid remote digest" unless /\Asha256:[0-9a-f]{64}\z/.match?(digest)
+                puts digest
+              ' <<<"${output}"
+              return 0
+            fi
+            if grep -Eiq '((^|: )not found$|manifest unknown|not found: manifest|no such manifest)' "${error_file}"; then
+              rm -f "${error_file}"
+              return 1
+            fi
+            cat "${error_file}" >&2
+            rm -f "${error_file}"
+            return 2
+          }
+
+          require_absent_tag() {
+            local reference=$1 existing status
+            set +e
+            existing=$(remote_digest "${reference}")
+            status=$?
+            set -e
+            if (( status == 0 )); then
+              echo "refusing to overwrite existing image tag ${reference} at ${existing}" >&2
+              exit 1
+            fi
+            (( status == 1 )) || exit "${status}"
+          }
+
+          recheck_release_tag
+          require_absent_tag "${image}:${VERSION_TAG}"
+          require_absent_tag "${image}:${sha_tag}"
+          require_absent_tag "${image}:${candidate_tag}"
+          timeout 30s docker image tag "${VERIFIED_IMAGE_ID}" "${image}:${candidate_tag}"
+          timeout 600s docker push "${image}:${candidate_tag}"
+          candidate_digest=$(remote_digest "${image}:${candidate_tag}")
+
+          require_absent_tag "${image}:${VERSION_TAG}"
+          require_absent_tag "${image}:${sha_tag}"
+          recheck_release_tag
+          timeout 120s docker buildx imagetools create \
+            --prefer-index=false \
+            --tag "${image}:${VERSION_TAG}" \
+            --tag "${image}:${sha_tag}" \
+            --metadata-file "${RUNNER_TEMP}/promotion-metadata.json" \
+            "${image}@${candidate_digest}"
+          promotion_digest=$(ruby -rjson -e \
+            'puts JSON.parse(File.read(ARGV.fetch(0))).fetch("containerimage.descriptor").fetch("digest")' \
+            "${RUNNER_TEMP}/promotion-metadata.json")
+          test "${promotion_digest}" = "${candidate_digest}"
+          test "$(remote_digest "${image}:${VERSION_TAG}")" = "${candidate_digest}"
+          test "$(remote_digest "${image}:${sha_tag}")" = "${candidate_digest}"
+          echo "image=${image}" >> "${GITHUB_OUTPUT}"
+          echo "digest=${candidate_digest}" >> "${GITHUB_OUTPUT}"
+          echo "version_ref=${image}:${VERSION_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "sha_ref=${image}:${sha_tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Attest published image provenance
+        id: attest
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-name: ${{ steps.publish.outputs.image }}
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          push-to-registry: true
+
+      - name: Report digest and provenance
+        shell: bash
+        run: |
+          echo "Release: ${{ steps.release.outputs.release_tag }}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "Verified source: ${{ github.event.workflow_run.head_sha }}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "Published digest: ${{ steps.publish.outputs.digest }}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "Version ref: ${{ steps.publish.outputs.version_ref }}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "Commit ref: ${{ steps.publish.outputs.sha_ref }}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "Attestation: ${{ steps.attest.outputs.attestation-url }}" >> "${GITHUB_STEP_SUMMARY}"

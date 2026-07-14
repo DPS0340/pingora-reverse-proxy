@@ -25,6 +25,9 @@ test-container-script:
 test-verify:
     ./scripts/test-verify.sh
 
+test-release:
+    ./scripts/test-release.sh
+
 test-helm:
     ./scripts/test-helm.sh
 

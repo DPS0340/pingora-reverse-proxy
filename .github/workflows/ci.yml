@@ -18,6 +18,11 @@ jobs:
     name: Authoritative Linux verification
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    env:
+      CONTAINER_GATE_IMAGE_ARCHIVE: ${{ runner.temp }}/verified-image/image.tar
+      CONTAINER_GATE_IMAGE_METADATA: ${{ runner.temp }}/verified-image/metadata.env
+      CONTAINER_GATE_SOURCE_SHA: ${{ github.sha }}
+      CONTAINER_GATE_WORKFLOW_RUN_ID: ${{ github.run_id }}
     steps:
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -54,6 +59,23 @@ jobs:
 
       - name: Run authoritative release gate
         run: ./scripts/verify.sh
+
+      - name: Upload exact verified production image
+        id: verified-image
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: verified-image-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/verified-image/image.tar
+            ${{ runner.temp }}/verified-image/metadata.env
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Report verified artifact provenance
+        run: |
+          echo "Verified source: ${{ github.sha }}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "Workflow artifact SHA-256: ${{ steps.verified-image.outputs.artifact-digest }}" >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Upload failure evidence
         if: failure()

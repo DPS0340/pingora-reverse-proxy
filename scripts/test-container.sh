@@ -12,6 +12,7 @@ GID_CONTAINER="${RUN_ID}-gid"
 TMP_CONTAINER="${RUN_ID}-tmp"
 OWNER_LABEL="io.pingora-reverse-proxy.test-owner=${RUN_ID}"
 TOKEN="task13-container-token-${RUN_ID}"
+SOURCE_SHA=${CONTAINER_GATE_SOURCE_SHA:-$(git rev-parse HEAD)}
 TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/pingora-container-test.XXXXXX")
 SENTINEL="$ROOT_DIR/src/task13-untracked-secret-sentinel-${RUN_ID}.pem"
 INJECT_FAILURE=${CONTAINER_GATE_INJECT_FAILURE:-}
@@ -38,6 +39,16 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+if [[ ! $SOURCE_SHA =~ ^[0-9a-f]{40}$ ]]; then
+  echo "CONTAINER_GATE_SOURCE_SHA must be a full lowercase Git SHA" >&2
+  exit 2
+fi
+if { [[ -n ${CONTAINER_GATE_IMAGE_ARCHIVE:-} ]] && [[ -z ${CONTAINER_GATE_IMAGE_METADATA:-} ]]; } || \
+  { [[ -z ${CONTAINER_GATE_IMAGE_ARCHIVE:-} ]] && [[ -n ${CONTAINER_GATE_IMAGE_METADATA:-} ]]; }; then
+  echo "CONTAINER_GATE_IMAGE_ARCHIVE and CONTAINER_GATE_IMAGE_METADATA must be set together" >&2
+  exit 2
+fi
 
 if [[ -n "$INJECT_FAILURE" && "$INJECT_FAILURE" != "after-start" ]]; then
   printf 'unsupported CONTAINER_GATE_INJECT_FAILURE: %s\n' "$INJECT_FAILURE" >&2
@@ -69,6 +80,8 @@ fi
 "$TIMEOUT_BIN" "$BUILD_TIMEOUT" docker build \
     --pull \
     --label "$OWNER_LABEL" \
+    --label "org.opencontainers.image.revision=${SOURCE_SHA}" \
+    --label "org.opencontainers.image.source=https://github.com/dps0340/pingora-reverse-proxy" \
     --tag "$IMAGE" \
     - <"$TMP_DIR/context.tar"
 
@@ -167,5 +180,14 @@ fi
 
 "$TIMEOUT_BIN" 30 docker stop --time 15 "$CONTAINER" >/dev/null
 test "$("$TIMEOUT_BIN" 30 docker inspect --format '{{.State.ExitCode}}' "$CONTAINER")" = "0"
+
+if [[ -n ${CONTAINER_GATE_IMAGE_ARCHIVE:-} ]]; then
+  "$ROOT_DIR/scripts/image-artifact.sh" create \
+    "$IMAGE" \
+    "$CONTAINER_GATE_IMAGE_ARCHIVE" \
+    "$CONTAINER_GATE_IMAGE_METADATA" \
+    "$SOURCE_SHA" \
+    "${CONTAINER_GATE_WORKFLOW_RUN_ID:-local}"
+fi
 
 printf 'container gate passed: uid/gid=65532 read-only-root health/api/metrics ready cleanup-owned=%s\n' "$RUN_ID"

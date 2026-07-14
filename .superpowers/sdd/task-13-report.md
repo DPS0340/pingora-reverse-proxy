@@ -103,6 +103,35 @@ python3 -m py_compile scripts/run-bounded.py
 
 All exited zero; ShellCheck 0.11.0 emitted no diagnostics. The bounded runner creates a dedicated process session, streams combined output itself, sends TERM to the entire group at the phase deadline, waits 15 seconds for repository cleanup traps, and then sends KILL to the group. The container context is made only from tracked Dockerfile/build inputs, and `.dockerignore` independently defaults to excluding everything. Cleanup treats every Docker scan/removal error as a gate failure and verifies the exact owner label after removal.
 
+### Release-policy RED evidence
+
+The release regression was added before the policy and artifact helpers or workflow changes:
+
+```text
+./scripts/test-release.sh
+ruby: No such file or directory -- .../scripts/release-policy.rb (LoadError)
+exit 1
+```
+
+Its table includes valid stable, prerelease, build-metadata, and combined SemVer 2.0 tags plus invalid leading-zero, empty-identifier, numeric-prerelease-leading-zero, punctuation, and duplicate-build-separator cases. It also checks Docker-tag mapping collisions, archive/manifest/config/image identity, corruption and Docker inspection failures, SHA-bound cross-workflow artifact names, serialization, tag conflict inspection, full-SHA actions, least privilege, no `latest`, and absence of any CD build.
+
+Release-policy GREEN:
+
+```text
+./scripts/test-release.sh
+verified_image_id=sha256:b8bed7d9428761ffd1a180b81fabf6ab0215adc8fcf3777ea547552525b463b8
+release gate passed: strict SemVer, collision-free tags, exact archive identity, and no-rebuild promotion
+
+bash -n scripts/test-container.sh scripts/test-release.sh scripts/image-artifact.sh
+shellcheck -x scripts/test-container.sh scripts/test-release.sh scripts/image-artifact.sh
+ruby -c scripts/release-policy.rb
+ruby -e 'require "yaml"; ARGV.each { |path| YAML.parse_file(path) }' .github/workflows/ci.yml .github/workflows/cd.yml
+```
+
+All exited zero and ShellCheck emitted no diagnostics. CI now saves the image only after that same image passes the real container behavior gate, records independently checked archive/manifest/config/image-ID/revision/platform metadata, and uploads both under an artifact name derived only from the verified SHA. CD downloads by the triggering workflow run ID and head SHA, revalidates every identity and checksum, loads the archive, and never rebuilds. Publication is globally serialized; strict version/SHA tags are refused if already present; the release Git tag is fetched and rechecked immediately before candidate push and final manifest promotion. Final tags point at the candidate registry digest, and GitHub publishes a registry-linked build-provenance attestation. No `latest` tag is produced.
+
+SemVer build metadata maps `+` to `_`. This mapping is collision-free because `_` is invalid in every SemVer identifier but valid in a Docker tag; prerelease dots/hyphens and build identifiers otherwise remain unchanged.
+
 ## Scope and ownership
 
 Task 13 owns the production image/chart/release gates and the deployable closure of Task 12's intentionally fail-closed `sidecar` executable selection. Production Rust changes are limited to `src/config.rs` and `src/main.rs`: validated sidecar endpoint/token/deadlines are converted to `SidecarConfig`, `SidecarStore::connect` runs, and `RouteRegistry::load` completes before listener binding. Memory and Redis construction remain unchanged. Focused config and shipped-binary runtime tests cover this boundary.
