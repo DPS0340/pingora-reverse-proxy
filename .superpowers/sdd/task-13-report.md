@@ -132,6 +132,22 @@ All exited zero and ShellCheck emitted no diagnostics. CI now saves the image on
 
 SemVer build metadata maps `+` to `_`. This mapping is collision-free because `_` is invalid in every SemVer identifier but valid in a Docker tag; prerelease dots/hyphens and build identifiers otherwise remain unchanged.
 
+### Review-discovered sibling probes that were false
+
+Two additional fail-closed edge cases were probed before adding production code. No production change was necessary:
+
+```text
+cargo test --locked --test config_contract listener_tls_file_paths_must_be_non_empty -- --exact
+```
+
+The first test draft expected raw Clap parsing to accept an empty `--ssl-key`, `--api-ssl-cert`, or `--ssl-ca`; it instead failed inside `Cli::try_parse_from` with `InvalidValue` and an empty value before `AppConfig` could be built. The retained regression asserts this parser boundary directly.
+
+```text
+helm template task13-invalid-non-integral ./helm-chart --set replicaCount=1.5
+```
+
+This exited 1 with the exact `replicaCount must be exactly 1 until cross-process route propagation is implemented` diagnostic. The suspected float-to-one acceptance was false; the negative case remains in the Helm matrix.
+
 ## Scope and ownership
 
 Task 13 owns the production image/chart/release gates and the deployable closure of Task 12's intentionally fail-closed `sidecar` executable selection. Production Rust changes are limited to `src/config.rs` and `src/main.rs`: validated sidecar endpoint/token/deadlines are converted to `SidecarConfig`, `SidecarStore::connect` runs, and `RouteRegistry::load` completes before listener binding. Memory and Redis construction remain unchanged. Focused config and shipped-binary runtime tests cover this boundary.

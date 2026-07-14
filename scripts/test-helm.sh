@@ -126,6 +126,9 @@ for backend in memory redis sidecar; do
   fi
   expect_render_failure "${backend}-replicas" "replicaCount must be exactly 1 until cross-process route propagation is implemented" "${backend_args[@]}"
 done
+expect_render_failure non-integral-replicas \
+  "replicaCount must be exactly 1 until cross-process route propagation is implemented" \
+  --set replicaCount=1.5
 expect_render_failure public-reject-without-request \
   "tls.public.rejectUnauthorized requires requestCert=true and a non-empty clientCAKey" \
   --set probes.enabled=false \

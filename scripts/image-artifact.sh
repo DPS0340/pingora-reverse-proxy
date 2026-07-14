@@ -31,65 +31,65 @@ manifest_config() {
   ' "$1"
 }
 
-create_artifact() {
+create_artifact() (
   if (( $# != 5 )); then
     echo "usage: image-artifact.sh create IMAGE ARCHIVE METADATA SOURCE_SHA WORKFLOW_RUN_ID" >&2
     exit 2
   fi
-  local image=$1 archive=$2 metadata=$3 source_sha=$4 workflow_run_id=$5
-  [[ $source_sha =~ ^[0-9a-f]{40}$ ]] || {
+  local create_image=$1 create_archive=$2 create_metadata=$3 create_source=$4 create_run_id=$5
+  [[ $create_source =~ ^[0-9a-f]{40}$ ]] || {
     echo "source SHA must be 40 lowercase hexadecimal characters" >&2
     exit 1
   }
-  [[ $workflow_run_id =~ ^([0-9]+|local)$ ]] || {
+  [[ $create_run_id =~ ^([0-9]+|local)$ ]] || {
     echo "workflow run ID must be numeric or local" >&2
     exit 1
   }
-  mkdir -p "$(dirname "$archive")" "$(dirname "$metadata")"
+  mkdir -p "$(dirname "$create_archive")" "$(dirname "$create_metadata")"
   local temporary
   temporary=$(mktemp -d "${TMPDIR:-/tmp}/pingora-image-artifact.XXXXXX")
-  trap 'rm -rf "$temporary"' RETURN
+  trap 'rm -rf "$temporary"' EXIT INT TERM
 
-  docker image save --output "$archive" "$image"
-  extract_manifest "$archive" "$temporary/manifest.json" "$temporary/listing"
-  local config_path config_sha image_id revision os architecture
-  config_path=$(manifest_config "$temporary/manifest.json")
-  [[ $(grep -Fxc "$config_path" "$temporary/listing") -eq 1 ]] || {
+  docker image save --output "$create_archive" "$create_image"
+  extract_manifest "$create_archive" "$temporary/manifest.json" "$temporary/listing"
+  local create_config_path create_config_sha create_image_id create_revision create_os create_architecture
+  create_config_path=$(manifest_config "$temporary/manifest.json")
+  [[ $(grep -Fxc "$create_config_path" "$temporary/listing") -eq 1 ]] || {
     echo "image archive config entry is missing or duplicated" >&2
     exit 1
   }
-  tar -xOf "$archive" "$config_path" >"$temporary/config.json"
-  config_sha=$(sha256_file "$temporary/config.json")
-  image_id=$(docker image inspect --format '{{.Id}}' "$image")
-  revision=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")
-  os=$(docker image inspect --format '{{.Os}}' "$image")
-  architecture=$(docker image inspect --format '{{.Architecture}}' "$image")
-  [[ $image_id == "sha256:$config_sha" ]] || {
+  tar -xOf "$create_archive" "$create_config_path" >"$temporary/config.json"
+  create_config_sha=$(sha256_file "$temporary/config.json")
+  create_image_id=$(docker image inspect --format '{{.Id}}' "$create_image")
+  create_revision=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$create_image")
+  create_os=$(docker image inspect --format '{{.Os}}' "$create_image")
+  create_architecture=$(docker image inspect --format '{{.Architecture}}' "$create_image")
+  [[ $create_image_id == "sha256:$create_config_sha" ]] || {
     echo "saved image config does not match the inspected image ID" >&2
     exit 1
   }
-  [[ $revision == "$source_sha" ]] || {
+  [[ $create_revision == "$create_source" ]] || {
     echo "OCI revision label does not match the verified source SHA" >&2
     exit 1
   }
 
-  local metadata_tmp="${metadata}.tmp.$$"
+  local metadata_tmp="${create_metadata}.tmp.$$"
   {
     echo "schema=1"
-    echo "source_sha=$source_sha"
-    echo "workflow_run_id=$workflow_run_id"
-    echo "image_id=$image_id"
-    echo "archive_sha256=$(sha256_file "$archive")"
+    echo "source_sha=$create_source"
+    echo "workflow_run_id=$create_run_id"
+    echo "image_id=$create_image_id"
+    echo "archive_sha256=$(sha256_file "$create_archive")"
     echo "manifest_sha256=$(sha256_file "$temporary/manifest.json")"
-    echo "config_sha256=$config_sha"
-    echo "os=$os"
-    echo "architecture=$architecture"
-    echo "revision_label=$revision"
+    echo "config_sha256=$create_config_sha"
+    echo "os=$create_os"
+    echo "architecture=$create_architecture"
+    echo "revision_label=$create_revision"
   } >"$metadata_tmp"
-  mv "$metadata_tmp" "$metadata"
-}
+  mv "$metadata_tmp" "$create_metadata"
+)
 
-verify_artifact() {
+verify_artifact() (
   if (( $# != 4 )); then
     echo "usage: image-artifact.sh verify ARCHIVE METADATA EXPECTED_SHA EXPECTED_WORKFLOW_RUN_ID" >&2
     exit 2
@@ -105,7 +105,7 @@ verify_artifact() {
   }
   local temporary
   temporary=$(mktemp -d "${TMPDIR:-/tmp}/pingora-image-artifact.XXXXXX")
-  trap 'rm -rf "$temporary"' RETURN
+  trap 'rm -rf "$temporary"' EXIT INT TERM
 
   declare -A values=()
   while IFS='=' read -r key value; do
@@ -162,7 +162,7 @@ verify_artifact() {
   [[ $(docker image inspect --format '{{.Architecture}}' "${values[image_id]}") == "${values[architecture]}" ]]
   [[ $(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "${values[image_id]}") == "$expected_sha" ]]
   echo "verified_image_id=${values[image_id]}"
-}
+)
 
 if (( $# < 1 )); then
   echo "usage: image-artifact.sh create|verify ..." >&2

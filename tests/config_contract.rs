@@ -339,6 +339,28 @@ fn listener_rejection_requires_certificate_request_and_ca() {
 }
 
 #[test]
+fn listener_tls_file_paths_must_be_non_empty() {
+    for args in [
+        vec!["proxy", "--ssl-key", "", "--ssl-cert", "public.crt"],
+        vec!["proxy", "--api-ssl-key", "api.key", "--api-ssl-cert", ""],
+        vec![
+            "proxy",
+            "--ssl-key",
+            "public.key",
+            "--ssl-cert",
+            "public.crt",
+            "--ssl-ca",
+            "",
+            "--ssl-request-cert",
+            "--ssl-reject-unauthorized",
+        ],
+    ] {
+        let error = Cli::try_parse_from(args).expect_err("empty TLS path was accepted");
+        assert!(error.to_string().contains("a value is required"));
+    }
+}
+
+#[test]
 fn client_certificate_request_flags_are_rejected_instead_of_ignored() {
     for flag in [
         "--client-ssl-request-cert",
