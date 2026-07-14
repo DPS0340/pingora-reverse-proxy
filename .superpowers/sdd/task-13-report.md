@@ -20,6 +20,8 @@ Closure commits, in order:
 - `51febd769f192e7c0bd432dca160a0a093b65878` — legacy and OCI-layout saved-image identity verification.
 - `b7e03f9335839d6fecc4e9ba25d4312b48d31c0c` — warning-free shared sidecar startup barrier.
 - `4800d766fabdf387297af9a79c9d777b840faba5` — review-closure evidence update.
+- `6e7022c11870e88c3bdd9f23c544e0755e38c81b` — closure-report commit identity binding.
+- `f1111e1e602c6b355f2155f69d12c0019a8380e5` — avoid a redundant post-KILL process-group signal.
 
 ### Runtime and Helm RED evidence
 
@@ -127,6 +129,17 @@ python3 -m py_compile scripts/run-bounded.py
 ```
 
 All exited zero; ShellCheck 0.11.0 emitted no diagnostics. The bounded runner creates a dedicated process session, streams combined output itself, sends TERM to the entire group at the phase deadline, waits 15 seconds for repository cleanup traps, and then sends KILL to the group. The container context is made only from tracked Dockerfile/build inputs, and `.dockerignore` independently defaults to excluding everything. Cleanup treats every Docker scan/removal error as a gate failure and verifies the exact owner label after removal.
+
+A later final-HEAD repeat exposed a macOS process-group cleanup race after the KILL fallback had already succeeded:
+
+```text
+PermissionError: [Errno 1] Operation not permitted
+  File "scripts/run-bounded.py", line 139, in main
+    signal_group(process_group, signal.SIGKILL)
+error: recipe `test-verify` failed on line 26 with exit code 1
+```
+
+The bounded loop had sent KILL successfully, reaped the direct child, and observed the shared output pipe close; its `finally` block then unnecessarily probed and signaled the drained group a second time. The cleanup path now skips only that redundant second KILL when `kill_sent` is already true. Before-KILL errors still trigger the final group cleanup and still fail closed. The complete nested-child/log/resource/TERM/KILL/status/order regression passed 10 consecutive runs after the change.
 
 ### Release-policy RED evidence
 
