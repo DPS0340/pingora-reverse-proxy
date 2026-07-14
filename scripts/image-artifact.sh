@@ -26,9 +26,45 @@ manifest_config() {
     manifest = JSON.parse(File.read(ARGV.fetch(0)))
     abort "image archive must contain exactly one image manifest" unless manifest.length == 1
     config = manifest.fetch(0).fetch("Config")
-    abort "unsafe image config path" unless /\A[0-9a-f]{64}\.json\z/.match?(config)
+    allowed = /\A(?:[0-9a-f]{64}\.json|blobs\/sha256\/[0-9a-f]{64})\z/
+    abort "unsafe image config path" unless allowed.match?(config)
     puts config
   ' "$1"
+}
+
+verify_saved_image_identity() {
+  local archive=$1 listing=$2 temporary=$3 image_id=$4 config_sha=$5
+  local image_hex=${image_id#sha256:}
+  [[ $image_id =~ ^sha256:[0-9a-f]{64}$ ]] || {
+    echo "saved image ID is not a sha256 digest" >&2
+    exit 1
+  }
+  if [[ $image_hex == "$config_sha" ]]; then
+    return
+  fi
+
+  local image_path="blobs/sha256/$image_hex"
+  [[ $(grep -Fxc "$image_path" "$listing") -eq 1 ]] || {
+    echo "saved OCI image identity blob is missing or duplicated" >&2
+    exit 1
+  }
+  tar -xOf "$archive" "$image_path" >"$temporary/image-identity.json"
+  [[ $(sha256_file "$temporary/image-identity.json") == "$image_hex" ]] || {
+    echo "saved OCI image identity digest does not match its bytes" >&2
+    exit 1
+  }
+  [[ $(grep -Fxc index.json "$listing") -eq 1 ]] || {
+    echo "saved OCI image identity requires exactly one index.json" >&2
+    exit 1
+  }
+  tar -xOf "$archive" index.json >"$temporary/index.json"
+  ruby -rjson -e '
+    index = JSON.parse(File.read(ARGV.fetch(0)))
+    expected = ARGV.fetch(1)
+    manifests = index.fetch("manifests")
+    abort "saved OCI index does not reference the inspected image ID" unless
+      manifests.count { |manifest| manifest["digest"] == expected } == 1
+  ' "$temporary/index.json" "$image_id"
 }
 
 create_artifact() (
@@ -64,10 +100,8 @@ create_artifact() (
   create_revision=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$create_image")
   create_os=$(docker image inspect --format '{{.Os}}' "$create_image")
   create_architecture=$(docker image inspect --format '{{.Architecture}}' "$create_image")
-  [[ $create_image_id == "sha256:$create_config_sha" ]] || {
-    echo "saved image config does not match the inspected image ID" >&2
-    exit 1
-  }
+  verify_saved_image_identity \
+    "$create_archive" "$temporary/listing" "$temporary" "$create_image_id" "$create_config_sha"
   [[ $create_revision == "$create_source" ]] || {
     echo "OCI revision label does not match the verified source SHA" >&2
     exit 1
@@ -133,7 +167,6 @@ verify_artifact() (
   [[ ${values[archive_sha256]} =~ ^[0-9a-f]{64}$ ]]
   [[ ${values[manifest_sha256]} =~ ^[0-9a-f]{64}$ ]]
   [[ ${values[config_sha256]} =~ ^[0-9a-f]{64}$ ]]
-  [[ ${values[image_id]} == "sha256:${values[config_sha256]}" ]]
   [[ $(sha256_file "$archive") == "${values[archive_sha256]}" ]] || {
     echo "image archive checksum mismatch" >&2
     exit 1
@@ -155,6 +188,8 @@ verify_artifact() (
     echo "image config checksum mismatch" >&2
     exit 1
   }
+  verify_saved_image_identity \
+    "$archive" "$temporary/listing" "$temporary" "${values[image_id]}" "${values[config_sha256]}"
 
   docker load --input "$archive" >/dev/null
   [[ $(docker image inspect --format '{{.Id}}' "${values[image_id]}") == "${values[image_id]}" ]]

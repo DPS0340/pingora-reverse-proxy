@@ -49,14 +49,20 @@ for tag in "${invalid_tags[@]}"; do
   fi
 done
 
-mkdir -p "$TMP_DIR/archive/layer"
+mkdir -p "$TMP_DIR/archive/layer" "$TMP_DIR/archive/blobs/sha256"
 printf '{"architecture":"amd64","os":"linux"}\n' >"$TMP_DIR/archive/config.json"
 config_sha=$(sha256sum "$TMP_DIR/archive/config.json" | cut -d' ' -f1)
-mv "$TMP_DIR/archive/config.json" "$TMP_DIR/archive/${config_sha}.json"
+mv "$TMP_DIR/archive/config.json" "$TMP_DIR/archive/blobs/sha256/${config_sha}"
 printf 'layer-bytes\n' >"$TMP_DIR/archive/layer/layer.tar"
-printf '[{"Config":"%s.json","RepoTags":["tested:image"],"Layers":["layer/layer.tar"]}]\n' \
+printf '[{"Config":"blobs/sha256/%s","RepoTags":["tested:image"],"Layers":["layer/layer.tar"]}]\n' \
   "$config_sha" >"$TMP_DIR/archive/manifest.json"
-tar -cf "$TMP_DIR/image.tar" -C "$TMP_DIR/archive" manifest.json "${config_sha}.json" layer/layer.tar
+printf '{"schemaVersion":2,"manifests":[]}' >"$TMP_DIR/archive/image-index.json"
+image_sha=$(sha256sum "$TMP_DIR/archive/image-index.json" | cut -d' ' -f1)
+mv "$TMP_DIR/archive/image-index.json" "$TMP_DIR/archive/blobs/sha256/${image_sha}"
+printf '{"schemaVersion":2,"manifests":[{"digest":"sha256:%s"}]}' \
+  "$image_sha" >"$TMP_DIR/archive/index.json"
+tar -cf "$TMP_DIR/image.tar" -C "$TMP_DIR/archive" \
+  manifest.json index.json "blobs/sha256/${image_sha}" "blobs/sha256/${config_sha}" layer/layer.tar
 archive_sha=$(sha256sum "$TMP_DIR/image.tar" | cut -d' ' -f1)
 manifest_sha=$(sha256sum "$TMP_DIR/archive/manifest.json" | cut -d' ' -f1)
 source_sha=$(printf '1%.0s' {1..40})
@@ -64,7 +70,7 @@ cat >"$TMP_DIR/metadata.env" <<EOF
 schema=1
 source_sha=$source_sha
 workflow_run_id=local
-image_id=sha256:$config_sha
+image_id=sha256:$image_sha
 archive_sha256=$archive_sha
 manifest_sha256=$manifest_sha
 config_sha256=$config_sha
@@ -100,7 +106,7 @@ chmod 0755 "$TMP_DIR/bin/docker"
 
 PATH="$TMP_DIR/bin:$PATH" \
   FAKE_DOCKER_LOG="$TMP_DIR/docker.log" \
-  FAKE_IMAGE_ID="sha256:$config_sha" \
+  FAKE_IMAGE_ID="sha256:$image_sha" \
   FAKE_SOURCE_SHA="$source_sha" \
   "$ROOT_DIR/scripts/image-artifact.sh" verify \
     "$TMP_DIR/image.tar" "$TMP_DIR/metadata.env" "$source_sha" local
@@ -111,7 +117,7 @@ cp "$TMP_DIR/image.tar" "$TMP_DIR/corrupt.tar"
 printf 'corruption' >>"$TMP_DIR/corrupt.tar"
 if PATH="$TMP_DIR/bin:$PATH" \
   FAKE_DOCKER_LOG="$TMP_DIR/corrupt-docker.log" \
-  FAKE_IMAGE_ID="sha256:$config_sha" \
+  FAKE_IMAGE_ID="sha256:$image_sha" \
   FAKE_SOURCE_SHA="$source_sha" \
   "$ROOT_DIR/scripts/image-artifact.sh" verify \
     "$TMP_DIR/corrupt.tar" "$TMP_DIR/metadata.env" "$source_sha" local >/dev/null 2>&1; then
@@ -122,7 +128,7 @@ fi
 if PATH="$TMP_DIR/bin:$PATH" \
   FAKE_DOCKER_LOG="$TMP_DIR/inspect-docker.log" \
   FAKE_DOCKER_INSPECT_FAILURE=1 \
-  FAKE_IMAGE_ID="sha256:$config_sha" \
+  FAKE_IMAGE_ID="sha256:$image_sha" \
   FAKE_SOURCE_SHA="$source_sha" \
   "$ROOT_DIR/scripts/image-artifact.sh" verify \
     "$TMP_DIR/image.tar" "$TMP_DIR/metadata.env" "$source_sha" local >/dev/null 2>&1; then
