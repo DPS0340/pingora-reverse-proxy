@@ -49,16 +49,22 @@ pub enum PidFileError {
 
 /// RAII ownership of a PID file created with `create_new`.
 pub struct PidFileGuard {
+    // Struct fields drop in declaration order. Keep the descriptor after the path owner so
+    // cleanup compares and quarantines the path while the original inode is still pinned.
     _owned: OwnedPath,
+    _file: std::fs::File,
 }
 
 impl PidFileGuard {
     pub fn acquire(path: impl AsRef<Path>) -> Result<Self, PidFileError> {
         let path = path.as_ref().to_owned();
-        let (mut file, owned) = OwnedPath::create_new_file(path).map_err(PidFileError::Create)?;
-        let guard = Self { _owned: owned };
-        writeln!(file, "{}", std::process::id()).map_err(PidFileError::Write)?;
-        file.sync_data().map_err(PidFileError::Write)?;
+        let (file, owned) = OwnedPath::create_new_file(path).map_err(PidFileError::Create)?;
+        let mut guard = Self {
+            _owned: owned,
+            _file: file,
+        };
+        writeln!(guard._file, "{}", std::process::id()).map_err(PidFileError::Write)?;
+        guard._file.sync_data().map_err(PidFileError::Write)?;
         Ok(guard)
     }
 }
