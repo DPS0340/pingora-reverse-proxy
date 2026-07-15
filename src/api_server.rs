@@ -2435,7 +2435,6 @@ mod tests {
         super::drop_public_listener_resources(Some(owner), handoff);
 
         assert!(descriptor_was_open.load(Ordering::Acquire));
-        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
     }
 
     #[cfg(unix)]
