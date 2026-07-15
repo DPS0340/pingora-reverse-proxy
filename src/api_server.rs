@@ -784,8 +784,9 @@ fn completed_tls_handshake(
 
 #[cfg(unix)]
 struct OwnedUnixListener {
-    listener: tokio::net::UnixListener,
+    // Drop ownership and unlink while the listener still pins the socket inode.
     _owner: SocketOwner,
+    listener: tokio::net::UnixListener,
 }
 
 #[cfg(unix)]
@@ -795,8 +796,8 @@ impl OwnedUnixListener {
         let listener =
             tokio::net::UnixListener::from_std(socket.into()).map_err(ListenerError::UnixBind)?;
         Ok(Self {
-            listener,
             _owner: owner,
+            listener,
         })
     }
 }
@@ -826,6 +827,8 @@ impl Listener for OwnedUnixListener {
 #[cfg(unix)]
 struct SocketOwner {
     owned: OwnedPath,
+    #[cfg(test)]
+    before_drop: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 #[cfg(unix)]
@@ -834,11 +837,24 @@ impl SocketOwner {
     fn from_path(path: PathBuf) -> io::Result<Self> {
         Ok(Self {
             owned: OwnedPath::from_path(path)?,
+            before_drop: None,
         })
     }
 
     fn from_owned(owned: OwnedPath) -> Self {
-        Self { owned }
+        Self {
+            owned,
+            #[cfg(test)]
+            before_drop: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn set_before_drop_hook<F>(&mut self, hook: F)
+    where
+        F: FnOnce() + Send + Sync + 'static,
+    {
+        self.before_drop = Some(Box::new(hook));
     }
 
     fn pingora_path(&self) -> io::Result<PathBuf> {
@@ -882,6 +898,15 @@ impl SocketOwner {
     }
 }
 
+#[cfg(all(unix, test))]
+impl Drop for SocketOwner {
+    fn drop(&mut self) {
+        if let Some(hook) = self.before_drop.take() {
+            hook();
+        }
+    }
+}
+
 /// An exact public-listener owner transferred into Pingora's supported FD adoption table.
 #[cfg(unix)]
 pub struct PreboundPublicService<A> {
@@ -910,8 +935,9 @@ enum PublicListenerReservation {
         key: String,
     },
     Unix {
-        socket: socket2::Socket,
+        // Keep the socket descriptor alive until owner cleanup has finished.
         owner: SocketOwner,
+        socket: socket2::Socket,
     },
 }
 
@@ -1314,9 +1340,8 @@ where
         if let Some(hook) = self.before_handoff_guard_drop.take() {
             hook(handoff.armed);
         }
-        drop(handoff);
+        drop_public_listener_resources(owner, handoff);
         tracing::debug!("Pingora public listener service stopped");
-        drop(owner);
     }
 
     fn name(&self) -> &str {
@@ -1326,6 +1351,13 @@ where
     fn threads(&self) -> Option<usize> {
         self.service.as_ref().and_then(|service| service.threads)
     }
+}
+
+#[cfg(unix)]
+fn drop_public_listener_resources(owner: Option<SocketOwner>, handoff: RawFdHandoffGuard) {
+    // Cleanup must run before the handoff guard closes the last listener FD.
+    drop(owner);
+    drop(handoff);
 }
 
 /// Install one TCP/TLS/UDS public Pingora endpoint.
@@ -1580,6 +1612,8 @@ mod tests {
     use std::io;
     #[cfg(unix)]
     use std::path::{Path, PathBuf};
+    #[cfg(unix)]
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -2329,6 +2363,79 @@ mod tests {
             0,
             "armed handoff guard closed a replacement descriptor"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn owned_unix_listener_keeps_descriptor_alive_through_owner_cleanup() {
+        use std::os::fd::AsRawFd;
+
+        let directory = tempfile::tempdir().expect("temporary owned listener directory");
+        let path = directory.path().join("owned.sock");
+        let mut listener = super::OwnedUnixListener::bind(path).expect("bind owned listener");
+        let fd = listener.listener.as_raw_fd();
+        let descriptor_was_open = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&descriptor_was_open);
+        listener._owner.set_before_drop_hook(move || {
+            observed.store(
+                unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0,
+                Ordering::Release,
+            );
+        });
+
+        drop(listener);
+
+        assert!(descriptor_was_open.load(Ordering::Acquire));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_reservation_keeps_descriptor_alive_through_owner_cleanup() {
+        use std::os::fd::AsRawFd;
+
+        let directory = tempfile::tempdir().expect("temporary reservation directory");
+        let path = directory.path().join("reservation.sock");
+        let (socket, mut owner) = super::bind_unix_socket(path).expect("bind reservation");
+        let fd = socket.as_raw_fd();
+        let descriptor_was_open = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&descriptor_was_open);
+        owner.set_before_drop_hook(move || {
+            observed.store(
+                unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0,
+                Ordering::Release,
+            );
+        });
+
+        drop(super::PublicListenerReservation::Unix { socket, owner });
+
+        assert!(descriptor_was_open.load(Ordering::Acquire));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adopted_public_listener_keeps_descriptor_alive_through_owner_cleanup() {
+        use std::os::fd::{AsRawFd, IntoRawFd};
+
+        let directory = tempfile::tempdir().expect("temporary adopted listener directory");
+        let path = directory.path().join("adopted.sock");
+        let (socket, mut owner) = super::bind_unix_socket(path).expect("bind adopted listener");
+        let fd = socket.as_raw_fd();
+        let descriptor_was_open = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&descriptor_was_open);
+        owner.set_before_drop_hook(move || {
+            observed.store(
+                unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0,
+                Ordering::Release,
+            );
+        });
+        let fd = socket.into_raw_fd();
+        let mut handoff = super::RawFdHandoffGuard::new(fd).expect("capture adopted descriptor");
+        handoff.arm();
+
+        super::drop_public_listener_resources(Some(owner), handoff);
+
+        assert!(descriptor_was_open.load(Ordering::Acquire));
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
     }
 
     #[cfg(unix)]

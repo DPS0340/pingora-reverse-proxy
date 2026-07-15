@@ -78,8 +78,12 @@ jobs:
             target
           key: linux-cargo-${{ steps.linux-toolchain.outputs.rustc }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
 
+      - name: Run verification contract tests
+        run: |
+          bash scripts/test-release.sh
+          bash scripts/test-verify.sh
       - name: Run authoritative release gate
-        run: ./scripts/verify.sh
+        run: bash scripts/verify.sh
 
       - name: Upload exact verified production image
         id: verified-image
@@ -98,11 +102,11 @@ jobs:
           echo "Verified source: ${{ github.sha }}" >> "${GITHUB_STEP_SUMMARY}"
           echo "Workflow artifact SHA-256: ${{ steps.verified-image.outputs.artifact-digest }}" >> "${GITHUB_STEP_SUMMARY}"
 
-      - name: Upload failure evidence
-        if: failure()
+      - name: Upload verification evidence
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: linux-verification-failure-${{ github.run_id }}
+          name: linux-verification-${{ github.sha }}-${{ github.run_id }}
           if-no-files-found: ignore
           retention-days: 14
           path: |

@@ -8,6 +8,7 @@ import datetime as dt
 import html
 import json
 import os
+import platform
 import re
 import secrets
 import shutil
@@ -39,6 +40,7 @@ PINNED_PACKAGES = {
     "websocket-client": "1.8.0",
 }
 EXPECTED_JUPYTERHUB_COMMIT = "97b3154610726b5b7d8768f1e89a4d910e002854"
+EXPECTED_PYTHON_VERSION = "3.11.2"
 JUPYTERHUB_SOURCE_COMMIT_PATH = Path("/opt/jupyterhub-source-commit")
 USERS = ("river", "秀樹", "has@", "space user")
 REQUIRED_SCENARIOS = frozenset(
@@ -1270,6 +1272,11 @@ def host_routing_scenario(runtime: ScenarioRuntime, recorder: Recorder) -> None:
 def assert_pinned_runtime(recorder: Recorder) -> None:
     from importlib.metadata import version
 
+    actual_python = platform.python_version()
+    if actual_python != EXPECTED_PYTHON_VERSION:
+        raise GateError(
+            f"Python is {actual_python}, expected {EXPECTED_PYTHON_VERSION}"
+        )
     for package, expected in PINNED_PACKAGES.items():
         actual = version(package)
         if actual != expected:

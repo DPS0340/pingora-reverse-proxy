@@ -90,6 +90,10 @@ expected=(01-fmt 02-clippy 03-tests 04-differential 05-jupyterhub 06-container 0
 test "${phases[*]}" = "${expected[*]}"
 grep -Fq 'DIFFERENTIAL_ALL_TARGETS=1 ./scripts/test-differential.sh' "$ROOT_DIR/scripts/verify.sh"
 grep -Fq 'cargo_args=(--locked --all-targets --all-features)' "$ROOT_DIR/scripts/test-differential.sh"
+grep -Fq 'manifest.tsv' "$ROOT_DIR/scripts/verify.sh"
+grep -Fq 'source_sha\t' "$ROOT_DIR/scripts/verify.sh"
+grep -Fq 'elapsed_milliseconds\t' "$ROOT_DIR/scripts/verify.sh"
+grep -Fq 'property_cases\t36864' "$ROOT_DIR/scripts/verify.sh"
 if grep -Fq -- '--foreground' "$ROOT_DIR/scripts/verify.sh"; then
   echo "verify still uses foreground-only timeout semantics" >&2
   exit 1

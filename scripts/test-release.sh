@@ -159,6 +159,11 @@ grep -Fq "name: verified-image-\${{ github.event.workflow_run.head_sha }}" "$ROO
 grep -Fq 'scripts/image-artifact.sh verify' "$ROOT_DIR/.github/workflows/cd.yml"
 grep -Fqx 'channel = "1.85.1"' "$ROOT_DIR/rust-toolchain.toml"
 grep -Fq 'PROPTEST_CASES=4096' "$ROOT_DIR/scripts/verify.sh"
+grep -Fq 'bounded transport tag `candidate-staging`' "$ROOT_DIR/README.md"
+if grep -Fq 'candidate unique to the CD run attempt' "$ROOT_DIR/README.md"; then
+  echo "README still documents the obsolete unbounded candidate scheme" >&2
+  exit 1
+fi
 ruby -ryaml - "$ROOT_DIR/.github/workflows/ci.yml" "$ROOT_DIR/.github/workflows/cd.yml" <<'RUBY'
 def assert(condition, message)
   raise message unless condition
@@ -179,10 +184,16 @@ linux_steps = linux.fetch('steps')
 install_index = linux_steps.index { |step| step['name'] == 'Install actionlint' }
 lint_index = linux_steps.index { |step| step['name'] == 'Check workflow schemas' }
 tools_index = linux_steps.index { |step| step['name'] == 'Install native and release-gate tools' }
+contracts_index = linux_steps.index { |step| step['name'] == 'Run verification contract tests' }
 verify_index = linux_steps.index { |step| step['name'] == 'Run authoritative release gate' }
-assert(install_index && lint_index && tools_index && verify_index &&
-       install_index < lint_index && lint_index < tools_index && tools_index < verify_index,
-       'schema checking and exact release-tool installation must precede the authoritative gate')
+assert(install_index && lint_index && tools_index && contracts_index && verify_index &&
+       install_index < lint_index && lint_index < tools_index &&
+       tools_index < contracts_index && contracts_index < verify_index,
+       'schema checking, exact tools, and verification contracts must precede the authoritative gate')
+contracts_script = linux_steps.fetch(contracts_index).fetch('run')
+assert(contracts_script.include?('bash scripts/test-release.sh') &&
+       contracts_script.include?('bash scripts/test-verify.sh'),
+       'authoritative CI must exercise release and verifier contracts')
 install_script = linux_steps.fetch(install_index).fetch('run')
 assert(install_script.include?('actionlint_1.7.12_linux_amd64.tar.gz'),
        'actionlint install must pin the Linux amd64 v1.7.12 archive')
@@ -213,6 +224,14 @@ upload_paths = upload.fetch('with').fetch('path').lines.map(&:strip).reject(&:em
 assert(upload_paths == ['${{ env.CONTAINER_GATE_IMAGE_ARCHIVE }}',
                         '${{ env.CONTAINER_GATE_IMAGE_METADATA }}'],
        'artifact upload must consume the same archive and metadata paths as verification')
+
+verification_evidence = linux_steps.find { |step| step['name'] == 'Upload verification evidence' }
+assert(verification_evidence && verification_evidence.fetch('if') == 'always()',
+       'exact-SHA verification evidence must upload on both success and failure')
+evidence_with = verification_evidence.fetch('with')
+assert(evidence_with.fetch('name').include?('${{ github.sha }}') &&
+       evidence_with.fetch('path').include?('.verification-logs/'),
+       'verification evidence artifact must bind logs and manifest to the exact source SHA')
 
 concurrency = cd.fetch('concurrency')
 assert(concurrency.keys.sort == ['cancel-in-progress', 'group'],

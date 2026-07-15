@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -41,6 +42,30 @@ class VersionProbeTests(unittest.TestCase):
                 "single-user entry point",
                 timeout=2,
             )
+
+    def test_pinned_runtime_rejects_the_wrong_python_interpreter(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            source_commit = Path(root) / "jupyterhub-source-commit"
+            source_commit.write_text(
+                HARNESS.EXPECTED_JUPYTERHUB_COMMIT,
+                encoding="ascii",
+            )
+            recorder = SimpleNamespace(passed=lambda _name: None)
+            with (
+                mock.patch.object(HARNESS, "PINNED_PACKAGES", {}),
+                mock.patch.object(
+                    HARNESS,
+                    "JUPYTERHUB_SOURCE_COMMIT_PATH",
+                    source_commit,
+                ),
+                mock.patch.object(HARNESS, "assert_command_version"),
+                mock.patch("platform.python_version", return_value="3.12.12"),
+            ):
+                with self.assertRaisesRegex(
+                    HARNESS.GateError,
+                    "Python is 3.12.12, expected 3.11.2",
+                ):
+                    HARNESS.assert_pinned_runtime(recorder)
 
 
 class ReconciliationTests(unittest.TestCase):

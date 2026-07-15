@@ -1146,10 +1146,15 @@ checks are implementation feedback, not release authorization:
 The immutable implementation commit must still pass `bash scripts/verify.sh` and
 exact-SHA GitHub Linux/macOS CI before release. Phase 03 sets
 `PROPTEST_CASES=4096`; the nine property runners therefore execute 36,864
-successful generated cases. Canonical phase logs and their exact commit metadata
-are external artifacts because a commit cannot embed its own SHA without
-changing that SHA. No table in this document substitutes for those exact-SHA
-artifacts.
+successful generated cases. Every verifier invocation writes
+`.verification-logs/manifest.tsv` with the exact source SHA, resolved tool
+versions, each phase status and elapsed milliseconds, aggregate Rust test and
+differential counts, and JupyterHub run/scenario counts. Linux CI uploads that
+manifest and all phase logs on both success and failure in an artifact whose
+name contains the exact source SHA and workflow run ID. Canonical phase logs
+and their exact commit metadata are external artifacts because a commit cannot
+embed its own SHA without changing that SHA. No table in this document
+substitutes for those exact-SHA artifacts.
 
 Project source builds, Clippy, and tests use exact Rust 1.85.1 from
 `rust-toolchain.toml`; CI rejects any other resolved compiler. CI builds the
@@ -1157,7 +1162,7 @@ pinned Just 1.56.0, cargo-audit 0.22.2, and cargo-deny 0.20.2 binaries under a
 separate exact Rust 1.89.0 toolchain because those tool releases declare newer
 MSRVs, without changing the project compiler. Production and clean JupyterHub
 images independently verify Rust 1.85.1 before building; JupyterHub 5.5.0 runs
-with Python 3.12.12.
+with Python 3.11.2.
 
 A mechanical audit of CHP 5.3.0 `bin/configurable-http-proxy` lines 24–120 found
 48 long options and the compatibility matrix contains exactly the same 48:
