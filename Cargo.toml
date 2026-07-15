@@ -41,6 +41,7 @@ url = { version = "2", features = ["serde"] }
 webpki-roots = "1"
 
 [dev-dependencies]
+pingora-load-balancing = "0.8.1"
 proptest = "1.7"
 serial_test = "3"
 tempfile = "3"

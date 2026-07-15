@@ -194,9 +194,9 @@ assert(candidate_script.include?('${RUNNER_TEMP}/pingora-verified-image/image.ta
        candidate_script.include?('${RUNNER_TEMP}/pingora-verified-image/metadata.env'),
        'CD verification must consume the downloaded archive and metadata paths')
 
-candidate_publish_index = publish_steps.index { |step| step['name'] == 'Publish immutable candidate manifest' }
+candidate_publish_index = publish_steps.index { |step| step['name'] == 'Publish run-unique candidate manifest' }
 attest_index = publish_steps.index { |step| step['name'] == 'Attest candidate image provenance' }
-promotion_index = publish_steps.index { |step| step['name'] == 'Promote attested digest to immutable release tags' }
+promotion_index = publish_steps.index { |step| step['name'] == 'Publish attested digest to release discovery tags' }
 cleanup_index = publish_steps.index { |step| step['name'] == 'Clean up registry credentials' }
 assert(candidate_publish_index && attest_index && promotion_index && cleanup_index &&
        candidate_publish_index < attest_index && attest_index < promotion_index &&
@@ -213,7 +213,7 @@ assert(candidate_publish_env.fetch('PUBLICATION_RUN_ID') == '${{ github.run_id }
        'candidate identity must change when the CD workflow itself is rerun')
 assert(candidate_publish_script.include?('candidate-${VERIFIED_SHA}-${PUBLICATION_RUN_ID}-${PUBLICATION_RUN_ATTEMPT}') &&
        candidate_publish_script.include?('docker push "${image}:${candidate_tag}"'),
-       'candidate publication must be immutable and unique per CD workflow attempt')
+       'candidate publication must be unique per CD workflow attempt')
 assert(!candidate_publish_script.include?('require_absent_tag "${image}:${VERSION_TAG}"') &&
        !candidate_publish_script.include?('require_absent_tag "${image}:${sha_tag}"'),
        'a rerun must reach idempotent promotion after a partially completed prior promotion')
@@ -222,11 +222,14 @@ assert(!candidate_publish_script.include?('--tag "${image}:${VERSION_TAG}"') &&
        'candidate publication must not expose public release tags before attestation')
 assert(attest.fetch('env').fetch('DOCKER_CONFIG') == '${{ runner.temp }}/pingora-docker-config',
        'registry credentials must remain available while provenance is pushed')
-assert(promotion_script.include?('ensure_release_tag "${image}:${VERSION_TAG}"') &&
-       promotion_script.include?('ensure_release_tag "${image}:${sha_tag}"') &&
-       promotion_script.include?('if [[ ${existing} == "${ATTESTED_DIGEST}" ]]') &&
+assert(promotion_script.include?('publish_discovery_tag "${image}:${VERSION_TAG}"') &&
+       promotion_script.include?('publish_discovery_tag "${image}:${sha_tag}"') &&
+       promotion_script.include?('test "$(remote_digest "${reference}")" = "${ATTESTED_DIGEST}"') &&
        promotion_script.include?('"${image}@${ATTESTED_DIGEST}"'),
-       'promotion must resume safely when a release tag already has the attested digest')
+       'discovery tag publication must use and verify only the attested digest')
+assert(!candidate_publish_script.match?(/manifest unknown|not found: manifest|no such manifest|set \+e/) &&
+       !promotion_script.match?(/manifest unknown|not found: manifest|no such manifest|set \+e/),
+       'registry failures must never be parsed as an absent-tag authorization path')
 assert(cleanup.fetch('if') == '${{ always() }}' &&
        cleanup.fetch('env').fetch('DOCKER_CONFIG') == '${{ runner.temp }}/pingora-docker-config' &&
        cleanup.fetch('run').include?('rm -rf -- "${DOCKER_CONFIG}"'),
@@ -250,4 +253,4 @@ if grep -Eh '^[[:space:]]*uses:' "$ROOT_DIR/.github/workflows/ci.yml" "$ROOT_DIR
   exit 1
 fi
 
-printf 'release gate passed: strict SemVer, collision-free tags, exact archive identity, provenance-before-promotion, and no-rebuild promotion\n'
+printf 'release gate passed: strict SemVer, run-unique candidate, exact archive identity, provenance-before-discovery-tags, digest verification, and no rebuild\n'

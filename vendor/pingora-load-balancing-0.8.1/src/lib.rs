@@ -16,12 +16,7 @@
 //! This crate provides common service discovery, health check and load balancing
 //! algorithms for proxies to use.
 
-// https://github.com/mcarton/rust-derivative/issues/112
-// False positive for macro generated code
-#![allow(clippy::non_canonical_partial_ord_impl)]
-
 use arc_swap::ArcSwap;
-use derivative::Derivative;
 use futures::FutureExt;
 pub use http::Extensions;
 use pingora_core::protocols::l4::socket::SocketAddr;
@@ -51,8 +46,7 @@ pub mod prelude {
 }
 
 /// [Backend] represents a server to proxy or connect to.
-#[derive(Derivative)]
-#[derivative(Clone, Hash, PartialEq, PartialOrd, Eq, Ord, Debug)]
+#[derive(Clone, Debug)]
 pub struct Backend {
     /// The address to the backend server.
     pub addr: SocketAddr,
@@ -66,11 +60,36 @@ pub struct Backend {
     /// [SocketAddr] and the same weight but different `ext` data are considered
     /// identical.
     /// See [Extensions] for how to add and read the data.
-    #[derivative(PartialEq = "ignore")]
-    #[derivative(PartialOrd = "ignore")]
-    #[derivative(Hash = "ignore")]
-    #[derivative(Ord = "ignore")]
     pub ext: Extensions,
+}
+
+impl PartialEq for Backend {
+    fn eq(&self, other: &Self) -> bool {
+        self.addr == other.addr && self.weight == other.weight
+    }
+}
+
+impl Eq for Backend {}
+
+impl PartialOrd for Backend {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Backend {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.addr
+            .cmp(&other.addr)
+            .then_with(|| self.weight.cmp(&other.weight))
+    }
+}
+
+impl Hash for Backend {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.addr.hash(state);
+        self.weight.hash(state);
+    }
 }
 
 impl Backend {
@@ -528,6 +547,21 @@ mod test {
 
         let b1 = backend.last().unwrap();
         assert_eq!(b1.ext.get::<bool>(), Some(&true));
+    }
+
+    #[test]
+    fn backend_identity_ignores_extensions() {
+        let mut left = Backend::new_with_weight("1.1.1.1:80", 2).unwrap();
+        let mut right = Backend::new_with_weight("1.1.1.1:80", 2).unwrap();
+        left.ext.insert(true);
+        right.ext.insert(7_u8);
+
+        assert_eq!(left, right);
+        assert_eq!(left.cmp(&right), std::cmp::Ordering::Equal);
+        assert_eq!(left.hash_key(), right.hash_key());
+
+        let clone = left.clone();
+        assert_eq!(clone.ext.get::<bool>(), Some(&true));
     }
 
     #[tokio::test]

@@ -8,3 +8,7 @@
 !vendor/**
 !scripts/chp-oracle.mjs
 !scripts/chp-runtime.mjs
+!scripts/jupyterhub-e2e.py
+!scripts/test_jupyterhub_e2e.py
+!scripts/verify-jupyterhub-source.py
+!tests/jupyterhub-requirements.txt

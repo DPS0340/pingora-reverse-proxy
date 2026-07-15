@@ -91,7 +91,7 @@ jobs:
           install -d -m 0700 "${DOCKER_CONFIG}"
           echo "${GHCR_TOKEN}" | timeout 30s docker login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
 
-      - name: Publish immutable candidate manifest
+      - name: Publish run-unique candidate manifest
         id: publish_candidate
         shell: bash
         env:
@@ -116,42 +116,17 @@ jobs:
           }
 
           remote_digest() {
-            local reference=$1 output error_file
-            error_file=$(mktemp "${RUNNER_TEMP}/remote-manifest.XXXXXX")
-            if output=$(timeout 60s docker buildx imagetools inspect \
-              "${reference}" --format '{{json .Manifest}}' 2>"${error_file}"); then
-              rm -f "${error_file}"
-              ruby -rjson -e '
-                digest = JSON.parse(STDIN.read).fetch("digest")
-                abort "invalid remote digest" unless /\Asha256:[0-9a-f]{64}\z/.match?(digest)
-                puts digest
-              ' <<<"${output}"
-              return 0
-            fi
-            if grep -Eiq '((^|: )not found$|manifest unknown|not found: manifest|no such manifest)' "${error_file}"; then
-              rm -f "${error_file}"
-              return 1
-            fi
-            cat "${error_file}" >&2
-            rm -f "${error_file}"
-            return 2
-          }
-
-          require_absent_tag() {
-            local reference=$1 existing status
-            set +e
-            existing=$(remote_digest "${reference}")
-            status=$?
-            set -e
-            if (( status == 0 )); then
-              echo "refusing to overwrite existing image tag ${reference} at ${existing}" >&2
-              exit 1
-            fi
-            (( status == 1 )) || exit "${status}"
+            local reference=$1 output
+            output=$(timeout 60s docker buildx imagetools inspect \
+              "${reference}" --format '{{json .Manifest}}')
+            ruby -rjson -e '
+              digest = JSON.parse(STDIN.read).fetch("digest")
+              abort "invalid remote digest" unless /\Asha256:[0-9a-f]{64}\z/.match?(digest)
+              puts digest
+            ' <<<"${output}"
           }
 
           recheck_release_tag
-          require_absent_tag "${image}:${candidate_tag}"
           timeout 30s docker image tag "${VERIFIED_IMAGE_ID}" "${image}:${candidate_tag}"
           timeout 600s docker push "${image}:${candidate_tag}"
           candidate_digest=$(remote_digest "${image}:${candidate_tag}")
@@ -170,7 +145,7 @@ jobs:
           subject-digest: ${{ steps.publish_candidate.outputs.digest }}
           push-to-registry: true
 
-      - name: Promote attested digest to immutable release tags
+      - name: Publish attested digest to release discovery tags
         id: promote
         shell: bash
         env:
@@ -194,43 +169,18 @@ jobs:
           }
 
           remote_digest() {
-            local reference=$1 output error_file
-            error_file=$(mktemp "${RUNNER_TEMP}/remote-manifest.XXXXXX")
-            if output=$(timeout 60s docker buildx imagetools inspect \
-              "${reference}" --format '{{json .Manifest}}' 2>"${error_file}"); then
-              rm -f "${error_file}"
-              ruby -rjson -e '
-                digest = JSON.parse(STDIN.read).fetch("digest")
-                abort "invalid remote digest" unless /\Asha256:[0-9a-f]{64}\z/.match?(digest)
-                puts digest
-              ' <<<"${output}"
-              return 0
-            fi
-            if grep -Eiq '((^|: )not found$|manifest unknown|not found: manifest|no such manifest)' "${error_file}"; then
-              rm -f "${error_file}"
-              return 1
-            fi
-            cat "${error_file}" >&2
-            rm -f "${error_file}"
-            return 2
+            local reference=$1 output
+            output=$(timeout 60s docker buildx imagetools inspect \
+              "${reference}" --format '{{json .Manifest}}')
+            ruby -rjson -e '
+              digest = JSON.parse(STDIN.read).fetch("digest")
+              abort "invalid remote digest" unless /\Asha256:[0-9a-f]{64}\z/.match?(digest)
+              puts digest
+            ' <<<"${output}"
           }
 
-          ensure_release_tag() {
-            local reference=$1 existing status metadata_file promotion_digest
-            set +e
-            existing=$(remote_digest "${reference}")
-            status=$?
-            set -e
-            if (( status == 0 )); then
-              if [[ ${existing} == "${ATTESTED_DIGEST}" ]]; then
-                printf 'release tag already points at attested digest: %s\n' "${reference}"
-                return 0
-              fi
-              echo "refusing to replace ${reference} at ${existing} with ${ATTESTED_DIGEST}" >&2
-              exit 1
-            fi
-            (( status == 1 )) || exit "${status}"
-
+          publish_discovery_tag() {
+            local reference=$1 metadata_file promotion_digest
             metadata_file=$(mktemp "${RUNNER_TEMP}/promotion-metadata.XXXXXX")
             timeout 120s docker buildx imagetools create \
               --prefer-index=false \
@@ -246,8 +196,8 @@ jobs:
           }
 
           recheck_release_tag
-          ensure_release_tag "${image}:${VERSION_TAG}"
-          ensure_release_tag "${image}:${sha_tag}"
+          publish_discovery_tag "${image}:${VERSION_TAG}"
+          publish_discovery_tag "${image}:${sha_tag}"
           {
             echo "version_ref=${image}:${VERSION_TAG}"
             echo "sha_ref=${image}:${sha_tag}"

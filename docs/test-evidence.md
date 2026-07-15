@@ -1080,14 +1080,27 @@ vulnerable direct/transitive graph, replaced `rustls-pemfile` parsing with the
 `rustls-pki-types` PEM API, and applies two narrow Pingora 0.8.1 patches under
 `vendor/`: the published `daemonize` dependency is replaced by `daemonix`,
 Pingora core shares Prometheus 0.14 instead of retaining the vulnerable
-protobuf 2 line, and Pingora load balancing drops its unused `derivative`
-dependency. The vendored OpenSSL name conversion uses the
+protobuf 2 line. Pingora load balancing replaces `derivative` with manual
+`Backend` trait implementations that preserve the upstream rule that extension
+data is cloned and debug-visible but ignored by equality, ordering, and hashing;
+the root dev graph activates and directly tests the patched crate. The vendored OpenSSL name conversion uses the
 non-deprecated, interior-NUL-safe API. Production Rust 1.85 compatibility is
 preserved by selecting `url 2.5.4`, `idna 1.0.3`, `idna_adapter 1.2.1`, and the
 compatible ICU4X 2.1 releases instead of the newer Rust-1.86-only graph.
 `webpki-roots` was safely unified on 1.0.8. The dynamic CHP oracle scripts were
 added to the explicit Docker context so clean container runs do not depend on
-untracked workspace files.
+untracked workspace files. The authoritative Compose integration inputs pin the
+Redis 7 and Python 3.13 OCI indexes by digest, and the JupyterHub environment is
+installed from a checked-in hash lock with `pip --require-hashes`. The JupyterHub
+image build also fixes `RUSTUP_TOOLCHAIN` to the digest-pinned base image's
+installed Rust 1.85.1 toolchain; it does not download a moving `stable` release.
+
+GHCR does not provide a conditional-create guarantee for the OCI manifest PUT
+used by this workflow. CD therefore treats SemVer and SHA tags as mutable
+discovery references rather than immutability boundaries. It attests the
+run-unique candidate digest before writing those references, treats every
+registry error as fatal instead of parsing error text as absence, and reports
+the digest and provenance as the only deployment identity.
 
 `cargo tree --locked -d` was reviewed after remediation. Fifteen duplicate
 package families remain. They are incompatible published major/minor lines,
@@ -1112,7 +1125,7 @@ results were:
 | all-target/all-feature tests and checks | 247.5 s | PASS, 403 Rust tests across 14 suites |
 | dedicated Node 20 / CHP 5.3.0 differential | 83.6 s | PASS, 35 scenarios plus the isolated launch-lock helper |
 | JupyterHub 5.5.0 clean Linux E2E | 801.1 s | PASS, 12 harness tests, the Linux ACL contract, and 18/18 scenarios on both memory and Redis |
-| production container build and smoke | 183.8 s | PASS on Rust 1.85.1, non-root/distroless runtime and OCI labels verified |
+| production container build and smoke | 183.8 s | PASS on Rust 1.85.1, non-root shellless Debian slim runtime and OCI labels verified |
 | Helm render/policy checks | 2.9 s | PASS |
 | `cargo audit --deny warnings` | 0.8 s | PASS, 352 dependencies and zero findings |
 | `cargo deny check advisories licenses bans sources` | 1.1 s | PASS |

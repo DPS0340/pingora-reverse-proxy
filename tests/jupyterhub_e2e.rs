@@ -24,10 +24,37 @@ fn canonical_harness_builds_and_launches_the_shipped_binary() {
         .expect("read Compose test definition");
     let harness = std::fs::read_to_string(workspace.join("scripts/jupyterhub-e2e.py"))
         .expect("read JupyterHub harness");
+    let dockerignore = std::fs::read_to_string(workspace.join(".dockerignore"))
+        .expect("read Docker context allowlist");
+    let requirements = std::fs::read_to_string(workspace.join("tests/jupyterhub-requirements.txt"))
+        .expect("read JupyterHub hash lock");
 
+    assert!(
+        compose.contains(
+            "redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99",
+        ) && compose.contains(
+            "python:3.13-alpine@sha256:399babc8b49529dabfd9c922f2b5eea81d611e4512e3ed250d75bd2e7683f4b0",
+        ),
+        "integration service images must be pinned to immutable OCI index digests"
+    );
+    assert!(
+        compose.contains("COPY tests/jupyterhub-requirements.txt")
+            && compose.contains("--require-hashes -r /tmp/jupyterhub-requirements.txt")
+            && dockerignore.contains("!tests/jupyterhub-requirements.txt")
+            && dockerignore.contains("!scripts/jupyterhub-e2e.py")
+            && dockerignore.contains("!scripts/test_jupyterhub_e2e.py")
+            && dockerignore.contains("!scripts/verify-jupyterhub-source.py")
+            && requirements.contains("jupyterhub-5.5.0-py3-none-any.whl")
+            && requirements.contains("--hash=sha256:"),
+        "direct and clean-context builds must install only the checked-in hash lock"
+    );
     assert!(
         compose.contains("cargo build --locked"),
         "the E2E image must build the deployable binary with the lockfile"
+    );
+    assert!(
+        compose.contains("RUSTUP_TOOLCHAIN=\"1.85.1-x86_64-unknown-linux-gnu\""),
+        "the E2E build must use the installed digest-pinned MSRV toolchain instead of downloading latest stable"
     );
     assert!(
         compose.contains("97b3154610726b5b7d8768f1e89a4d910e002854")
@@ -35,7 +62,7 @@ fn canonical_harness_builds_and_launches_the_shipped_binary() {
         "the E2E image must install JupyterHub from the exact checksum-pinned baseline commit"
     );
     assert!(
-        compose.contains("2e38d1767742d41911cfc2160cad485eae2698f98ed291308c7d3be090c757a0")
+        requirements.contains("2e38d1767742d41911cfc2160cad485eae2698f98ed291308c7d3be090c757a0")
             && compose.contains("verify-jupyterhub-source.py"),
         "the exact wheel must retain runtime assets while a build gate compares its code to the pinned commit"
     );
