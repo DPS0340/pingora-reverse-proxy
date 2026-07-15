@@ -1136,6 +1136,7 @@ checks are implementation feedback, not release authorization:
 |---|---|
 | exact Rust 1.85.1 formatting and warnings-denied all-target/all-feature Clippy | PASS |
 | vendored `Backend` trait regressions | PASS, 2/2 |
+| dedicated Node 20 / CHP 5.3.0 differential gate | PASS, 35/35 plus isolated launch-lock helper |
 | TLS/Unix focused contract suite | PASS, 22/22 |
 | release policy, workflow schema, and push-digest parser contracts | PASS |
 | actual Docker push/parser/digest-qualified inspection and cleanup | PASS |

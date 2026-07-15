@@ -786,10 +786,11 @@ struct CustomErrorFixture {
 
 impl CustomErrorFixture {
     async fn start() -> Self {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        let listener = tokio::net::TcpListener::bind(("0.0.0.0", 0))
             .await
             .expect("bind custom-error fixture");
-        let address = listener.local_addr().expect("custom-error address");
+        let port = listener.local_addr().expect("custom-error address").port();
+        let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             let router =
@@ -834,10 +835,14 @@ struct WebSocketFixture {
 
 impl WebSocketFixture {
     async fn start() -> Self {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        let listener = tokio::net::TcpListener::bind(("0.0.0.0", 0))
             .await
             .expect("bind websocket fixture");
-        let address = listener.local_addr().expect("websocket fixture address");
+        let port = listener
+            .local_addr()
+            .expect("websocket fixture address")
+            .port();
+        let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
         let task = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
