@@ -6,13 +6,46 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
+import sys
 import tarfile
-import tomllib
 from pathlib import Path, PurePosixPath
 
 
 def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def parse_inline_patch_path(cargo_toml: str, package: str) -> str:
+    section = re.search(
+        r"(?ms)^\[patch\.crates-io\]\s*$\n(?P<body>.*?)(?=^\[|\Z)", cargo_toml
+    )
+    if section is None:
+        raise ValueError("Cargo.toml is missing [patch.crates-io]")
+    entries = re.findall(
+        rf"(?m)^\s*{re.escape(package)}\s*=\s*\{{\s*path\s*=\s*\"([^\"\n]+)\"\s*\}}\s*$",
+        section.group("body"),
+    )
+    if len(entries) != 1:
+        raise ValueError(
+            f"[patch.crates-io] must contain exactly one literal inline {package} path entry"
+        )
+    return entries[0]
+
+
+def parse_package_identity(manifest: str) -> tuple[str, str]:
+    section = re.search(r"(?ms)^\[package\]\s*$\n(?P<body>.*?)(?=^\[|\Z)", manifest)
+    if section is None:
+        raise ValueError("vendored Cargo.toml is missing [package]")
+    values: dict[str, str] = {}
+    for key in ("name", "version"):
+        match = re.search(
+            rf"(?m)^\s*{key}\s*=\s*\"([^\"\n]+)\"\s*$", section.group("body")
+        )
+        if match is None:
+            raise ValueError(f"vendored Cargo.toml is missing a literal package.{key}")
+        values[key] = match.group(1)
+    return values["name"], values["version"]
 
 
 def regular_files(root: Path) -> dict[str, bytes]:
@@ -90,15 +123,17 @@ def verify(metadata_path: Path, archive: Path, vendor_dir: Path, cargo_toml: Pat
         if upstream_digest == vendored_digest:
             raise ValueError(f"declared patch is byte-identical to upstream: {name}")
 
-    cargo = tomllib.loads(cargo_toml.read_text(encoding="utf-8"))
-    patch = cargo.get("patch", {}).get("crates-io", {}).get(metadata["crate"])
     expected_path = f"vendor/{metadata['vendor_dir']}"
-    if patch != {"path": expected_path}:
+    actual_path = parse_inline_patch_path(
+        cargo_toml.read_text(encoding="utf-8"), metadata["crate"]
+    )
+    if actual_path != expected_path:
         raise ValueError(f"Cargo patch must be exactly {{'path': '{expected_path}'}}")
 
-    vendor_manifest = tomllib.loads(vendored["Cargo.toml"].decode("utf-8"))
-    package = vendor_manifest.get("package", {})
-    if package.get("name") != metadata["crate"] or package.get("version") != metadata["version"]:
+    package_name, package_version = parse_package_identity(
+        vendored["Cargo.toml"].decode("utf-8")
+    )
+    if package_name != metadata["crate"] or package_version != metadata["version"]:
         raise ValueError("vendored package identity does not match provenance metadata")
 
 
@@ -115,8 +150,8 @@ def main() -> int:
     vendor_dir = args.vendor_dir or args.metadata.parent / metadata["vendor_dir"]
     try:
         verify(args.metadata, archive, vendor_dir, args.cargo_toml)
-    except (OSError, ValueError, KeyError, json.JSONDecodeError, tomllib.TOMLDecodeError) as error:
-        print(f"vendor provenance verification failed: {error}", file=__import__("sys").stderr)
+    except (OSError, ValueError, KeyError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        print(f"vendor provenance verification failed: {error}", file=sys.stderr)
         return 1
     print(
         f"vendor provenance verified: {metadata['crate']} {metadata['version']} "
