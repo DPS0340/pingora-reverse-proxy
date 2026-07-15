@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -32,6 +33,10 @@ HTTP_TIMEOUT = 4
 PROCESS_GRACE = 15
 VERSION_PROBE_TIMEOUT = 120
 LOG_TAIL_BYTES = 64 * 1024
+PORT_RANGE_START = 20_000
+PORT_RANGE_END = 29_999
+_PORT_ALLOCATION_LOCK = threading.Lock()
+_port_cursor = secrets.randbelow(PORT_RANGE_END - PORT_RANGE_START + 1)
 PINNED_PACKAGES = {
     "ipykernel": "6.30.1",
     "jupyter-server": "2.17.0",
@@ -431,12 +436,33 @@ def supervisor_main() -> int:
 
 class PortReservation:
     def __init__(self, port: int = 0) -> None:
-        self._socket: socket.socket | None = socket.socket(
-            socket.AF_INET, socket.SOCK_STREAM
-        )
-        self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
-        self._socket.bind(("127.0.0.1", port))
-        self.port = self._socket.getsockname()[1]
+        global _port_cursor
+        self._socket: socket.socket | None = None
+        candidates = (port,) if port else range(PORT_RANGE_END - PORT_RANGE_START + 1)
+        with _PORT_ALLOCATION_LOCK:
+            for offset in candidates:
+                candidate = (
+                    offset
+                    if port
+                    else PORT_RANGE_START
+                    + (_port_cursor + offset) % (PORT_RANGE_END - PORT_RANGE_START + 1)
+                )
+                listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+                try:
+                    listener.bind(("127.0.0.1", candidate))
+                except OSError:
+                    listener.close()
+                    if port:
+                        raise
+                    continue
+                self._socket = listener
+                self.port = candidate
+                if not port:
+                    _port_cursor = candidate - PORT_RANGE_START + 1
+                break
+        if self._socket is None:
+            raise GateError("non-ephemeral port reservation range is exhausted")
 
     def release(self) -> None:
         if self._socket is not None:
@@ -465,11 +491,14 @@ class ManagedProcess:
         cwd: Path,
         log_path: Path,
         secrets_to_redact: tuple[str, ...],
+        port_reservations: tuple[PortReservation, ...] = (),
     ) -> None:
         self.name = name
         self.log_path = log_path
         self.secrets = secrets_to_redact
         self._log = log_path.open("wb")
+        for reservation in port_reservations:
+            reservation.release()
         self.process = subprocess.Popen(
             command,
             cwd=cwd,
@@ -540,7 +569,12 @@ class ScenarioRuntime:
         self.lingering_groups: set[int] = set()
 
     def start_process(
-        self, name: str, command: list[str], env: dict[str, str], cwd: Path
+        self,
+        name: str,
+        command: list[str],
+        env: dict[str, str],
+        cwd: Path,
+        port_reservations: tuple[PortReservation, ...] = (),
     ) -> ManagedProcess:
         process = ManagedProcess(
             name,
@@ -549,6 +583,7 @@ class ScenarioRuntime:
             cwd,
             self.root / f"{name}-{len(self.processes)}.log",
             self.secrets,
+            port_reservations,
         )
         self.processes.append(process)
         return process
@@ -654,15 +689,14 @@ class ExternalProxy:
         ]
         if self.host_routing:
             command.append("--host-routing")
-        for reservation in self._reservations:
-            reservation.release()
-        self._reservations.clear()
         self.process = self.runtime.start_process(
             self.name,
             command,
             env,
             self.runtime.root,
+            tuple(self._reservations),
         )
+        self._reservations.clear()
 
         def ready() -> bool:
             assert self.process is not None
@@ -809,14 +843,14 @@ c.JupyterHub.subdomain_host = {subdomain_host!r}
             },
         )
         (self.directory / "runtime").mkdir(exist_ok=True)
-        self._reservation.release()
-        self._reservation = None
         self.process = self.runtime.start_process(
             self.name,
             ["jupyterhub", "-f", str(self.config)],
             env,
             self.directory,
+            (self._reservation,),
         )
+        self._reservation = None
 
         def ready() -> bool:
             assert self.process is not None

@@ -173,6 +173,14 @@ class HubStartupFenceTests(unittest.TestCase):
 
 
 class PortReservationTests(unittest.TestCase):
+    def test_dynamic_reservation_uses_non_ephemeral_handoff_range(self) -> None:
+        reservation = HARNESS.PortReservation()
+        try:
+            self.assertGreaterEqual(reservation.port, 20_000)
+            self.assertLessEqual(reservation.port, 29_999)
+        finally:
+            reservation.release()
+
     def test_reservation_holds_the_port_until_explicit_release(self) -> None:
         reservation = HARNESS.PortReservation()
         contender = HARNESS.socket.socket(HARNESS.socket.AF_INET, HARNESS.socket.SOCK_STREAM)
@@ -187,6 +195,33 @@ class PortReservationTests(unittest.TestCase):
             replacement.bind(("127.0.0.1", port))
         finally:
             replacement.close()
+
+    def test_managed_process_releases_reservations_at_popen_handoff(self) -> None:
+        events: list[str] = []
+
+        class Reservation:
+            def release(self) -> None:
+                events.append("release")
+
+        def launch(*_args, **_kwargs):
+            events.append("popen")
+            return SimpleNamespace(pid=123)
+
+        with tempfile.TemporaryDirectory() as root, mock.patch.object(
+            HARNESS.subprocess, "Popen", side_effect=launch
+        ):
+            process = HARNESS.ManagedProcess(
+                "test",
+                ["ignored"],
+                {},
+                Path(root),
+                Path(root) / "process.log",
+                (),
+                port_reservations=(Reservation(),),
+            )
+            process._log.close()
+
+        self.assertEqual(events, ["release", "popen"])
 
 
 class PersistenceTests(unittest.TestCase):

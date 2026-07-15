@@ -3,7 +3,8 @@ set -euo pipefail
 
 TIMEOUT_BIN=${TIMEOUT_BIN:-timeout}
 BUILD_TIMEOUT=${CONTAINER_BUILD_TIMEOUT_SECONDS:-1800}
-ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+CONTROL_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+ROOT_DIR=$(cd "${CONTAINER_GATE_SOURCE_ROOT:-$CONTROL_DIR}" && pwd)
 RUN_ID="task13-container-$(date +%s)-$$"
 IMAGE="pingora-reverse-proxy:${RUN_ID}"
 CONTAINER="${RUN_ID}"
@@ -26,7 +27,7 @@ cleanup() {
   trap - EXIT
 
   if (( CLEANUP_ENABLED )); then
-    "$ROOT_DIR/scripts/cleanup-container-resources.sh" \
+    "$CONTROL_DIR/scripts/cleanup-container-resources.sh" \
       "$TIMEOUT_BIN" "$OWNER_LABEL" "$IMAGE" \
       "$CONTAINER" "$UID_CONTAINER" "$GID_CONTAINER" "$TMP_CONTAINER" || cleanup_status=1
   fi
@@ -78,7 +79,7 @@ cd "$ROOT_DIR"
 install -m 0600 /dev/null "$SENTINEL"
 cp "$TRACKED_INPUT" "$TRACKED_INPUT_BACKUP"
 printf '\n// dirty workspace content must never enter a production image\n' >>"$TRACKED_INPUT"
-"$ROOT_DIR/scripts/build-container-context.sh" "$TMP_DIR/context.tar"
+"$CONTROL_DIR/scripts/build-container-context.sh" "$TMP_DIR/context.tar" "$ROOT_DIR" "$SOURCE_SHA"
 if tar -tf "$TMP_DIR/context.tar" | grep -Fq "${SENTINEL#"$ROOT_DIR/"}"; then
   echo "untracked secret sentinel entered the container build context" >&2
   exit 1
@@ -88,7 +89,7 @@ if tar -xOf "$TMP_DIR/context.tar" src/lib.rs | grep -Fq \
   echo "dirty tracked content entered the immutable HEAD container context" >&2
   exit 1
 fi
-git show HEAD:src/lib.rs >"$TMP_DIR/head-lib.rs"
+git -C "$ROOT_DIR" show "$SOURCE_SHA":src/lib.rs >"$TMP_DIR/head-lib.rs"
 tar -xOf "$TMP_DIR/context.tar" src/lib.rs >"$TMP_DIR/archive-lib.rs"
 cmp "$TMP_DIR/head-lib.rs" "$TMP_DIR/archive-lib.rs"
 cp "$TRACKED_INPUT_BACKUP" "$TRACKED_INPUT"
@@ -199,7 +200,7 @@ fi
 test "$("$TIMEOUT_BIN" 30 docker inspect --format '{{.State.ExitCode}}' "$CONTAINER")" = "0"
 
 if [[ -n ${CONTAINER_GATE_IMAGE_ARCHIVE:-} ]]; then
-  "$ROOT_DIR/scripts/image-artifact.sh" create \
+  "$CONTROL_DIR/scripts/image-artifact.sh" create \
     "$IMAGE" \
     "$CONTAINER_GATE_IMAGE_ARCHIVE" \
     "$CONTAINER_GATE_IMAGE_METADATA" \

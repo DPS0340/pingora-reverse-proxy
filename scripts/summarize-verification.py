@@ -12,6 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 CONTRACT = runpy.run_path(str(ROOT / "scripts" / "jupyterhub-e2e.py"))
 EXPECTED_BACKENDS = {"memory", "redis"}
+EXPECTED_DIFFERENTIAL_CASES = 35
 EXPECTED_JUPYTERHUB = "5.5.0"
 EXPECTED_COMMIT = CONTRACT["EXPECTED_JUPYTERHUB_COMMIT"]
 EXPECTED_SCENARIOS = set(CONTRACT["REQUIRED_SCENARIOS"])
@@ -81,8 +82,11 @@ def main() -> None:
 
     if rust_tests == 0:
         raise SystemExit("verification manifest found no passing Rust tests")
-    if differential_cases == 0:
-        raise SystemExit("verification manifest found no differential cases")
+    if differential_cases != EXPECTED_DIFFERENTIAL_CASES:
+        raise SystemExit(
+            f"expected exactly {EXPECTED_DIFFERENTIAL_CASES} differential cases, "
+            f"found {differential_cases}"
+        )
     if vendor_provenance is None:
         raise SystemExit("verification manifest found no vendor provenance evidence")
     if len(summaries) != len(EXPECTED_BACKENDS):

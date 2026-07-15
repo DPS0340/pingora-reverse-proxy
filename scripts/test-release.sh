@@ -157,8 +157,8 @@ fi
 
 grep -Fq "name: verified-image-\${{ github.sha }}" "$ROOT_DIR/.github/workflows/ci.yml"
 grep -Fq 'CONTAINER_GATE_IMAGE_ARCHIVE:' "$ROOT_DIR/.github/workflows/ci.yml"
-grep -Fq "run-id: \${{ github.event.workflow_run.id }}" "$ROOT_DIR/.github/workflows/cd.yml"
-grep -Fq "name: verified-image-\${{ github.event.workflow_run.head_sha }}" "$ROOT_DIR/.github/workflows/cd.yml"
+grep -Fq "name: trusted-rebuilt-image-\${{ github.event.workflow_run.head_sha }}" "$ROOT_DIR/.github/workflows/cd.yml"
+grep -Fq 'CONTAINER_GATE_SOURCE_ROOT: ${{ github.workspace }}/candidate' "$ROOT_DIR/.github/workflows/cd.yml"
 grep -Fq 'publication-control/scripts/image-artifact.sh verify' "$ROOT_DIR/.github/workflows/cd.yml"
 grep -Fqx 'channel = "1.85.1"' "$ROOT_DIR/rust-toolchain.toml"
 grep -Fqx '# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e' "$ROOT_DIR/Dockerfile"
@@ -167,6 +167,7 @@ grep -Fq 'test "$(rustc --version)" = "rustc 1.85.1 (4eb161250 2025-03-15)"' "$R
 grep -Fq 'test "$$(rustc --version)" = "rustc 1.85.1 (4eb161250 2025-03-15)"' "$ROOT_DIR/compose.test.yml"
 grep -Fq 'PROPTEST_CASES=4096' "$ROOT_DIR/scripts/verify.sh"
 grep -Fq 'bounded transport reference `candidate-staging`' "$ROOT_DIR/README.md"
+grep -Fq 'credential-free trusted rebuild job' "$ROOT_DIR/README.md"
 grep -Fq 'never executes helper code from the candidate checkout' "$ROOT_DIR/README.md"
 grep -Fq 'tracked allowlisted files and rejects tracked symlinks' "$ROOT_DIR/README.md"
 grep -Fq '361b69af0234d2e4d10234e2efd106bb3b8147c575d52f45604a46aaf26def7a' "$ROOT_DIR/README.md"
@@ -271,7 +272,51 @@ assert(concurrency.fetch('group') == 'pingora-container-publication' &&
        concurrency.fetch('cancel-in-progress') == false,
        'publication must remain serialized without canceling an active publication')
 
-publish_steps = cd.fetch('jobs').fetch('publish').fetch('steps')
+rebuild = cd.fetch('jobs').fetch('rebuild-candidate')
+publish = cd.fetch('jobs').fetch('publish')
+assert(publish.fetch('needs') == 'rebuild-candidate',
+       'privileged publication must consume only the trusted rebuild job output')
+assert(rebuild.fetch('permissions') == {'contents' => 'read'},
+       'candidate rebuild must have no write, package, attestation, or OIDC privileges')
+rebuild_steps = rebuild.fetch('steps')
+rebuild_control_index = rebuild_steps.index { |step| step['name'] == 'Check out immutable rebuild controls' }
+rebuild_candidate_index = rebuild_steps.index { |step| step['name'] == 'Check out candidate source without credentials' }
+rebuild_authorize_index = rebuild_steps.index { |step| step['name'] == 'Authorize exact candidate source for trusted rebuild' }
+rebuild_gate_index = rebuild_steps.index { |step| step['name'] == 'Rebuild and test exact candidate with trusted controls' }
+rebuild_upload_index = rebuild_steps.index { |step| step['name'] == 'Upload trusted rebuilt image' }
+assert(rebuild_control_index && rebuild_candidate_index && rebuild_authorize_index && rebuild_gate_index &&
+       rebuild_upload_index && rebuild_control_index < rebuild_candidate_index &&
+       rebuild_candidate_index < rebuild_authorize_index && rebuild_authorize_index < rebuild_gate_index &&
+       rebuild_gate_index < rebuild_upload_index,
+       'trusted checkout and exact ancestry must precede rebuild, test, and artifact upload')
+rebuild_control = rebuild_steps.fetch(rebuild_control_index).fetch('with')
+rebuild_candidate = rebuild_steps.fetch(rebuild_candidate_index).fetch('with')
+assert(rebuild_control.fetch('ref') == '${{ github.workflow_sha }}' &&
+       rebuild_control.fetch('path') == 'publication-control' &&
+       rebuild_control.fetch('persist-credentials') == false,
+       'rebuild controls must come from the immutable workflow revision')
+assert(rebuild_candidate.fetch('ref') == '${{ github.event.workflow_run.head_sha }}' &&
+       rebuild_candidate.fetch('path') == 'candidate' &&
+       rebuild_candidate.fetch('persist-credentials') == false,
+       'rebuild candidate source must be exact and credential-free')
+rebuild_authorize = rebuild_steps.fetch(rebuild_authorize_index).fetch('run')
+assert(rebuild_authorize.include?('test "$(git -C candidate rev-parse HEAD)" = "${VERIFIED_SHA}"') &&
+       rebuild_authorize.include?('git -C candidate merge-base --is-ancestor'),
+       'trusted rebuild must authorize exact candidate ancestry before source use')
+rebuild_gate = rebuild_steps.fetch(rebuild_gate_index)
+rebuild_gate_env = rebuild_gate.fetch('env')
+assert(rebuild_gate.fetch('run').include?('publication-control/scripts/test-container.sh') &&
+       !rebuild_gate.fetch('run').match?(/(^|[[:space:]])candidate\/scripts\//) &&
+       rebuild_gate_env.fetch('CONTAINER_GATE_SOURCE_ROOT') == '${{ github.workspace }}/candidate' &&
+       rebuild_gate_env.fetch('CONTAINER_GATE_SOURCE_SHA') == '${{ github.event.workflow_run.head_sha }}' &&
+       rebuild_gate_env.fetch('CONTAINER_GATE_WORKFLOW_RUN_ID') == '${{ github.run_id }}',
+       'trusted rebuild must archive and test the exact candidate via immutable controls')
+rebuild_upload = rebuild_steps.fetch(rebuild_upload_index)
+assert(rebuild_upload.fetch('uses') == 'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a' &&
+       rebuild_upload.fetch('with').fetch('name') == 'trusted-rebuilt-image-${{ github.event.workflow_run.head_sha }}',
+       'trusted rebuild artifact upload action and candidate-bound name must be pinned')
+
+publish_steps = publish.fetch('steps')
 trusted_checkout_index = publish_steps.index { |step| step['name'] == 'Check out immutable publication controls' }
 candidate_checkout_index = publish_steps.index { |step| step['name'] == 'Check out verified candidate without credentials' }
 authorization_index = publish_steps.index { |step| step['name'] == 'Authorize candidate from trusted default-branch history' }
@@ -311,14 +356,18 @@ assert(release_step.fetch('working-directory') == 'candidate' &&
        release_script.include?('../publication-control/scripts/release-policy.rb') &&
        !release_script.match?(/(^|[[:space:]])ruby scripts\//),
        'release policy must execute only from immutable publication controls')
-download = publish_steps.find { |step| step['name'] == 'Download exact image from the verified workflow run' }
-assert(download.fetch('with').fetch('path') == '${{ runner.temp }}/pingora-verified-image',
-       'download path must preserve the verified artifact directory contract')
+download = publish_steps.find { |step| step['name'] == 'Download exact trusted rebuilt image' }
+download_with = download.fetch('with')
+assert(download_with.fetch('name') == 'trusted-rebuilt-image-${{ github.event.workflow_run.head_sha }}' &&
+       download_with.fetch('path') == '${{ runner.temp }}/pingora-verified-image' &&
+       !download_with.key?('run-id') && !download_with.key?('github-token'),
+       'publication must download only the current trusted rebuild artifact')
 candidate = publish_steps.find { |step| step['name'] == 'Verify and load the tested image bytes' }
 candidate_script = candidate.fetch('run')
 assert(candidate_script.include?('${RUNNER_TEMP}/pingora-verified-image/image.tar') &&
        candidate_script.include?('${RUNNER_TEMP}/pingora-verified-image/metadata.env') &&
-       candidate_script.include?('publication-control/scripts/image-artifact.sh verify'),
+       candidate_script.include?('publication-control/scripts/image-artifact.sh verify') &&
+       candidate.fetch('env').fetch('VERIFIED_RUN_ID') == '${{ github.run_id }}',
        'CD verification must consume the downloaded archive and metadata paths')
 
 candidate_publish_index = publish_steps.index { |step| step['name'] == 'Publish bounded staging manifest' }
@@ -424,4 +473,4 @@ if grep -Eh '^[[:space:]]*uses:' "$ROOT_DIR/.github/workflows/ci.yml" "$ROOT_DIR
   exit 1
 fi
 
-printf 'release gate passed: strict SemVer, bounded staging publication, push-result digest capture, exact archive identity, provenance-before-discovery-tags, digest verification, and no rebuild\n'
+printf 'release gate passed: exact trusted rebuild, bounded staging publication, push-result digest capture, candidate-bound provenance, digest verification, and no privileged rebuild\n'

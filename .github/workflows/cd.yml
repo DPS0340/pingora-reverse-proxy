@@ -16,7 +16,70 @@ env:
   IMAGE_NAME: pingora-reverse-proxy
 
 jobs:
+  rebuild-candidate:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Check out immutable rebuild controls
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: publication-control
+          persist-credentials: false
+
+      - name: Check out candidate source without credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          path: candidate
+          persist-credentials: false
+
+      - name: Authorize exact candidate source for trusted rebuild
+        shell: bash
+        env:
+          TRUSTED_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          VERIFIED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -Eeuo pipefail
+          [[ ${VERIFIED_SHA} =~ ^[0-9a-f]{40}$ ]]
+          git check-ref-format --branch "${TRUSTED_DEFAULT_BRANCH}" >/dev/null
+          default_ref="refs/remotes/origin/${TRUSTED_DEFAULT_BRANCH}"
+          git -C candidate show-ref --verify --quiet "${default_ref}"
+          test "$(git -C candidate rev-parse HEAD)" = "${VERIFIED_SHA}"
+          git -C candidate merge-base --is-ancestor \
+            "${VERIFIED_SHA}" "${default_ref}"
+
+      - name: Rebuild and test exact candidate with trusted controls
+        shell: bash
+        env:
+          CONTAINER_GATE_IMAGE_ARCHIVE: ${{ runner.temp }}/trusted-rebuilt-image/image.tar
+          CONTAINER_GATE_IMAGE_METADATA: ${{ runner.temp }}/trusted-rebuilt-image/metadata.env
+          CONTAINER_GATE_SOURCE_ROOT: ${{ github.workspace }}/candidate
+          CONTAINER_GATE_SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+          CONTAINER_GATE_WORKFLOW_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -Eeuo pipefail
+          install -d -m 0700 "${RUNNER_TEMP}/trusted-rebuilt-image"
+          publication-control/scripts/test-container.sh
+
+      - name: Upload trusted rebuilt image
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: trusted-rebuilt-image-${{ github.event.workflow_run.head_sha }}
+          path: ${{ runner.temp }}/trusted-rebuilt-image
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
   publish:
+    needs: rebuild-candidate
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push' &&
@@ -98,20 +161,18 @@ jobs:
           fi
           ruby ../publication-control/scripts/release-policy.rb "${release_tags[0]}" >> "${GITHUB_OUTPUT}"
 
-      - name: Download exact image from the verified workflow run
+      - name: Download exact trusted rebuilt image
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
-          name: verified-image-${{ github.event.workflow_run.head_sha }}
+          name: trusted-rebuilt-image-${{ github.event.workflow_run.head_sha }}
           path: ${{ runner.temp }}/pingora-verified-image
-          github-token: ${{ github.token }}
-          run-id: ${{ github.event.workflow_run.id }}
 
       - name: Verify and load the tested image bytes
         id: candidate
         shell: bash
         env:
           VERIFIED_SHA: ${{ github.event.workflow_run.head_sha }}
-          VERIFIED_RUN_ID: ${{ github.event.workflow_run.id }}
+          VERIFIED_RUN_ID: ${{ github.run_id }}
         run: |
           set -Eeuo pipefail
           publication-control/scripts/image-artifact.sh verify \

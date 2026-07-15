@@ -125,6 +125,18 @@ grep -Fqx $'provenance\tvendor\tpingora-load-balancing\t0.8.1\tarchive_sha256\t0
 grep -Fqx $'count\tdifferential_cases\t35' "$TMP_DIR/summary-manifest.tsv"
 grep -Fqx $'count\tjupyterhub_runs\t2' "$TMP_DIR/summary-manifest.tsv"
 grep -Fqx $'count\tjupyterhub_scenarios\t36' "$TMP_DIR/summary-manifest.tsv"
+printf 'test result: ok. 34 passed; 0 failed\n' >"$TMP_DIR/summary-logs/04-differential.log"
+printf 'schema\tfixture\n' >"$TMP_DIR/reduced-differential-manifest.tsv"
+set +e
+python3 "$ROOT_DIR/scripts/summarize-verification.py" \
+  "$TMP_DIR/summary-logs" "$TMP_DIR/reduced-differential-manifest.tsv" \
+  2>"$TMP_DIR/reduced-differential.err"
+status=$?
+set -e
+test "$status" -ne 0
+grep -Fq 'expected exactly 35 differential cases, found 34' \
+  "$TMP_DIR/reduced-differential.err"
+printf 'test result: ok. 35 passed; 0 failed\n' >"$TMP_DIR/summary-logs/04-differential.log"
 touch "$TMP_DIR/summary-logs/10-stale.log"
 set +e
 python3 "$ROOT_DIR/scripts/summarize-verification.py" \
