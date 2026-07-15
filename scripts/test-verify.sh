@@ -130,6 +130,7 @@ printf 'schema\tfixture\n' >"$TMP_DIR/final-manifest.tsv"
 python3 "$ROOT_DIR/scripts/finalize-verification-manifest.py" \
   "$TMP_DIR/final-manifest.tsv" "$started_ns" 0
 grep -Eq $'^result\tstatus\t0\telapsed_milliseconds\t[0-9]+$' "$TMP_DIR/final-manifest.tsv"
+grep -Fqx $'complete\tCOMPLETE' "$TMP_DIR/final-manifest.tsv"
 set +e
 python3 "$ROOT_DIR/scripts/finalize-verification-manifest.py" \
   "$TMP_DIR/final-manifest.tsv" "$started_ns" 23
@@ -137,6 +138,7 @@ status=$?
 set -e
 test "$status" -eq 23
 grep -Eq $'^result\tstatus\t23\telapsed_milliseconds\t[0-9]+$' "$TMP_DIR/final-manifest.tsv"
+test "$(grep -Fxc $'complete\tCOMPLETE' "$TMP_DIR/final-manifest.tsv")" -eq 2
 mkdir "$TMP_DIR/not-a-manifest"
 set +e
 python3 "$ROOT_DIR/scripts/finalize-verification-manifest.py" \

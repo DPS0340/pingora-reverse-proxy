@@ -33,6 +33,7 @@ def main() -> int:
             output.write(
                 f"result\tstatus\t{original_status}"
                 f"\telapsed_milliseconds\t{elapsed_ms}\n"
+                "complete\tCOMPLETE\n"
             )
             output.flush()
             os.fsync(output.fileno())
