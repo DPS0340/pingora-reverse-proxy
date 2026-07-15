@@ -97,20 +97,17 @@ jobs:
         env:
           DOCKER_CONFIG: ${{ runner.temp }}/pingora-docker-config
           RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
-          VERSION_TAG: ${{ steps.release.outputs.docker_tag }}
           VERIFIED_IMAGE_ID: ${{ steps.candidate.outputs.verified_image_id }}
           VERIFIED_SHA: ${{ github.event.workflow_run.head_sha }}
-          WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
-          WORKFLOW_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          PUBLICATION_RUN_ID: ${{ github.run_id }}
+          PUBLICATION_RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -Eeuo pipefail
-          trap 'timeout 30s docker logout ghcr.io >/dev/null 2>&1 || true; rm -rf -- "${DOCKER_CONFIG}"' EXIT
           image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${IMAGE_NAME}"
-          sha_tag="sha-${VERIFIED_SHA}"
-          candidate_tag="candidate-${VERIFIED_SHA}-${WORKFLOW_RUN_ID}-${WORKFLOW_RUN_ATTEMPT}"
+          candidate_tag="candidate-${VERIFIED_SHA}-${PUBLICATION_RUN_ID}-${PUBLICATION_RUN_ATTEMPT}"
           [[ ${VERIFIED_SHA} =~ ^[0-9a-f]{40}$ ]]
-          [[ ${WORKFLOW_RUN_ID} =~ ^[0-9]+$ ]]
-          [[ ${WORKFLOW_RUN_ATTEMPT} =~ ^[0-9]+$ ]]
+          [[ ${PUBLICATION_RUN_ID} =~ ^[0-9]+$ ]]
+          [[ ${PUBLICATION_RUN_ATTEMPT} =~ ^[0-9]+$ ]]
 
           recheck_release_tag() {
             timeout 60s git fetch --force --no-tags origin \
@@ -154,8 +151,6 @@ jobs:
           }
 
           recheck_release_tag
-          require_absent_tag "${image}:${VERSION_TAG}"
-          require_absent_tag "${image}:${sha_tag}"
           require_absent_tag "${image}:${candidate_tag}"
           timeout 30s docker image tag "${VERIFIED_IMAGE_ID}" "${image}:${candidate_tag}"
           timeout 600s docker push "${image}:${candidate_tag}"
@@ -168,20 +163,12 @@ jobs:
       - name: Attest candidate image provenance
         id: attest
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/pingora-docker-config
         with:
           subject-name: ${{ steps.publish_candidate.outputs.image }}
           subject-digest: ${{ steps.publish_candidate.outputs.digest }}
           push-to-registry: true
-
-      - name: Re-authenticate to GHCR for promotion
-        shell: bash
-        env:
-          DOCKER_CONFIG: ${{ runner.temp }}/pingora-docker-config
-          GHCR_TOKEN: ${{ github.token }}
-        run: |
-          set -Eeuo pipefail
-          install -d -m 0700 "${DOCKER_CONFIG}"
-          echo "${GHCR_TOKEN}" | timeout 30s docker login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
 
       - name: Promote attested digest to immutable release tags
         id: promote
@@ -195,7 +182,6 @@ jobs:
           VERIFIED_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -Eeuo pipefail
-          trap 'timeout 30s docker logout ghcr.io >/dev/null 2>&1 || true; rm -rf -- "${DOCKER_CONFIG}"' EXIT
           image="${PUBLISHED_IMAGE}"
           sha_tag="sha-${VERIFIED_SHA}"
           [[ ${VERIFIED_SHA} =~ ^[0-9a-f]{40}$ ]]
@@ -229,34 +215,39 @@ jobs:
             return 2
           }
 
-          require_absent_tag() {
-            local reference=$1 existing status
+          ensure_release_tag() {
+            local reference=$1 existing status metadata_file promotion_digest
             set +e
             existing=$(remote_digest "${reference}")
             status=$?
             set -e
             if (( status == 0 )); then
-              echo "refusing to overwrite existing image tag ${reference} at ${existing}" >&2
+              if [[ ${existing} == "${ATTESTED_DIGEST}" ]]; then
+                printf 'release tag already points at attested digest: %s\n' "${reference}"
+                return 0
+              fi
+              echo "refusing to replace ${reference} at ${existing} with ${ATTESTED_DIGEST}" >&2
               exit 1
             fi
             (( status == 1 )) || exit "${status}"
+
+            metadata_file=$(mktemp "${RUNNER_TEMP}/promotion-metadata.XXXXXX")
+            timeout 120s docker buildx imagetools create \
+              --prefer-index=false \
+              --tag "${reference}" \
+              --metadata-file "${metadata_file}" \
+              "${image}@${ATTESTED_DIGEST}"
+            promotion_digest=$(ruby -rjson -e \
+              'puts JSON.parse(File.read(ARGV.fetch(0))).fetch("containerimage.descriptor").fetch("digest")' \
+              "${metadata_file}")
+            rm -f "${metadata_file}"
+            test "${promotion_digest}" = "${ATTESTED_DIGEST}"
+            test "$(remote_digest "${reference}")" = "${ATTESTED_DIGEST}"
           }
 
           recheck_release_tag
-          require_absent_tag "${image}:${VERSION_TAG}"
-          require_absent_tag "${image}:${sha_tag}"
-          timeout 120s docker buildx imagetools create \
-            --prefer-index=false \
-            --tag "${image}:${VERSION_TAG}" \
-            --tag "${image}:${sha_tag}" \
-            --metadata-file "${RUNNER_TEMP}/promotion-metadata.json" \
-            "${image}@${ATTESTED_DIGEST}"
-          promotion_digest=$(ruby -rjson -e \
-            'puts JSON.parse(File.read(ARGV.fetch(0))).fetch("containerimage.descriptor").fetch("digest")' \
-            "${RUNNER_TEMP}/promotion-metadata.json")
-          test "${promotion_digest}" = "${ATTESTED_DIGEST}"
-          test "$(remote_digest "${image}:${VERSION_TAG}")" = "${ATTESTED_DIGEST}"
-          test "$(remote_digest "${image}:${sha_tag}")" = "${ATTESTED_DIGEST}"
+          ensure_release_tag "${image}:${VERSION_TAG}"
+          ensure_release_tag "${image}:${sha_tag}"
           {
             echo "version_ref=${image}:${VERSION_TAG}"
             echo "sha_ref=${image}:${sha_tag}"
@@ -273,3 +264,12 @@ jobs:
             echo "Commit ref: ${{ steps.promote.outputs.sha_ref }}"
             echo "Attestation: ${{ steps.attest.outputs.attestation-url }}"
           } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Clean up registry credentials
+        if: ${{ always() }}
+        shell: bash
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/pingora-docker-config
+        run: |
+          timeout 30s docker logout ghcr.io >/dev/null 2>&1 || true
+          rm -rf -- "${DOCKER_CONFIG}"

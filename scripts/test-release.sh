@@ -197,21 +197,40 @@ assert(candidate_script.include?('${RUNNER_TEMP}/pingora-verified-image/image.ta
 candidate_publish_index = publish_steps.index { |step| step['name'] == 'Publish immutable candidate manifest' }
 attest_index = publish_steps.index { |step| step['name'] == 'Attest candidate image provenance' }
 promotion_index = publish_steps.index { |step| step['name'] == 'Promote attested digest to immutable release tags' }
-assert(candidate_publish_index && attest_index && promotion_index &&
-       candidate_publish_index < attest_index && attest_index < promotion_index,
-       'candidate provenance must be published before public SemVer/SHA tag promotion')
-candidate_publish_script = publish_steps.fetch(candidate_publish_index).fetch('run')
+cleanup_index = publish_steps.index { |step| step['name'] == 'Clean up registry credentials' }
+assert(candidate_publish_index && attest_index && promotion_index && cleanup_index &&
+       candidate_publish_index < attest_index && attest_index < promotion_index &&
+       promotion_index < cleanup_index,
+       'candidate publication, attestation, promotion, and credential cleanup must remain ordered')
+candidate_publish = publish_steps.fetch(candidate_publish_index)
+candidate_publish_script = candidate_publish.fetch('run')
+candidate_publish_env = candidate_publish.fetch('env')
+attest = publish_steps.fetch(attest_index)
 promotion_script = publish_steps.fetch(promotion_index).fetch('run')
-assert(candidate_publish_script.include?('candidate-${VERIFIED_SHA}-${WORKFLOW_RUN_ID}-${WORKFLOW_RUN_ATTEMPT}') &&
+cleanup = publish_steps.fetch(cleanup_index)
+assert(candidate_publish_env.fetch('PUBLICATION_RUN_ID') == '${{ github.run_id }}' &&
+       candidate_publish_env.fetch('PUBLICATION_RUN_ATTEMPT') == '${{ github.run_attempt }}',
+       'candidate identity must change when the CD workflow itself is rerun')
+assert(candidate_publish_script.include?('candidate-${VERIFIED_SHA}-${PUBLICATION_RUN_ID}-${PUBLICATION_RUN_ATTEMPT}') &&
        candidate_publish_script.include?('docker push "${image}:${candidate_tag}"'),
-       'candidate publication must be immutable and unique per workflow attempt')
+       'candidate publication must be immutable and unique per CD workflow attempt')
+assert(!candidate_publish_script.include?('require_absent_tag "${image}:${VERSION_TAG}"') &&
+       !candidate_publish_script.include?('require_absent_tag "${image}:${sha_tag}"'),
+       'a rerun must reach idempotent promotion after a partially completed prior promotion')
 assert(!candidate_publish_script.include?('--tag "${image}:${VERSION_TAG}"') &&
        !candidate_publish_script.include?('--tag "${image}:${sha_tag}"'),
        'candidate publication must not expose public release tags before attestation')
-assert(promotion_script.include?('--tag "${image}:${VERSION_TAG}"') &&
-       promotion_script.include?('--tag "${image}:${sha_tag}"') &&
+assert(attest.fetch('env').fetch('DOCKER_CONFIG') == '${{ runner.temp }}/pingora-docker-config',
+       'registry credentials must remain available while provenance is pushed')
+assert(promotion_script.include?('ensure_release_tag "${image}:${VERSION_TAG}"') &&
+       promotion_script.include?('ensure_release_tag "${image}:${sha_tag}"') &&
+       promotion_script.include?('if [[ ${existing} == "${ATTESTED_DIGEST}" ]]') &&
        promotion_script.include?('"${image}@${ATTESTED_DIGEST}"'),
-       'post-attestation promotion must attach both immutable public tags to the attested digest')
+       'promotion must resume safely when a release tag already has the attested digest')
+assert(cleanup.fetch('if') == '${{ always() }}' &&
+       cleanup.fetch('env').fetch('DOCKER_CONFIG') == '${{ runner.temp }}/pingora-docker-config' &&
+       cleanup.fetch('run').include?('rm -rf -- "${DOCKER_CONFIG}"'),
+       'registry credentials must be removed on every success or failure path')
 RUBY
 if grep -Eq 'docker (build([[:space:]]|$)|buildx build([[:space:]]|$))' "$ROOT_DIR/.github/workflows/cd.yml"; then
   echo "CD rebuilds instead of promoting the tested image" >&2
