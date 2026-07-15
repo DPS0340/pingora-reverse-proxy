@@ -50,7 +50,7 @@ stop_active_group() {
         cleanup_failure "cargo process group was not recorded"
     fi
 
-    wait "$active_pid" 2>/dev/null
+    wait "$active_pid" 2>/dev/null || true
     if [[ -n "$active_pgid" ]]; then
         attempts="${DIFFERENTIAL_TERM_GRACE_ATTEMPTS:-50}"
         interval="${DIFFERENTIAL_TERM_GRACE_INTERVAL:-0.1}"
@@ -127,17 +127,33 @@ TEST_REDIS_URL="redis://127.0.0.1:${redis_port}" \
     cargo test "${cargo_args[@]}" &
 active_pid=$!
 active_pgid="$active_pid"
+set +e
 observed_pgid="$(ps -o pgid= -p "$active_pid")"
+pgid_status=$?
+set -e
 observed_pgid="${observed_pgid//[[:space:]]/}"
-if [[ ! "$observed_pgid" =~ ^[0-9]+$ || "$observed_pgid" != "$active_pid" ]]; then
+leader_waited=0
+cargo_status=0
+if ((pgid_status != 0)); then
+    # A short-lived cargo leader can exit before ps observes it. Reap it now so
+    # its original status is not replaced by an isolation-check failure; the
+    # job-control PGID remains active_pid for any surviving descendants.
+    set +e
+    wait "$active_pid"
+    cargo_status=$?
+    set -e
+    leader_waited=1
+elif [[ ! "$observed_pgid" =~ ^[0-9]+$ || "$observed_pgid" != "$active_pid" ]]; then
     recorded_pgid="$observed_pgid"
     echo "failed to isolate cargo process group: pid=$active_pid pgid=$recorded_pgid" >&2
     exit 1
 fi
-set +e
-wait "$active_pid"
-cargo_status=$?
-set -e
+if ((leader_waited == 0)); then
+    set +e
+    wait "$active_pid"
+    cargo_status=$?
+    set -e
+fi
 if kill -0 -- "-$active_pgid" 2>/dev/null; then
     stop_active_group
 else

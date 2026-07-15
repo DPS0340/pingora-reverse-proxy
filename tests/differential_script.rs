@@ -102,6 +102,13 @@ if [ "${FAIL_CARGO:-0}" = 1 ]; then exit 25; fi
 exit 0
 "#,
     );
+    write_executable(
+        &directory.path().join("ps"),
+        r#"#!/bin/sh
+if [ "${FORCE_PGID_LOOKUP_MISS:-0}" = 1 ]; then exit 1; fi
+exec /bin/ps "$@"
+"#,
+    );
     directory
 }
 
@@ -234,6 +241,20 @@ fn differential_script_cleans_its_image_at_every_failure_stage_and_success() {
         let log = std::fs::read_to_string(log).expect("read lifecycle log");
         assert_owned_cleanup(&log);
     }
+}
+
+#[test]
+fn differential_script_preserves_fast_cargo_status_when_pgid_lookup_loses_race() {
+    let tools = fake_tool_directory();
+    let log = tools.path().join("fast-cargo-exit.log");
+    let status = script_command(&tools, &log)
+        .env("FAIL_CARGO", "1")
+        .env("FORCE_PGID_LOOKUP_MISS", "1")
+        .status()
+        .expect("run differential script with an already-exited cargo leader");
+
+    assert_eq!(status.code(), Some(25));
+    assert_owned_cleanup(&std::fs::read_to_string(log).expect("fast cargo lifecycle log"));
 }
 
 #[cfg(unix)]
