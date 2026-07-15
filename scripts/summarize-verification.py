@@ -15,6 +15,17 @@ EXPECTED_BACKENDS = {"memory", "redis"}
 EXPECTED_JUPYTERHUB = "5.5.0"
 EXPECTED_COMMIT = CONTRACT["EXPECTED_JUPYTERHUB_COMMIT"]
 EXPECTED_SCENARIOS = set(CONTRACT["REQUIRED_SCENARIOS"])
+EXPECTED_LOGS = {
+    "01-fmt.log",
+    "02-clippy.log",
+    "03-tests.log",
+    "04-differential.log",
+    "05-jupyterhub.log",
+    "06-container.log",
+    "07-helm.log",
+    "08-audit.log",
+    "09-deny.log",
+}
 
 
 def main() -> None:
@@ -29,8 +40,17 @@ def main() -> None:
 
     rust_tests = 0
     differential_cases = 0
+    vendor_provenance: tuple[str, str, str] | None = None
     summaries: list[dict[str, object]] = []
-    for log in sorted(log_dir.glob("[0-9][0-9]-*.log")):
+    logs = sorted(log_dir.glob("[0-9][0-9]-*.log"))
+    observed_logs = {log.name for log in logs}
+    if observed_logs != EXPECTED_LOGS:
+        raise SystemExit(
+            "verification log inventory mismatch: "
+            f"missing={sorted(EXPECTED_LOGS - observed_logs)!r}, "
+            f"extra={sorted(observed_logs - EXPECTED_LOGS)!r}"
+        )
+    for log in logs:
         text = log.read_text(encoding="utf-8", errors="replace")
         passed = sum(
             int(match.group(1))
@@ -39,7 +59,19 @@ def main() -> None:
         rust_tests += passed
         if log.name == "04-differential.log":
             differential_cases += passed
-        for line in text.splitlines():
+        if log.name == "03-tests.log":
+            matches = re.findall(
+                r"^vendor provenance verified: ([a-z0-9-]+) ([0-9]+(?:\.[0-9]+){2}) "
+                r"archive_sha256=([0-9a-f]{64})$",
+                text,
+                flags=re.MULTILINE,
+            )
+            if len(matches) != 1:
+                raise SystemExit(
+                    f"expected one vendor provenance marker, found {len(matches)}"
+                )
+            vendor_provenance = matches[0]
+        for line in text.splitlines() if log.name == "05-jupyterhub.log" else ():
             marker = "JUPYTERHUB_E2E_SUMMARY="
             if marker in line:
                 value = json.loads(line.split(marker, 1)[1].strip())
@@ -51,6 +83,8 @@ def main() -> None:
         raise SystemExit("verification manifest found no passing Rust tests")
     if differential_cases == 0:
         raise SystemExit("verification manifest found no differential cases")
+    if vendor_provenance is None:
+        raise SystemExit("verification manifest found no vendor provenance evidence")
     if len(summaries) != len(EXPECTED_BACKENDS):
         raise SystemExit(
             f"expected two JupyterHub summaries, found {len(summaries)}"
@@ -83,6 +117,10 @@ def main() -> None:
         )
 
     with manifest.open("a", encoding="utf-8") as output:
+        package, version, archive_sha256 = vendor_provenance
+        output.write(
+            f"provenance\tvendor\t{package}\t{version}\tarchive_sha256\t{archive_sha256}\n"
+        )
         output.write(f"count\trust_test_passed\t{rust_tests}\n")
         output.write(f"count\tdifferential_cases\t{differential_cases}\n")
         output.write(f"count\tjupyterhub_runs\t{len(summaries)}\n")

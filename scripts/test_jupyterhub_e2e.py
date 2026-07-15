@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -163,12 +164,29 @@ class HubStartupFenceTests(unittest.TestCase):
                 SimpleNamespace(),
                 "test-hub",
                 proxy,
-                8081,
+                HARNESS.PortReservation(),
                 Path(root) / "hub",
                 False,
             )
             config = hub.config.read_text(encoding="utf-8")
         self.assertIn("c.JupyterHub.init_spawners_timeout = -1", config)
+
+
+class PortReservationTests(unittest.TestCase):
+    def test_reservation_holds_the_port_until_explicit_release(self) -> None:
+        reservation = HARNESS.PortReservation()
+        contender = HARNESS.socket.socket(HARNESS.socket.AF_INET, HARNESS.socket.SOCK_STREAM)
+        with self.assertRaises(OSError):
+            contender.bind(("127.0.0.1", reservation.port))
+        contender.close()
+
+        port = reservation.port
+        reservation.release()
+        replacement = HARNESS.socket.socket(HARNESS.socket.AF_INET, HARNESS.socket.SOCK_STREAM)
+        try:
+            replacement.bind(("127.0.0.1", port))
+        finally:
+            replacement.close()
 
 
 class PersistenceTests(unittest.TestCase):
@@ -267,6 +285,21 @@ class BuildContextTests(unittest.TestCase):
                 f"tracked {directory}/{file_name}\n", encoding="utf-8"
             )
         subprocess.run(["git", "add", "."], cwd=workspace, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=JupyterHub Test",
+                "-c",
+                "user.email=jupyterhub-test@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "fixture",
+            ],
+            cwd=workspace,
+            check=True,
+        )
         return workspace
 
     def test_build_context_excludes_untracked_workspace_secret(self) -> None:
@@ -289,11 +322,61 @@ class BuildContextTests(unittest.TestCase):
             workspace = self.make_workspace(Path(root))
             os.symlink("lib.rs", workspace / "src" / "linked.rs")
             subprocess.run(["git", "add", "src/linked.rs"], cwd=workspace, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=JupyterHub Test",
+                    "-c",
+                    "user.email=jupyterhub-test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "tracked symlink",
+                ],
+                cwd=workspace,
+                check=True,
+            )
             destination = Path(root) / "context"
             destination.mkdir()
 
             with self.assertRaisesRegex(HARNESS.GateError, "symbolic links are forbidden"):
                 HARNESS.copy_build_context(workspace, destination)
+
+    def test_build_context_uses_head_bytes_instead_of_dirty_tracked_content(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            workspace = self.make_workspace(Path(root))
+            (workspace / "src" / "lib.rs").write_text(
+                "dirty tracked injection\n", encoding="utf-8"
+            )
+            destination = Path(root) / "context"
+            destination.mkdir()
+
+            HARNESS.copy_build_context(workspace, destination)
+
+            self.assertEqual(
+                (destination / "src" / "lib.rs").read_text(encoding="utf-8"),
+                "tracked src/lib.rs\n",
+            )
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks are unavailable")
+    def test_build_context_ignores_an_ancestor_symlink_substitution(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            workspace = self.make_workspace(Path(root))
+            shutil.rmtree(workspace / "src")
+            outside = Path(root) / "outside"
+            outside.mkdir()
+            (outside / "lib.rs").write_text("ancestor injection\n", encoding="utf-8")
+            os.symlink(outside, workspace / "src")
+            destination = Path(root) / "context"
+            destination.mkdir()
+
+            HARNESS.copy_build_context(workspace, destination)
+
+            self.assertEqual(
+                (destination / "src" / "lib.rs").read_text(encoding="utf-8"),
+                "tracked src/lib.rs\n",
+            )
 
 if __name__ == "__main__":
     unittest.main()

@@ -6,18 +6,14 @@ readonly ROOT_DIR
 readonly LOG_DIR="${VERIFY_LOG_DIR:-${ROOT_DIR}/.verification-logs}"
 readonly MANIFEST_FILE="${LOG_DIR}/manifest.tsv"
 mkdir -p "${LOG_DIR}"
+rm -f "${LOG_DIR}"/[0-9][0-9]-*.log "${MANIFEST_FILE}"
 cd "${ROOT_DIR}"
 
 readonly PROPTEST_CASES=4096
-PROPERTY_RUNNER_COUNT="$(python3 scripts/verify-property-inventory.py --count)"
-readonly PROPERTY_RUNNER_COUNT
-readonly PROPERTY_CASES=$((PROPERTY_RUNNER_COUNT * PROPTEST_CASES))
 VERIFY_STARTED_NS="$(python3 -c 'import time; print(time.monotonic_ns())')"
 readonly VERIFY_STARTED_NS
 printf 'schema\tpingora-verification-v1\n' >"${MANIFEST_FILE}"
 printf 'source_sha\t%s\n' "$(git rev-parse --verify HEAD)" >>"${MANIFEST_FILE}"
-printf 'count\tproperty_runners\t%s\n' "${PROPERTY_RUNNER_COUNT}" >>"${MANIFEST_FILE}"
-printf 'count\tproperty_cases\t%s\n' "${PROPERTY_CASES}" >>"${MANIFEST_FILE}"
 
 finalize_manifest() {
   local status=$?
@@ -32,6 +28,12 @@ finalize_manifest() {
   exit "${finalizer_status}"
 }
 trap finalize_manifest EXIT
+
+PROPERTY_RUNNER_COUNT="$(python3 scripts/verify-property-inventory.py --count)"
+readonly PROPERTY_RUNNER_COUNT
+readonly PROPERTY_CASES=$((PROPERTY_RUNNER_COUNT * PROPTEST_CASES))
+printf 'count\tproperty_runners\t%s\n' "${PROPERTY_RUNNER_COUNT}" >>"${MANIFEST_FILE}"
+printf 'count\tproperty_cases\t%s\n' "${PROPERTY_CASES}" >>"${MANIFEST_FILE}"
 
 if command -v gtimeout >/dev/null 2>&1; then
   TIMEOUT=gtimeout
@@ -79,6 +81,14 @@ record_tool cargo cargo --version
 record_tool python3 python3 --version
 record_tool just just --version
 record_tool docker docker version --format 'docker client={{.Client.Version}} server={{.Server.Version}}'
+if "${TIMEOUT}" 15s docker compose version >/dev/null 2>&1; then
+  record_tool docker-compose docker compose version
+elif command -v docker-compose >/dev/null 2>&1; then
+  record_tool docker-compose docker-compose version
+else
+  echo "verify: Docker Compose is required" >&2
+  exit 1
+fi
 record_tool helm helm version --short
 record_tool cargo-audit cargo audit --version
 record_tool cargo-deny cargo deny --version
@@ -94,7 +104,7 @@ run_phase() {
   set +e
   python3 "${ROOT_DIR}/scripts/run-bounded.py" \
     --timeout "${limit}" \
-    --kill-after 15s \
+    --kill-after 30s \
     --log "${log}" \
     -- "$@"
   status=$?
@@ -113,7 +123,7 @@ run_phase 02-clippy 1800s cargo clippy --locked --all-targets --all-features -- 
 run_phase 03-tests 2400s env \
   PROPTEST_CASES="${PROPTEST_CASES}" DIFFERENTIAL_ALL_TARGETS=1 \
   /bin/bash -o pipefail -c \
-  './scripts/test-differential.sh && cargo test --locked --all-targets --all-features -- --list | python3 scripts/verify-property-inventory.py --verify-list'
+  'python3 scripts/verify-vendor-provenance.py && ./scripts/test-differential.sh && cargo test --locked --all-targets --all-features -- --list | python3 scripts/verify-property-inventory.py --verify-list'
 run_phase 04-differential 1800s just test-differential
 run_phase 05-jupyterhub 1800s env -u STORE_BACKEND just test-jupyterhub
 run_phase 06-container 2400s just test-container

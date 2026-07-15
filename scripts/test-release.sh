@@ -322,18 +322,21 @@ assert(candidate_script.include?('${RUNNER_TEMP}/pingora-verified-image/image.ta
        'CD verification must consume the downloaded archive and metadata paths')
 
 candidate_publish_index = publish_steps.index { |step| step['name'] == 'Publish bounded staging manifest' }
+provenance_index = publish_steps.index { |step| step['name'] == 'Create trusted candidate provenance predicate' }
 attest_index = publish_steps.index { |step| step['name'] == 'Attest candidate image provenance' }
 verify_attestation_index = publish_steps.index { |step| step['name'] == 'Verify candidate image provenance' }
 promotion_index = publish_steps.index { |step| step['name'] == 'Publish attested digest to release discovery tags' }
 cleanup_index = publish_steps.index { |step| step['name'] == 'Clean up registry credentials' }
-assert(candidate_publish_index && attest_index && verify_attestation_index &&
-       promotion_index && cleanup_index && candidate_publish_index < attest_index &&
+assert(candidate_publish_index && provenance_index && attest_index && verify_attestation_index &&
+       promotion_index && cleanup_index && candidate_publish_index < provenance_index &&
+       provenance_index < attest_index &&
        attest_index < verify_attestation_index && verify_attestation_index < promotion_index &&
        promotion_index < cleanup_index,
        'candidate publication, attestation verification, promotion, and credential cleanup must remain ordered')
 candidate_publish = publish_steps.fetch(candidate_publish_index)
 candidate_publish_script = candidate_publish.fetch('run')
 candidate_publish_env = candidate_publish.fetch('env')
+provenance = publish_steps.fetch(provenance_index)
 attest = publish_steps.fetch(attest_index)
 verify_attestation = publish_steps.fetch(verify_attestation_index)
 promotion_script = publish_steps.fetch(promotion_index).fetch('run')
@@ -358,21 +361,38 @@ assert(!candidate_publish_script.include?('require_absent_tag "${image}:${VERSIO
 assert(!candidate_publish_script.include?('--tag "${image}:${VERSION_TAG}"') &&
        !candidate_publish_script.include?('--tag "${image}:${sha_tag}"'),
        'candidate publication must not expose public release tags before attestation')
+provenance_script = provenance.fetch('run')
+assert(provenance.fetch('env').fetch('CANDIDATE_SHA') == '${{ github.event.workflow_run.head_sha }}' &&
+       provenance.fetch('env').fetch('CONTROL_SHA') == '${{ github.workflow_sha }}' &&
+       provenance_script.include?('"resolvedDependencies"') &&
+       provenance_script.include?('"gitCommit" => candidate') &&
+       provenance_script.include?('"publication_control_sha" => control'),
+       'trusted provenance predicate must bind the verified candidate and immutable publication controls')
 assert(attest.fetch('env').fetch('DOCKER_CONFIG') == '${{ runner.temp }}/pingora-docker-config',
        'registry credentials must remain available while provenance is pushed')
 attest_with = attest.fetch('with')
-assert(attest_with.fetch('subject-name') == '${{ steps.publish_candidate.outputs.image }}' &&
+assert(attest.fetch('uses') == 'actions/attest@a1948c3f048ba23858d222213b7c278aabede763' &&
+       attest_with.fetch('subject-name') == '${{ steps.publish_candidate.outputs.image }}' &&
        attest_with.fetch('subject-digest') == '${{ steps.publish_candidate.outputs.digest }}' &&
-       attest_with.fetch('push-to-registry') == true,
+       attest_with.fetch('predicate-type') == 'https://slsa.dev/provenance/v1' &&
+       attest_with.fetch('predicate-path') == '${{ steps.provenance.outputs.predicate }}' &&
+       attest_with.fetch('push-to-registry') == true &&
+       attest_with.fetch('create-storage-record') == false,
        'provenance must bind and push the exact push-derived image digest')
 verify_attestation_script = verify_attestation.fetch('run')
 assert(verify_attestation.fetch('env').fetch('DOCKER_CONFIG') == '${{ runner.temp }}/pingora-docker-config' &&
        verify_attestation.fetch('env').fetch('GH_TOKEN') == '${{ github.token }}' &&
+       verify_attestation.fetch('env').fetch('EXPECTED_CANDIDATE_SHA') == '${{ github.event.workflow_run.head_sha }}' &&
+       verify_attestation.fetch('env').fetch('EXPECTED_CONTROL_SHA') == '${{ github.workflow_sha }}' &&
        verify_attestation_script.include?('gh attestation verify "${subject}"') &&
        verify_attestation_script.include?('--repo "${GITHUB_REPOSITORY}"') &&
        verify_attestation_script.include?('--signer-workflow "${signer}"') &&
+       verify_attestation_script.include?('--signer-digest "${EXPECTED_CONTROL_SHA}"') &&
+       verify_attestation_script.include?('--source-digest "${EXPECTED_CONTROL_SHA}"') &&
+       verify_attestation_script.include?('--bundle-from-oci') &&
+       verify_attestation_script.include?('dependency.dig("digest", "gitCommit") == candidate') &&
        verify_attestation_script.include?('"oci://${PUBLISHED_IMAGE}@${ATTESTED_DIGEST}"'),
-       'promotion must require digest-bound provenance from the expected repository workflow')
+       'promotion must require candidate-bound provenance from the exact trusted workflow revision and OCI bundle')
 assert(promotion_script.include?('publish_discovery_tag "${image}:${VERSION_TAG}"') &&
        promotion_script.include?('publish_discovery_tag "${image}:${sha_tag}"') &&
        promotion_script.include?('test "$(remote_digest "${reference}")" = "${ATTESTED_DIGEST}"') &&

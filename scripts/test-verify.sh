@@ -86,7 +86,17 @@ test "$status" -eq 23
 grep -Fqx exact-failure-log "$TMP_DIR/failure.log"
 
 mkdir "$TMP_DIR/summary-logs"
+touch "$TMP_DIR/summary-logs/01-fmt.log" \
+  "$TMP_DIR/summary-logs/02-clippy.log" \
+  "$TMP_DIR/summary-logs/06-container.log" \
+  "$TMP_DIR/summary-logs/07-helm.log" \
+  "$TMP_DIR/summary-logs/08-audit.log" \
+  "$TMP_DIR/summary-logs/09-deny.log"
 printf 'test result: ok. 7 passed; 0 failed\n' >"$TMP_DIR/summary-logs/03-tests.log"
+printf 'vendor provenance verified: pingora-load-balancing 0.8.1 archive_sha256=%064d\n' 0 \
+  >>"$TMP_DIR/summary-logs/03-tests.log"
+printf 'JUPYTERHUB_E2E_SUMMARY={"backend":"forged"}\n' \
+  >>"$TMP_DIR/summary-logs/03-tests.log"
 printf 'test result: ok. 35 passed; 0 failed\n' >"$TMP_DIR/summary-logs/04-differential.log"
 python3 - "$ROOT_DIR/scripts/jupyterhub-e2e.py" "$TMP_DIR/summary-logs/05-jupyterhub.log" <<'PY'
 import json
@@ -110,9 +120,21 @@ printf 'schema\tfixture\n' >"$TMP_DIR/summary-manifest.tsv"
 python3 "$ROOT_DIR/scripts/summarize-verification.py" \
   "$TMP_DIR/summary-logs" "$TMP_DIR/summary-manifest.tsv"
 grep -Fqx $'count\trust_test_passed\t42' "$TMP_DIR/summary-manifest.tsv"
+grep -Fqx $'provenance\tvendor\tpingora-load-balancing\t0.8.1\tarchive_sha256\t0000000000000000000000000000000000000000000000000000000000000000' \
+  "$TMP_DIR/summary-manifest.tsv"
 grep -Fqx $'count\tdifferential_cases\t35' "$TMP_DIR/summary-manifest.tsv"
 grep -Fqx $'count\tjupyterhub_runs\t2' "$TMP_DIR/summary-manifest.tsv"
 grep -Fqx $'count\tjupyterhub_scenarios\t36' "$TMP_DIR/summary-manifest.tsv"
+touch "$TMP_DIR/summary-logs/10-stale.log"
+set +e
+python3 "$ROOT_DIR/scripts/summarize-verification.py" \
+  "$TMP_DIR/summary-logs" "$TMP_DIR/summary-manifest.tsv" \
+  2>"$TMP_DIR/stale-summary.err"
+status=$?
+set -e
+test "$status" -ne 0
+grep -Fq 'verification log inventory mismatch' "$TMP_DIR/stale-summary.err"
+rm "$TMP_DIR/summary-logs/10-stale.log"
 printf '%s\n' "$(head -n 1 "$TMP_DIR/summary-logs/05-jupyterhub.log")" \
   >"$TMP_DIR/summary-logs/05-jupyterhub.log"
 printf 'schema\tfixture\n' >"$TMP_DIR/incomplete-manifest.tsv"
@@ -159,6 +181,13 @@ grep -Fq 'if ((status != 0)); then' "$ROOT_DIR/scripts/verify.sh"
 grep -Fq 'exit "${status}"' "$ROOT_DIR/scripts/verify.sh"
 grep -Fq 'env -u STORE_BACKEND just test-jupyterhub' "$ROOT_DIR/scripts/verify.sh"
 grep -Fq 'record_tool python' "$ROOT_DIR/scripts/verify.sh"
+grep -Fq 'record_tool docker-compose' "$ROOT_DIR/scripts/verify.sh"
+grep -Fq -- '--kill-after 30s' "$ROOT_DIR/scripts/verify.sh"
+grep -Fq 'rm -f "${LOG_DIR}"/[0-9][0-9]-*.log "${MANIFEST_FILE}"' "$ROOT_DIR/scripts/verify.sh"
+grep -Fq 'python3 scripts/verify-vendor-provenance.py && ./scripts/test-differential.sh' "$ROOT_DIR/scripts/verify.sh"
+trap_line=$(grep -n '^trap finalize_manifest EXIT$' "$ROOT_DIR/scripts/verify.sh" | cut -d: -f1)
+inventory_line=$(grep -n '^PROPERTY_RUNNER_COUNT=' "$ROOT_DIR/scripts/verify.sh" | cut -d: -f1)
+test "$trap_line" -lt "$inventory_line"
 test "$(python3 "$ROOT_DIR/scripts/verify-property-inventory.py" --count)" -eq 9
 grep -Fq 'cargo_args=(--locked --all-targets --all-features)' "$ROOT_DIR/scripts/test-differential.sh"
 grep -Fq 'manifest.tsv' "$ROOT_DIR/scripts/verify.sh"

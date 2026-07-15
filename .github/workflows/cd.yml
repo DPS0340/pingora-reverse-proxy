@@ -178,26 +178,75 @@ jobs:
             echo "digest=${candidate_digest}"
           } >> "${GITHUB_OUTPUT}"
 
+      - name: Create trusted candidate provenance predicate
+        id: provenance
+        shell: bash
+        env:
+          CANDIDATE_SHA: ${{ github.event.workflow_run.head_sha }}
+          CI_WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
+          CONTROL_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -Eeuo pipefail
+          [[ ${CANDIDATE_SHA} =~ ^[0-9a-f]{40}$ ]]
+          [[ ${CONTROL_SHA} =~ ^[0-9a-f]{40}$ ]]
+          predicate="${RUNNER_TEMP}/candidate-provenance.json"
+          ruby -rjson -e '
+            path, repository, candidate, control, ci_run_id, run_id, run_attempt = ARGV
+            predicate = {
+              "buildDefinition" => {
+                "buildType" => "https://github.com/#{repository}/.github/workflows/ci.yml@#{candidate}",
+                "externalParameters" => {
+                  "candidate_sha" => candidate,
+                  "ci_workflow_run_id" => ci_run_id,
+                },
+                "internalParameters" => {"publication_control_sha" => control},
+                "resolvedDependencies" => [{
+                  "uri" => "git+https://github.com/#{repository}.git",
+                  "digest" => {"gitCommit" => candidate},
+                }],
+              },
+              "runDetails" => {
+                "builder" => {
+                  "id" => "https://github.com/#{repository}/.github/workflows/cd.yml@#{control}",
+                },
+                "metadata" => {
+                  "invocationId" => "https://github.com/#{repository}/actions/runs/#{run_id}/attempts/#{run_attempt}",
+                },
+              },
+            }
+            File.write(path, JSON.generate(predicate))
+          ' "${predicate}" "${GITHUB_REPOSITORY}" "${CANDIDATE_SHA}" "${CONTROL_SHA}" \
+            "${CI_WORKFLOW_RUN_ID}" "${GITHUB_RUN_ID}" "${GITHUB_RUN_ATTEMPT}"
+          echo "predicate=${predicate}" >>"${GITHUB_OUTPUT}"
+
       - name: Attest candidate image provenance
         id: attest
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
         env:
           DOCKER_CONFIG: ${{ runner.temp }}/pingora-docker-config
         with:
           subject-name: ${{ steps.publish_candidate.outputs.image }}
           subject-digest: ${{ steps.publish_candidate.outputs.digest }}
+          predicate-type: https://slsa.dev/provenance/v1
+          predicate-path: ${{ steps.provenance.outputs.predicate }}
           push-to-registry: true
+          create-storage-record: false
 
       - name: Verify candidate image provenance
         shell: bash
         env:
           ATTESTED_DIGEST: ${{ steps.publish_candidate.outputs.digest }}
           DOCKER_CONFIG: ${{ runner.temp }}/pingora-docker-config
+          EXPECTED_CANDIDATE_SHA: ${{ github.event.workflow_run.head_sha }}
+          EXPECTED_CONTROL_SHA: ${{ github.workflow_sha }}
+          EXPECTED_CI_RUN_ID: ${{ github.event.workflow_run.id }}
           GH_TOKEN: ${{ github.token }}
           PUBLISHED_IMAGE: ${{ steps.publish_candidate.outputs.image }}
         run: |
           set -Eeuo pipefail
           [[ ${ATTESTED_DIGEST} =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ ${EXPECTED_CANDIDATE_SHA} =~ ^[0-9a-f]{40}$ ]]
+          [[ ${EXPECTED_CONTROL_SHA} =~ ^[0-9a-f]{40}$ ]]
           subject="oci://${PUBLISHED_IMAGE}@${ATTESTED_DIGEST}"
           signer="${GITHUB_REPOSITORY}/.github/workflows/cd.yml"
           verification_output=$(mktemp "${RUNNER_TEMP}/attestation-verification.XXXXXX")
@@ -206,11 +255,32 @@ jobs:
             if timeout 60s gh attestation verify "${subject}" \
               --repo "${GITHUB_REPOSITORY}" \
               --signer-workflow "${signer}" \
+              --signer-digest "${EXPECTED_CONTROL_SHA}" \
+              --source-digest "${EXPECTED_CONTROL_SHA}" \
+              --predicate-type https://slsa.dev/provenance/v1 \
+              --bundle-from-oci \
               --format json >"${verification_output}"; then
               ruby -rjson -e '
                 results = JSON.parse(File.read(ARGV.fetch(0)))
-                abort "no verified provenance attestation" unless results.is_a?(Array) && !results.empty?
-              ' "${verification_output}"
+                candidate, control, ci_run_id, repository = ARGV.drop(1)
+                expected_builder = "https://github.com/#{repository}/.github/workflows/cd.yml@#{control}"
+                matching = Array(results).select do |result|
+                  statement = result.dig("verificationResult", "statement")
+                  next false unless statement.is_a?(Hash)
+                  predicate = statement["predicate"]
+                  next false unless statement["predicateType"] == "https://slsa.dev/provenance/v1" && predicate.is_a?(Hash)
+                  definition = predicate["buildDefinition"] || {}
+                  details = predicate["runDetails"] || {}
+                  dependencies = Array(definition["resolvedDependencies"])
+                  dependencies.any? { |dependency| dependency.dig("digest", "gitCommit") == candidate } &&
+                    definition.dig("externalParameters", "candidate_sha") == candidate &&
+                    definition.dig("externalParameters", "ci_workflow_run_id").to_s == ci_run_id &&
+                    definition.dig("internalParameters", "publication_control_sha") == control &&
+                    details.dig("builder", "id") == expected_builder
+                end
+                abort "no exact candidate/control provenance attestation" if matching.empty?
+              ' "${verification_output}" "${EXPECTED_CANDIDATE_SHA}" \
+                "${EXPECTED_CONTROL_SHA}" "${EXPECTED_CI_RUN_ID}" "${GITHUB_REPOSITORY}"
               exit 0
             fi
             if [[ ${attempt} -eq 6 ]]; then

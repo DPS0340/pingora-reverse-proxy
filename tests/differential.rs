@@ -584,12 +584,30 @@ fn oracle_launch_lock_subprocess_helper() {
         return;
     };
     let socket = std::env::var("ORACLE_LOCK_HELPER_SOCKET").expect("helper socket path");
+    let waiting = std::env::var("ORACLE_LOCK_HELPER_WAITING").expect("helper waiting path");
     let ready = std::env::var("ORACLE_LOCK_HELPER_READY").expect("helper ready path");
-    let _lock = LaunchLock::acquire_at(std::path::Path::new(&lock_path));
+    let release = std::env::var("ORACLE_LOCK_HELPER_RELEASE").expect("helper release path");
+    let lock_path = std::path::Path::new(&lock_path);
+    let _lock = loop {
+        match LaunchLock::try_acquire_at(lock_path).expect("probe cross-process launch lock") {
+            Some(lock) => break lock,
+            None => {
+                std::fs::write(&waiting, b"waiting").expect("publish observed lock contention");
+                std::thread::yield_now();
+            }
+        }
+    };
     let _listener = std::os::unix::net::UnixListener::bind(&socket)
         .expect("serialized helper owns unique socket path");
     std::fs::write(ready, b"ready").expect("publish helper bind readiness");
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !std::path::Path::new(&release).exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "parent never acknowledged the helper listener"
+        );
+        std::thread::yield_now();
+    }
 }
 
 #[cfg(unix)]
@@ -598,7 +616,9 @@ fn cross_process_launch_barrier_serializes_a_unique_binder() {
     let directory = tempfile::tempdir().expect("launch barrier directory");
     let lock_path = directory.path().join("launch.lock");
     let socket = directory.path().join("helper.sock");
+    let waiting = directory.path().join("waiting");
     let ready = directory.path().join("ready");
+    let release = directory.path().join("release");
     // Keep concurrent oracle launches outside this private-lock subprocess test.
     let _suite_lock = LaunchLock::acquire();
     let lock = LaunchLock::acquire_at(&lock_path);
@@ -610,10 +630,20 @@ fn cross_process_launch_barrier_serializes_a_unique_binder() {
         ])
         .env("ORACLE_LOCK_HELPER_PATH", &lock_path)
         .env("ORACLE_LOCK_HELPER_SOCKET", &socket)
+        .env("ORACLE_LOCK_HELPER_WAITING", &waiting)
         .env("ORACLE_LOCK_HELPER_READY", &ready)
+        .env("ORACLE_LOCK_HELPER_RELEASE", &release)
+        .stdout(std::process::Stdio::null())
         .spawn()
         .expect("spawn serialized socket binder");
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    let waiting_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !waiting.exists() {
+        assert!(
+            std::time::Instant::now() < waiting_deadline,
+            "helper never reached lock acquisition"
+        );
+        std::thread::yield_now();
+    }
     assert!(!ready.exists(), "binder crossed the process launch lock");
     assert!(
         !socket.exists(),
@@ -632,6 +662,7 @@ fn cross_process_launch_barrier_serializes_a_unique_binder() {
         std::os::unix::net::UnixStream::connect(&socket).is_ok(),
         "serialized child did not own the unique socket"
     );
+    std::fs::write(&release, b"release").expect("release serialized helper");
     assert!(helper.wait().expect("serialized helper exit").success());
 }
 

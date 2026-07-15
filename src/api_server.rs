@@ -249,13 +249,22 @@ fn socket_address_identity(fd: std::os::fd::RawFd) -> io::Result<Option<Vec<u8>>
 #[cfg(unix)]
 struct PublicServiceFutureState<F> {
     future: Option<Pin<Box<F>>>,
+    shutdown_guard: Option<PublicServiceShutdownGuard>,
     handoff: Option<RawFdHandoffGuard>,
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct PublicServiceResources {
+    handoff: Option<RawFdHandoffGuard>,
+    shutdown_guard: Option<PublicServiceShutdownGuard>,
 }
 
 #[cfg(unix)]
 impl<F> PublicServiceFutureState<F> {
     fn finish(mut self) -> Option<RawFdHandoffGuard> {
         drop(self.future.take());
+        drop(self.shutdown_guard.take());
         self.handoff.take()
     }
 }
@@ -267,8 +276,47 @@ impl<F> Drop for PublicServiceFutureState<F> {
         // descriptor. Always destroy that future/listener before an armed
         // guard conditionally closes the pre-adoption descriptor.
         drop(self.future.take());
+        drop(self.shutdown_guard.take());
         drop(self.handoff.take());
     }
+}
+
+#[cfg(unix)]
+struct PublicServiceShutdownGuard {
+    sender: tokio::sync::watch::Sender<bool>,
+    relay: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(unix)]
+impl Drop for PublicServiceShutdownGuard {
+    fn drop(&mut self) {
+        // Pingora detaches endpoint JoinHandles when its service future is
+        // cancelled. Wake those endpoint tasks before dropping ownership so
+        // they close their cloned listeners instead of running indefinitely.
+        self.sender.send_replace(true);
+        self.relay.abort();
+    }
+}
+
+#[cfg(unix)]
+fn bridge_public_shutdown(
+    mut upstream: ShutdownWatch,
+) -> (ShutdownWatch, PublicServiceShutdownGuard) {
+    let (sender, downstream) = tokio::sync::watch::channel(*upstream.borrow());
+    let relay_sender = sender.clone();
+    let relay = tokio::spawn(async move {
+        loop {
+            if *upstream.borrow() {
+                relay_sender.send_replace(true);
+                break;
+            }
+            if upstream.changed().await.is_err() {
+                relay_sender.send_replace(true);
+                break;
+            }
+        }
+    });
+    (downstream, PublicServiceShutdownGuard { sender, relay })
 }
 
 #[cfg(unix)]
@@ -288,7 +336,7 @@ async fn run_public_service_future<F, V>(
     ready_notifier: ServiceReadyNotifier,
     traffic: Arc<TrafficLifecycle>,
     mut initial_adoption_lock: Option<tokio::sync::OwnedMutexGuard<pingora::server::Fds>>,
-    handoff: Option<RawFdHandoffGuard>,
+    resources: PublicServiceResources,
     #[cfg(test)] mut after_blocked_adoption_poll: Option<Box<dyn FnOnce() + Send>>,
     verify_ready: V,
 ) -> (PublicServiceOutcome, Option<RawFdHandoffGuard>)
@@ -296,12 +344,17 @@ where
     F: Future<Output = ()>,
     V: FnOnce() -> io::Result<bool>,
 {
+    let PublicServiceResources {
+        handoff,
+        shutdown_guard,
+    } = resources;
     let _exit = PublicExitGuard { traffic };
     let mut ready_notifier = FailClosedReadyNotifier(Some(ready_notifier));
     let mut state = PublicServiceFutureState {
         future: Some(Box::pin(
             std::panic::AssertUnwindSafe(future).catch_unwind(),
         )),
+        shutdown_guard,
         handoff,
     };
     let first_poll = std::future::poll_fn(|context| {
@@ -1387,17 +1440,21 @@ where
         debug_assert_eq!(fd, transferred_fd);
         tracing::debug!(listeners_per_fd, "starting Pingora public listener service");
         let shutdown_observer = shutdown.clone();
+        let (service_shutdown, shutdown_guard) = bridge_public_shutdown(shutdown);
         let (outcome, returned_handoff) = run_public_service_future(
             <Service<A> as pingora::services::Service>::start_service(
                 &mut service,
                 Some(adoption_fds),
-                shutdown,
+                service_shutdown,
                 listeners_per_fd,
             ),
             ready_notifier.take(),
             Arc::clone(&self.traffic),
             Some(adoption_lock),
-            Some(handoff),
+            PublicServiceResources {
+                handoff: Some(handoff),
+                shutdown_guard: Some(shutdown_guard),
+            },
             #[cfg(test)]
             self.after_blocked_adoption_poll
                 .take()
@@ -1747,7 +1804,7 @@ mod tests {
             ServiceReadyNotifier::new(ready_sender),
             Arc::clone(&traffic),
             None,
-            None,
+            super::PublicServiceResources::default(),
             None,
             || Ok(true),
         )
@@ -1775,7 +1832,7 @@ mod tests {
             ServiceReadyNotifier::new(ready_sender),
             Arc::clone(&traffic),
             None,
-            None,
+            super::PublicServiceResources::default(),
             None,
             || Ok(true),
         ));
@@ -2018,6 +2075,8 @@ mod tests {
     async fn cancellation_after_pingora_adoption_keeps_a_pin_through_owner_cleanup() {
         use pingora::server::{Fds, ListenFds};
         use pingora::services::ServiceWithDependents;
+        use std::os::fd::RawFd;
+        use std::sync::atomic::AtomicI32;
 
         let directory = tempfile::tempdir_in("/tmp").expect("temporary adopted UDS directory");
         let socket_path = directory.path().join("public.sock");
@@ -2032,6 +2091,21 @@ mod tests {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .expect("prebind public UDS");
+        let observed_fd = Arc::new(AtomicI32::new(-1));
+        let observed_identity = Arc::new(std::sync::Mutex::new(None));
+        public.set_before_fd_table_lock_hook({
+            let observed_fd = Arc::clone(&observed_fd);
+            let observed_identity = Arc::clone(&observed_identity);
+            move |fd: RawFd| {
+                let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+                assert_eq!(unsafe { libc::fstat(fd, &mut stat) }, 0);
+                *observed_identity
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some((stat.st_dev, stat.st_ino));
+                observed_fd.store(fd, Ordering::Release);
+            }
+        });
         let pin_was_open = Arc::new(AtomicBool::new(false));
         public.set_before_socket_owner_drop_hook({
             let pin_was_open = Arc::clone(&pin_was_open);
@@ -2063,6 +2137,24 @@ mod tests {
             .expect("cancelled adopted service did not acknowledge exit");
         assert!(pin_was_open.load(Ordering::Acquire));
         assert!(!socket_path.exists(), "cancelled adopted UDS owner leaked");
+        let fd = observed_fd.load(Ordering::Acquire);
+        let identity = observed_identity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("capture adopted descriptor identity");
+        tokio::time::timeout(Duration::from_secs(1), async move {
+            loop {
+                let mut current: libc::stat = unsafe { std::mem::zeroed() };
+                if unsafe { libc::fstat(fd, &mut current) } != 0
+                    || (current.st_dev, current.st_ino) != identity
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled adopted service leaked its transferred descriptor");
     }
 
     #[cfg(unix)]

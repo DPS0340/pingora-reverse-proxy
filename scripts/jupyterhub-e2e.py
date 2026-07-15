@@ -6,16 +6,17 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import html
+import io
 import json
 import os
 import platform
 import re
 import secrets
-import shutil
 import signal
 import socket
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import uuid
@@ -186,43 +187,50 @@ BUILD_CONTEXT_DIRECTORIES = frozenset({"src", "tests", "scripts", "vendor"})
 
 
 def copy_build_context(workspace: Path, destination: Path) -> None:
-    result = subprocess.run(
+    archive = subprocess.run(
         [
             "git",
             "-C",
             str(workspace),
-            "ls-files",
-            "-z",
+            "archive",
+            "--format=tar",
+            "HEAD",
             "--",
             *sorted(BUILD_CONTEXT_ROOT_FILES),
             *sorted(BUILD_CONTEXT_DIRECTORIES),
         ],
         check=True,
         capture_output=True,
-    )
-    relative_paths = [
-        Path(os.fsdecode(raw)) for raw in result.stdout.split(b"\0") if raw
-    ]
-    tracked = {path.as_posix() for path in relative_paths}
+    ).stdout
+
+    tracked: set[str] = set()
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tree:
+        for member in tree.getmembers():
+            relative = Path(member.name)
+            if relative.is_absolute() or ".." in relative.parts:
+                raise GateError(f"unsafe tracked build path: {relative}")
+            if relative.parts[0] not in BUILD_CONTEXT_ROOT_FILES | BUILD_CONTEXT_DIRECTORIES:
+                raise GateError(f"tracked path is outside the build allowlist: {relative}")
+            if member.isdir():
+                continue
+            tracked.add(relative.as_posix())
+            if member.issym() or member.islnk():
+                raise GateError(
+                    f"symbolic links are forbidden in the JupyterHub build context: {relative}"
+                )
+            if not member.isreg():
+                raise GateError(f"tracked build input is not a regular file: {relative}")
+            source = tree.extractfile(member)
+            if source is None:
+                raise GateError(f"could not read tracked build input: {relative}")
+            target = destination / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(source.read())
+            target.chmod(member.mode & 0o777)
+
     missing = sorted(BUILD_CONTEXT_ROOT_FILES - tracked)
     if missing:
         raise GateError(f"required tracked build inputs are missing: {missing!r}")
-
-    for relative in relative_paths:
-        if relative.is_absolute() or ".." in relative.parts:
-            raise GateError(f"unsafe tracked build path: {relative}")
-        if relative.parts[0] not in BUILD_CONTEXT_ROOT_FILES | BUILD_CONTEXT_DIRECTORIES:
-            raise GateError(f"tracked path is outside the build allowlist: {relative}")
-        source = workspace / relative
-        if source.is_symlink():
-            raise GateError(
-                f"symbolic links are forbidden in the JupyterHub build context: {relative}"
-            )
-        if not source.is_file():
-            raise GateError(f"tracked build input is not a regular file: {relative}")
-        target = destination / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target)
 
 
 def docker_ids(command: list[str]) -> list[str]:
@@ -421,19 +429,31 @@ def supervisor_main() -> int:
     return 0
 
 
-def reserve_ports(count: int) -> list[int]:
-    sockets = [socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in range(count)]
-    try:
-        for item in sockets:
-            item.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
-            item.bind(("127.0.0.1", 0))
-        ports = [item.getsockname()[1] for item in sockets]
-        if len(set(ports)) != count:
-            raise GateError("dynamic port reservation returned duplicates")
-        return ports
-    finally:
-        for item in sockets:
-            item.close()
+class PortReservation:
+    def __init__(self, port: int = 0) -> None:
+        self._socket: socket.socket | None = socket.socket(
+            socket.AF_INET, socket.SOCK_STREAM
+        )
+        self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+        self._socket.bind(("127.0.0.1", port))
+        self.port = self._socket.getsockname()[1]
+
+    def release(self) -> None:
+        if self._socket is not None:
+            self._socket.close()
+            self._socket = None
+
+    def __del__(self) -> None:
+        self.release()
+
+
+def reserve_ports(count: int) -> list[PortReservation]:
+    reservations = [PortReservation() for _ in range(count)]
+    if len({item.port for item in reservations}) != count:
+        for item in reservations:
+            item.release()
+        raise GateError("dynamic port reservation returned duplicates")
+    return reservations
 
 
 class ManagedProcess:
@@ -579,15 +599,16 @@ class ExternalProxy:
         self,
         runtime: ScenarioRuntime,
         name: str,
-        public_port: int,
-        api_port: int,
+        public_port: PortReservation,
+        api_port: PortReservation,
         route_key: str,
         host_routing: bool,
     ) -> None:
         self.runtime = runtime
         self.name = name
-        self.public_port = public_port
-        self.api_port = api_port
+        self.public_port = public_port.port
+        self.api_port = api_port.port
+        self._reservations = [public_port, api_port]
         self.route_key = route_key
         self.host_routing = host_routing
         self.process: ManagedProcess | None = None
@@ -605,6 +626,11 @@ class ExternalProxy:
         return {"Authorization": f"token {self.runtime.proxy_token}"}
 
     def start(self) -> None:
+        if not self._reservations:
+            self._reservations = [
+                PortReservation(self.public_port),
+                PortReservation(self.api_port),
+            ]
         env = os.environ.copy()
         env.update(
             {
@@ -628,6 +654,9 @@ class ExternalProxy:
         ]
         if self.host_routing:
             command.append("--host-routing")
+        for reservation in self._reservations:
+            reservation.release()
+        self._reservations.clear()
         self.process = self.runtime.start_process(
             self.name,
             command,
@@ -697,14 +726,15 @@ class Hub:
         runtime: ScenarioRuntime,
         name: str,
         proxy: ExternalProxy,
-        hub_port: int,
+        hub_port: PortReservation,
         directory: Path,
         subdomain: bool,
     ) -> None:
         self.runtime = runtime
         self.name = name
         self.proxy = proxy
-        self.hub_port = hub_port
+        self.hub_port = hub_port.port
+        self._reservation: PortReservation | None = hub_port
         self.directory = directory
         self.subdomain = subdomain
         self.process: ManagedProcess | None = None
@@ -765,6 +795,8 @@ c.JupyterHub.subdomain_host = {subdomain_host!r}
         self.config.write_text(config, encoding="utf-8")
 
     def start(self) -> None:
+        if self._reservation is None:
+            self._reservation = PortReservation(self.hub_port)
         env = build_hub_environment(
             os.environ,
             {
@@ -777,6 +809,8 @@ c.JupyterHub.subdomain_host = {subdomain_host!r}
             },
         )
         (self.directory / "runtime").mkdir(exist_ok=True)
+        self._reservation.release()
+        self._reservation = None
         self.process = self.runtime.start_process(
             self.name,
             ["jupyterhub", "-f", str(self.config)],
@@ -811,6 +845,7 @@ c.JupyterHub.subdomain_host = {subdomain_host!r}
         assert self.process is not None
         self.runtime.lingering_groups.add(self.process.pgid)
         self.process.stop_parent_only()
+        self._reservation = PortReservation(self.hub_port)
 
     def stop_final(self) -> None:
         if self.process is not None and not self.process.exited():
@@ -1132,7 +1167,7 @@ def path_routing_scenarios(runtime: ScenarioRuntime, recorder: Recorder) -> None
     hub = Hub(runtime, "path-hub", proxy, hub_port, runtime.root / "path-hub", False)
 
     crud_path = "/api/routes/task12-crud"
-    crud_target = f"http://127.0.0.1:{hub_port}"
+    crud_target = f"http://127.0.0.1:{hub_port.port}"
     added = proxy.api(
         "POST",
         crud_path,
@@ -1286,7 +1321,7 @@ def host_routing_scenario(runtime: ScenarioRuntime, recorder: Recorder) -> None:
     wait_for("host route for river", host_route_ready)
     session = login(hub, "river")
     page = single_user_page(
-        session, f"http://river.hub.localhost:{public_port}/user/river/tree"
+        session, f"http://river.hub.localhost:{public_port.port}/user/river/tree"
     )
     if socket.gethostbyname("river.hub.localhost") != "127.0.0.1":
         raise GateError("river.hub.localhost did not resolve to loopback")

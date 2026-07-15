@@ -900,6 +900,29 @@ impl LaunchLock {
         assert_eq!(result, 0, "acquire cross-process oracle launch lock");
         Self { file }
     }
+
+    pub(crate) fn try_acquire_at(path: &std::path::Path) -> std::io::Result<Option<Self>> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        let result = unsafe {
+            libc::flock(
+                std::os::fd::AsRawFd::as_raw_fd(&file),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+        };
+        if result == 0 {
+            return Ok(Some(Self { file }));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(None);
+        }
+        Err(error)
+    }
 }
 
 #[cfg(unix)]
