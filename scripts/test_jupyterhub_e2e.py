@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -246,6 +247,53 @@ class EnvironmentIsolationTests(unittest.TestCase):
         self.assertNotIn(redis_url, rendered)
         self.assertNotIn(sentinel, rendered)
         self.assertIn("<redacted>", rendered)
+
+
+class BuildContextTests(unittest.TestCase):
+    def make_workspace(self, root: Path) -> Path:
+        workspace = root / "workspace"
+        workspace.mkdir()
+        subprocess.run(["git", "init", "--quiet"], cwd=workspace, check=True)
+        for name in ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml"):
+            (workspace / name).write_text(f"tracked {name}\n", encoding="utf-8")
+        for directory, file_name in (
+            ("src", "lib.rs"),
+            ("tests", "contract.rs"),
+            ("scripts", "gate.py"),
+            ("vendor", "NOTICE"),
+        ):
+            (workspace / directory).mkdir()
+            (workspace / directory / file_name).write_text(
+                f"tracked {directory}/{file_name}\n", encoding="utf-8"
+            )
+        subprocess.run(["git", "add", "."], cwd=workspace, check=True)
+        return workspace
+
+    def test_build_context_excludes_untracked_workspace_secret(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            workspace = self.make_workspace(Path(root))
+            (workspace / "src" / "untracked-secret.txt").write_text(
+                "must-not-enter-context", encoding="utf-8"
+            )
+            destination = Path(root) / "context"
+            destination.mkdir()
+
+            HARNESS.copy_build_context(workspace, destination)
+
+            self.assertTrue((destination / "src" / "lib.rs").is_file())
+            self.assertFalse((destination / "src" / "untracked-secret.txt").exists())
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks are unavailable")
+    def test_build_context_rejects_a_tracked_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            workspace = self.make_workspace(Path(root))
+            os.symlink("lib.rs", workspace / "src" / "linked.rs")
+            subprocess.run(["git", "add", "src/linked.rs"], cwd=workspace, check=True)
+            destination = Path(root) / "context"
+            destination.mkdir()
+
+            with self.assertRaisesRegex(HARNESS.GateError, "symbolic links are forbidden"):
+                HARNESS.copy_build_context(workspace, destination)
 
 if __name__ == "__main__":
     unittest.main()

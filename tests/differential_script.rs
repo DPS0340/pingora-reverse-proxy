@@ -264,13 +264,14 @@ fn differential_script_cleans_its_image_on_signal_interruption() {
     let log = tools.path().join("signal.log");
     let mut child = script_command(&tools, &log)
         .env("FAKE_CARGO_TREE", "1")
+        .env("FAKE_LATE_CONTAINER_DELAY", "2")
         .spawn()
         .expect("spawn differential script for signal");
     wait_for_lifecycle_marker(&mut child, &log, " cargo-tree ", "cargo");
     let killed = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
     assert_eq!(killed, 0);
     assert_eq!(child.wait().expect("signal script exit").code(), Some(143));
-    std::thread::sleep(std::time::Duration::from_millis(600));
+    std::thread::sleep(std::time::Duration::from_millis(2200));
     let log = std::fs::read_to_string(log).expect("read signal lifecycle log");
     assert_owned_cleanup(&log);
     assert!(
@@ -290,10 +291,11 @@ fn differential_script_reaps_successful_leaders_surviving_process_groups_before_
     let log = tools.path().join("leader-success.log");
     let status = script_command(&tools, &log)
         .env("FAKE_CARGO_LEADER_EXIT_TREE", "1")
+        .env("FAKE_LATE_CONTAINER_DELAY", "2")
         .status()
         .expect("run differential script with successful cargo leader");
     assert!(status.success());
-    std::thread::sleep(std::time::Duration::from_millis(600));
+    std::thread::sleep(std::time::Duration::from_millis(2200));
 
     let log = std::fs::read_to_string(log).expect("read leader-success lifecycle log");
     assert!(

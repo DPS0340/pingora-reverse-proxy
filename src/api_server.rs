@@ -783,9 +783,67 @@ fn completed_tls_handshake(
 }
 
 #[cfg(unix)]
+struct UnixSocketCleanup {
+    owner: Option<SocketOwner>,
+    _pin: std::os::fd::OwnedFd,
+}
+
+#[cfg(unix)]
+impl UnixSocketCleanup {
+    fn new(owner: SocketOwner, socket: &socket2::Socket) -> io::Result<Self> {
+        let pin: std::os::fd::OwnedFd = socket.try_clone()?.into();
+        Ok(Self {
+            owner: Some(owner),
+            _pin: pin,
+        })
+    }
+
+    fn owner(&self) -> &SocketOwner {
+        self.owner.as_ref().expect("Unix socket owner is present")
+    }
+
+    #[cfg(test)]
+    fn set_before_owner_drop_hook<F>(&mut self, hook: F)
+    where
+        F: FnOnce(bool) + Send + Sync + 'static,
+    {
+        use std::os::fd::AsRawFd;
+
+        let fd = self._pin.as_raw_fd();
+        let mut expected: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::fstat(fd, &mut expected) },
+            0,
+            "cleanup pin descriptor is valid when the test hook is installed"
+        );
+        let expected_address =
+            socket_address_identity(fd).expect("read cleanup pin socket identity");
+        self.owner
+            .as_mut()
+            .expect("Unix socket owner is present")
+            .set_before_drop_hook(move || {
+                let mut current: libc::stat = unsafe { std::mem::zeroed() };
+                let original = unsafe { libc::fstat(fd, &mut current) } == 0
+                    && current.st_dev == expected.st_dev
+                    && current.st_ino == expected.st_ino
+                    && socket_address_identity(fd).ok() == Some(expected_address);
+                hook(original);
+            });
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnixSocketCleanup {
+    fn drop(&mut self) {
+        // The duplicate descriptor remains open until after SocketOwner has
+        // completed identity-sensitive unlink/quarantine cleanup.
+        drop(self.owner.take());
+    }
+}
+
+#[cfg(unix)]
 struct OwnedUnixListener {
-    // Drop ownership and unlink while the listener still pins the socket inode.
-    _owner: SocketOwner,
+    _cleanup: UnixSocketCleanup,
     listener: tokio::net::UnixListener,
 }
 
@@ -793,10 +851,11 @@ struct OwnedUnixListener {
 impl OwnedUnixListener {
     fn bind(path: PathBuf) -> Result<Self, ListenerError> {
         let (socket, owner) = bind_unix_socket(path)?;
+        let cleanup = UnixSocketCleanup::new(owner, &socket).map_err(ListenerError::UnixBind)?;
         let listener =
             tokio::net::UnixListener::from_std(socket.into()).map_err(ListenerError::UnixBind)?;
         Ok(Self {
-            _owner: owner,
+            _cleanup: cleanup,
             listener,
         })
     }
@@ -935,8 +994,7 @@ enum PublicListenerReservation {
         key: String,
     },
     Unix {
-        // Keep the socket descriptor alive until owner cleanup has finished.
-        owner: SocketOwner,
+        cleanup: UnixSocketCleanup,
         socket: socket2::Socket,
     },
 }
@@ -995,7 +1053,9 @@ impl PublicListenerReservation {
             ListenerConfig::Unix(path) => {
                 let (socket, owner) =
                     bind_unix_socket_with_hook(path.clone(), after_parent_capture_before_bind)?;
-                Ok(Self::Unix { socket, owner })
+                let cleanup =
+                    UnixSocketCleanup::new(owner, &socket).map_err(ListenerError::UnixBind)?;
+                Ok(Self::Unix { cleanup, socket })
             }
         }
     }
@@ -1004,14 +1064,17 @@ impl PublicListenerReservation {
         self,
         service: &mut Service<A>,
         after_uds_path_resolution: F,
-    ) -> Result<(String, socket2::Socket, Option<SocketOwner>), ListenerError>
+    ) -> Result<(String, socket2::Socket, Option<UnixSocketCleanup>), ListenerError>
     where
         F: FnOnce(),
     {
         match self {
             Self::Tcp { socket, key } => Ok((key, socket, None)),
-            Self::Unix { socket, owner } => {
-                let pingora_path = owner.pingora_path().map_err(ListenerError::UnixBind)?;
+            Self::Unix { cleanup, socket } => {
+                let pingora_path = cleanup
+                    .owner()
+                    .pingora_path()
+                    .map_err(ListenerError::UnixBind)?;
                 after_uds_path_resolution();
                 let path = pingora_path.to_str().ok_or_else(|| {
                     ListenerError::UnixBind(io::Error::new(
@@ -1020,7 +1083,7 @@ impl PublicListenerReservation {
                     ))
                 })?;
                 service.add_uds_with_preconfigured_permissions(path);
-                Ok((path.to_string(), socket, Some(owner)))
+                Ok((path.to_string(), socket, Some(cleanup)))
             }
         }
     }
@@ -1217,6 +1280,19 @@ impl<A> PreboundPublicService<A> {
         self.after_uds_path_resolution = Some(Box::new(hook));
     }
 
+    #[cfg(test)]
+    fn set_before_socket_owner_drop_hook<F>(&mut self, hook: F)
+    where
+        F: FnOnce(bool) + Send + Sync + 'static,
+    {
+        match self.reservation.as_mut() {
+            Some(PublicListenerReservation::Unix { cleanup, .. }) => {
+                cleanup.set_before_owner_drop_hook(hook);
+            }
+            _ => panic!("socket owner drop hook requires a Unix reservation"),
+        }
+    }
+
     fn signal_startup_failure(&mut self) {
         self.startup_failed.store(true, Ordering::Release);
         #[cfg(test)]
@@ -1263,7 +1339,7 @@ where
         };
         #[cfg(test)]
         let after_uds_path_resolution = self.after_uds_path_resolution.take();
-        let (key, socket, owner) = match reservation.into_parts(&mut service, || {
+        let (key, socket, cleanup) = match reservation.into_parts(&mut service, || {
             #[cfg(test)]
             if let Some(hook) = after_uds_path_resolution {
                 hook();
@@ -1326,8 +1402,8 @@ where
             self.after_blocked_adoption_poll
                 .take()
                 .map(|hook| hook as Box<dyn FnOnce() + Send>),
-            || match owner.as_ref() {
-                Some(owner) => owner.configured_entry_matches(),
+            || match cleanup.as_ref() {
+                Some(cleanup) => cleanup.owner().configured_entry_matches(),
                 None => Ok(true),
             },
         )
@@ -1340,7 +1416,7 @@ where
         if let Some(hook) = self.before_handoff_guard_drop.take() {
             hook(handoff.armed);
         }
-        drop_public_listener_resources(owner, handoff);
+        drop_public_listener_resources(cleanup, handoff);
         tracing::debug!("Pingora public listener service stopped");
     }
 
@@ -1354,9 +1430,9 @@ where
 }
 
 #[cfg(unix)]
-fn drop_public_listener_resources(owner: Option<SocketOwner>, handoff: RawFdHandoffGuard) {
-    // Cleanup must run before the handoff guard closes the last listener FD.
-    drop(owner);
+fn drop_public_listener_resources(cleanup: Option<UnixSocketCleanup>, handoff: RawFdHandoffGuard) {
+    // Cleanup owns an independent descriptor pin and unlinks before closing it.
+    drop(cleanup);
     drop(handoff);
 }
 
@@ -1939,6 +2015,58 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn cancellation_after_pingora_adoption_keeps_a_pin_through_owner_cleanup() {
+        use pingora::server::{Fds, ListenFds};
+        use pingora::services::ServiceWithDependents;
+
+        let directory = tempfile::tempdir_in("/tmp").expect("temporary adopted UDS directory");
+        let socket_path = directory.path().join("public.sock");
+        let traffic = Arc::new(TrafficLifecycle::new());
+        let service =
+            pingora::services::listening::Service::new("test public".to_string(), TestServerApp);
+        let mut public = super::PreboundPublicService::new(
+            service,
+            &crate::config::ListenerConfig::Unix(socket_path.clone()),
+            None,
+            Arc::clone(&traffic),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .expect("prebind public UDS");
+        let pin_was_open = Arc::new(AtomicBool::new(false));
+        public.set_before_socket_owner_drop_hook({
+            let pin_was_open = Arc::clone(&pin_was_open);
+            move |open| pin_was_open.store(open, Ordering::Release)
+        });
+        let fds: ListenFds = Arc::new(tokio::sync::Mutex::new(Fds::new()));
+        let (_shutdown_sender, shutdown) = tokio::sync::watch::channel(false);
+        let (ready_sender, mut ready_watch) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move {
+            public
+                .start_service(
+                    Some(fds),
+                    shutdown,
+                    1,
+                    ServiceReadyNotifier::new(ready_sender),
+                )
+                .await;
+        });
+        ready_watch
+            .wait_for(|ready| *ready)
+            .await
+            .expect("Pingora UDS adoption readiness");
+
+        task.abort();
+        let _ = task.await;
+
+        tokio::time::timeout(Duration::from_secs(1), traffic.wait_for_accepts_stopped())
+            .await
+            .expect("cancelled adopted service did not acknowledge exit");
+        assert!(pin_was_open.load(Ordering::Acquire));
+        assert!(!socket_path.exists(), "cancelled adopted UDS owner leaked");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn parent_alias_replaced_after_capture_before_bind_uses_anchor_and_fails_closed() {
         use pingora::server::{Fds, ListenFds};
         use pingora::services::ServiceWithDependents;
@@ -2368,19 +2496,13 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn owned_unix_listener_keeps_descriptor_alive_through_owner_cleanup() {
-        use std::os::fd::AsRawFd;
-
         let directory = tempfile::tempdir().expect("temporary owned listener directory");
         let path = directory.path().join("owned.sock");
         let mut listener = super::OwnedUnixListener::bind(path).expect("bind owned listener");
-        let fd = listener.listener.as_raw_fd();
         let descriptor_was_open = Arc::new(AtomicBool::new(false));
         let observed = Arc::clone(&descriptor_was_open);
-        listener._owner.set_before_drop_hook(move || {
-            observed.store(
-                unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0,
-                Ordering::Release,
-            );
+        listener._cleanup.set_before_owner_drop_hook(move |open| {
+            observed.store(open, Ordering::Release);
         });
 
         drop(listener);
@@ -2390,23 +2512,127 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unix_reservation_keeps_descriptor_alive_through_owner_cleanup() {
-        use std::os::fd::AsRawFd;
+    fn owned_unix_listener_constructor_panic_cleans_socket_path() {
+        let directory = tempfile::tempdir().expect("temporary owned constructor directory");
+        let path = directory.path().join("owned-constructor-panic.sock");
 
-        let directory = tempfile::tempdir().expect("temporary reservation directory");
-        let path = directory.path().join("reservation.sock");
-        let (socket, mut owner) = super::bind_unix_socket(path).expect("bind reservation");
-        let fd = socket.as_raw_fd();
-        let descriptor_was_open = Arc::new(AtomicBool::new(false));
-        let observed = Arc::clone(&descriptor_was_open);
-        owner.set_before_drop_hook(move || {
-            observed.store(
-                unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0,
-                Ordering::Release,
-            );
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _listener = super::OwnedUnixListener::bind(path.clone())
+                .expect("Tokio constructor must panic without a runtime");
+        }));
+
+        assert!(
+            panic.is_err(),
+            "Tokio constructor unexpectedly found a runtime"
+        );
+        assert!(
+            !path.exists(),
+            "OwnedUnixListener constructor panic leaked the Unix socket path"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tokio_unix_constructor_panic_keeps_original_pin_through_owner_cleanup() {
+        let directory = tempfile::tempdir().expect("temporary constructor panic directory");
+        let path = directory.path().join("constructor-panic.sock");
+        let (socket, owner) =
+            super::bind_unix_socket(path.clone()).expect("bind constructor panic socket");
+        let mut cleanup =
+            super::UnixSocketCleanup::new(owner, &socket).expect("duplicate constructor panic pin");
+        let observed_original = Arc::new(AtomicBool::new(false));
+        cleanup.set_before_owner_drop_hook({
+            let observed_original = Arc::clone(&observed_original);
+            move |original| observed_original.store(original, Ordering::Release)
         });
 
-        drop(super::PublicListenerReservation::Unix { socket, owner });
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let listener: std::os::unix::net::UnixListener = socket.into();
+            let _listener = tokio::net::UnixListener::from_std(listener)
+                .expect("Tokio constructor must panic without a runtime");
+            drop(cleanup);
+        }));
+
+        assert!(
+            panic.is_err(),
+            "Tokio constructor unexpectedly found a runtime"
+        );
+        assert!(
+            observed_original.load(Ordering::Acquire),
+            "constructor panic dropped or replaced the cleanup pin before owner cleanup"
+        );
+        assert!(
+            !path.exists(),
+            "constructor panic leaked the Unix socket path"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_cleanup_hook_rejects_a_reused_pin_descriptor() {
+        use std::os::fd::AsRawFd;
+
+        let directory = tempfile::tempdir().expect("temporary cleanup identity directory");
+        let path = directory.path().join("cleanup-identity.sock");
+        let (socket, owner) = super::bind_unix_socket(path).expect("bind cleanup identity socket");
+        let mut cleanup =
+            super::UnixSocketCleanup::new(owner, &socket).expect("duplicate cleanup identity pin");
+        let observed_original = Arc::new(AtomicBool::new(true));
+        cleanup.set_before_owner_drop_hook({
+            let observed_original = Arc::clone(&observed_original);
+            move |original| observed_original.store(original, Ordering::Release)
+        });
+
+        let replacement = tempfile::tempfile().expect("create replacement descriptor");
+        assert_eq!(
+            unsafe { libc::dup2(replacement.as_raw_fd(), cleanup._pin.as_raw_fd()) },
+            cleanup._pin.as_raw_fd(),
+            "replace cleanup pin descriptor"
+        );
+        drop(cleanup);
+
+        assert!(
+            !observed_original.load(Ordering::Acquire),
+            "numeric descriptor reuse was mistaken for the original cleanup pin"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_cleanup_guard_pins_inode_after_primary_listener_closes() {
+        let directory = tempfile::tempdir().expect("temporary cleanup guard directory");
+        let path = directory.path().join("cleanup.sock");
+        let (socket, owner) = super::bind_unix_socket(path.clone()).expect("bind cleanup guard");
+        let mut cleanup =
+            super::UnixSocketCleanup::new(owner, &socket).expect("duplicate cleanup pin");
+        let pin_was_open = Arc::new(AtomicBool::new(false));
+        cleanup.set_before_owner_drop_hook({
+            let pin_was_open = Arc::clone(&pin_was_open);
+            move |open| pin_was_open.store(open, Ordering::Release)
+        });
+
+        drop(socket);
+        drop(cleanup);
+
+        assert!(pin_was_open.load(Ordering::Acquire));
+        assert!(!path.exists(), "cleanup guard leaked its socket path");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_reservation_keeps_descriptor_alive_through_owner_cleanup() {
+        let directory = tempfile::tempdir().expect("temporary reservation directory");
+        let path = directory.path().join("reservation.sock");
+        let (socket, owner) = super::bind_unix_socket(path).expect("bind reservation");
+        let mut cleanup =
+            super::UnixSocketCleanup::new(owner, &socket).expect("duplicate reservation pin");
+        let descriptor_was_open = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&descriptor_was_open);
+        cleanup.set_before_owner_drop_hook(move |open| {
+            observed.store(open, Ordering::Release);
+        });
+
+        drop(super::PublicListenerReservation::Unix { cleanup, socket });
 
         assert!(descriptor_was_open.load(Ordering::Acquire));
     }
@@ -2414,25 +2640,23 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn adopted_public_listener_keeps_descriptor_alive_through_owner_cleanup() {
-        use std::os::fd::{AsRawFd, IntoRawFd};
+        use std::os::fd::IntoRawFd;
 
         let directory = tempfile::tempdir().expect("temporary adopted listener directory");
         let path = directory.path().join("adopted.sock");
-        let (socket, mut owner) = super::bind_unix_socket(path).expect("bind adopted listener");
-        let fd = socket.as_raw_fd();
+        let (socket, owner) = super::bind_unix_socket(path).expect("bind adopted listener");
+        let mut cleanup =
+            super::UnixSocketCleanup::new(owner, &socket).expect("duplicate adopted pin");
         let descriptor_was_open = Arc::new(AtomicBool::new(false));
         let observed = Arc::clone(&descriptor_was_open);
-        owner.set_before_drop_hook(move || {
-            observed.store(
-                unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0,
-                Ordering::Release,
-            );
+        cleanup.set_before_owner_drop_hook(move |open| {
+            observed.store(open, Ordering::Release);
         });
         let fd = socket.into_raw_fd();
         let mut handoff = super::RawFdHandoffGuard::new(fd).expect("capture adopted descriptor");
         handoff.arm();
 
-        super::drop_public_listener_resources(Some(owner), handoff);
+        super::drop_public_listener_resources(Some(cleanup), handoff);
 
         assert!(descriptor_was_open.load(Ordering::Acquire));
     }

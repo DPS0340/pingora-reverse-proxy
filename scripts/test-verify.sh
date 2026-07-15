@@ -85,15 +85,88 @@ set -e
 test "$status" -eq 23
 grep -Fqx exact-failure-log "$TMP_DIR/failure.log"
 
+mkdir "$TMP_DIR/summary-logs"
+printf 'test result: ok. 7 passed; 0 failed\n' >"$TMP_DIR/summary-logs/03-tests.log"
+printf 'test result: ok. 35 passed; 0 failed\n' >"$TMP_DIR/summary-logs/04-differential.log"
+python3 - "$ROOT_DIR/scripts/jupyterhub-e2e.py" "$TMP_DIR/summary-logs/05-jupyterhub.log" <<'PY'
+import json
+import runpy
+import sys
+from pathlib import Path
+
+contract = runpy.run_path(sys.argv[1])
+scenarios = sorted(contract["REQUIRED_SCENARIOS"])
+with Path(sys.argv[2]).open("w", encoding="utf-8") as output:
+    for backend in ("memory", "redis"):
+        summary = {
+            "backend": backend,
+            "jupyterhub": "5.5.0",
+            "jupyterhub_commit": contract["EXPECTED_JUPYTERHUB_COMMIT"],
+            "scenarios": scenarios,
+        }
+        output.write(f"JUPYTERHUB_E2E_SUMMARY={json.dumps(summary)}\n")
+PY
+printf 'schema\tfixture\n' >"$TMP_DIR/summary-manifest.tsv"
+python3 "$ROOT_DIR/scripts/summarize-verification.py" \
+  "$TMP_DIR/summary-logs" "$TMP_DIR/summary-manifest.tsv"
+grep -Fqx $'count\trust_test_passed\t42' "$TMP_DIR/summary-manifest.tsv"
+grep -Fqx $'count\tdifferential_cases\t35' "$TMP_DIR/summary-manifest.tsv"
+grep -Fqx $'count\tjupyterhub_runs\t2' "$TMP_DIR/summary-manifest.tsv"
+grep -Fqx $'count\tjupyterhub_scenarios\t36' "$TMP_DIR/summary-manifest.tsv"
+printf '%s\n' "$(head -n 1 "$TMP_DIR/summary-logs/05-jupyterhub.log")" \
+  >"$TMP_DIR/summary-logs/05-jupyterhub.log"
+printf 'schema\tfixture\n' >"$TMP_DIR/incomplete-manifest.tsv"
+set +e
+python3 "$ROOT_DIR/scripts/summarize-verification.py" \
+  "$TMP_DIR/summary-logs" "$TMP_DIR/incomplete-manifest.tsv" \
+  2>"$TMP_DIR/incomplete-summary.err"
+status=$?
+set -e
+test "$status" -ne 0
+grep -Fq 'expected two JupyterHub summaries, found 1' "$TMP_DIR/incomplete-summary.err"
+
+started_ns=$(python3 -c 'import time; print(time.monotonic_ns())')
+printf 'schema\tfixture\n' >"$TMP_DIR/final-manifest.tsv"
+python3 "$ROOT_DIR/scripts/finalize-verification-manifest.py" \
+  "$TMP_DIR/final-manifest.tsv" "$started_ns" 0
+grep -Eq $'^result\tstatus\t0\telapsed_milliseconds\t[0-9]+$' "$TMP_DIR/final-manifest.tsv"
+set +e
+python3 "$ROOT_DIR/scripts/finalize-verification-manifest.py" \
+  "$TMP_DIR/final-manifest.tsv" "$started_ns" 23
+status=$?
+set -e
+test "$status" -eq 23
+grep -Eq $'^result\tstatus\t23\telapsed_milliseconds\t[0-9]+$' "$TMP_DIR/final-manifest.tsv"
+mkdir "$TMP_DIR/not-a-manifest"
+set +e
+python3 "$ROOT_DIR/scripts/finalize-verification-manifest.py" \
+  "$TMP_DIR/not-a-manifest" "$started_ns" 0
+status=$?
+set -e
+test "$status" -ne 0
+
 mapfile -t phases < <(sed -n 's/^run_phase \([^ ]*\).*/\1/p' "$ROOT_DIR/scripts/verify.sh")
 expected=(01-fmt 02-clippy 03-tests 04-differential 05-jupyterhub 06-container 07-helm 08-audit 09-deny)
 test "${phases[*]}" = "${expected[*]}"
-grep -Fq 'DIFFERENTIAL_ALL_TARGETS=1 ./scripts/test-differential.sh' "$ROOT_DIR/scripts/verify.sh"
+grep -Fq 'DIFFERENTIAL_ALL_TARGETS=1' "$ROOT_DIR/scripts/verify.sh"
+grep -Fq './scripts/test-differential.sh && cargo test --locked --all-targets --all-features -- --list' "$ROOT_DIR/scripts/verify.sh"
+grep -Fq 'python3 scripts/verify-property-inventory.py --verify-list' "$ROOT_DIR/scripts/verify.sh"
+grep -Fq 'scripts/summarize-verification.py' "$ROOT_DIR/scripts/verify.sh"
+grep -Fq 'scripts/finalize-verification-manifest.py' "$ROOT_DIR/scripts/verify.sh"
+grep -Fq 'if ((status != 0)); then' "$ROOT_DIR/scripts/verify.sh"
+grep -Fq 'exit "${status}"' "$ROOT_DIR/scripts/verify.sh"
+grep -Fq 'env -u STORE_BACKEND just test-jupyterhub' "$ROOT_DIR/scripts/verify.sh"
+grep -Fq 'record_tool python' "$ROOT_DIR/scripts/verify.sh"
+test "$(python3 "$ROOT_DIR/scripts/verify-property-inventory.py" --count)" -eq 9
 grep -Fq 'cargo_args=(--locked --all-targets --all-features)' "$ROOT_DIR/scripts/test-differential.sh"
 grep -Fq 'manifest.tsv' "$ROOT_DIR/scripts/verify.sh"
 grep -Fq 'source_sha\t' "$ROOT_DIR/scripts/verify.sh"
 grep -Fq 'elapsed_milliseconds\t' "$ROOT_DIR/scripts/verify.sh"
-grep -Fq 'property_cases\t36864' "$ROOT_DIR/scripts/verify.sh"
+grep -Fq 'PROPERTY_CASES=$((PROPERTY_RUNNER_COUNT * PROPTEST_CASES))' "$ROOT_DIR/scripts/verify.sh"
+if grep -Fq 'property_cases\t36864' "$ROOT_DIR/scripts/verify.sh"; then
+  echo "verify still hard-codes the property-case count" >&2
+  exit 1
+fi
 if grep -Fq -- '--foreground' "$ROOT_DIR/scripts/verify.sh"; then
   echo "verify still uses foreground-only timeout semantics" >&2
   exit 1

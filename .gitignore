@@ -1,4 +1,6 @@
 /target
 /.verification-logs/
 /.worktrees/
+__pycache__/
+*.py[cod]
 /.superpowers/sdd/task-4-report.md

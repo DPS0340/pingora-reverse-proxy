@@ -30,15 +30,56 @@ jobs:
       id-token: write
       packages: write
     steps:
-      - name: Check out the verified commit
+      - name: Check out immutable publication controls
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: publication-control
+          persist-credentials: false
+
+      - name: Check out verified candidate without credentials
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 0
+          fetch-tags: true
+          path: candidate
+          persist-credentials: false
+
+      - name: Authorize candidate from trusted default-branch history
+        shell: bash
+        env:
+          TRUSTED_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          VERIFIED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -Eeuo pipefail
+          [[ ${VERIFIED_SHA} =~ ^[0-9a-f]{40}$ ]]
+          git check-ref-format --branch "${TRUSTED_DEFAULT_BRANCH}" >/dev/null
+          default_ref="refs/remotes/origin/${TRUSTED_DEFAULT_BRANCH}"
+          git -C candidate show-ref --verify --quiet "${default_ref}"
+          test "$(git -C candidate rev-parse HEAD)" = "${VERIFIED_SHA}"
+          git -C candidate merge-base --is-ancestor \
+            "${VERIFIED_SHA}" "${default_ref}"
+
+      - name: Install pinned attestation verifier
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          archive="${RUNNER_TEMP}/gh_2.95.0_linux_amd64.tar.gz"
+          extracted="${RUNNER_TEMP}/gh_2.95.0_linux_amd64"
+          curl --fail --location --silent --show-error --max-time 60 \
+            --output "${archive}" \
+            https://github.com/cli/cli/releases/download/v2.95.0/gh_2.95.0_linux_amd64.tar.gz
+          echo "25d1e4729e8808c9ed3d613e96ebd3f3e44446f2d368c89d878a71a36ddb3d8c  ${archive}" | sha256sum --check
+          timeout 30s tar -xzf "${archive}" -C "${RUNNER_TEMP}"
+          timeout 30s sudo install -m 0755 "${extracted}/bin/gh" /usr/local/bin/gh
+          test "$(gh --version | head -n 1)" = "gh version 2.95.0 (2026-06-17)"
+          rm -rf -- "${archive}" "${extracted}"
 
       - name: Select one strict SemVer release tag
         id: release
         shell: bash
+        working-directory: candidate
         env:
           VERIFIED_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
@@ -47,7 +88,7 @@ jobs:
           mapfile -t tags_at_sha < <(git tag --points-at "${VERIFIED_SHA}")
           release_tags=()
           for tag in "${tags_at_sha[@]}"; do
-            if ruby scripts/release-policy.rb "${tag}" >/dev/null 2>&1; then
+            if ruby ../publication-control/scripts/release-policy.rb "${tag}" >/dev/null 2>&1; then
               release_tags+=("${tag}")
             fi
           done
@@ -55,7 +96,7 @@ jobs:
             echo "expected exactly one release tag on verified commit" >&2
             exit 1
           fi
-          ruby scripts/release-policy.rb "${release_tags[0]}" >> "${GITHUB_OUTPUT}"
+          ruby ../publication-control/scripts/release-policy.rb "${release_tags[0]}" >> "${GITHUB_OUTPUT}"
 
       - name: Download exact image from the verified workflow run
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
@@ -73,7 +114,7 @@ jobs:
           VERIFIED_RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
           set -Eeuo pipefail
-          scripts/image-artifact.sh verify \
+          publication-control/scripts/image-artifact.sh verify \
             "${RUNNER_TEMP}/pingora-verified-image/image.tar" \
             "${RUNNER_TEMP}/pingora-verified-image/metadata.env" \
             "${VERIFIED_SHA}" \
@@ -94,6 +135,7 @@ jobs:
       - name: Publish bounded staging manifest
         id: publish_candidate
         shell: bash
+        working-directory: candidate
         env:
           DOCKER_CONFIG: ${{ runner.temp }}/pingora-docker-config
           RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
@@ -127,7 +169,7 @@ jobs:
           trap 'rm -f -- "${push_output_file}"' EXIT
           timeout 30s docker image tag "${VERIFIED_IMAGE_ID}" "${image}:${candidate_tag}"
           timeout 600s docker push "${image}:${candidate_tag}" 2>&1 | tee "${push_output_file}"
-          candidate_digest=$(ruby scripts/extract-docker-push-digest.rb "${push_output_file}")
+          candidate_digest=$(ruby ../publication-control/scripts/extract-docker-push-digest.rb "${push_output_file}")
           test "$(remote_digest "${image}@${candidate_digest}")" = "${candidate_digest}"
           rm -f -- "${push_output_file}"
           trap - EXIT
@@ -146,9 +188,42 @@ jobs:
           subject-digest: ${{ steps.publish_candidate.outputs.digest }}
           push-to-registry: true
 
+      - name: Verify candidate image provenance
+        shell: bash
+        env:
+          ATTESTED_DIGEST: ${{ steps.publish_candidate.outputs.digest }}
+          DOCKER_CONFIG: ${{ runner.temp }}/pingora-docker-config
+          GH_TOKEN: ${{ github.token }}
+          PUBLISHED_IMAGE: ${{ steps.publish_candidate.outputs.image }}
+        run: |
+          set -Eeuo pipefail
+          [[ ${ATTESTED_DIGEST} =~ ^sha256:[0-9a-f]{64}$ ]]
+          subject="oci://${PUBLISHED_IMAGE}@${ATTESTED_DIGEST}"
+          signer="${GITHUB_REPOSITORY}/.github/workflows/cd.yml"
+          verification_output=$(mktemp "${RUNNER_TEMP}/attestation-verification.XXXXXX")
+          trap 'rm -f -- "${verification_output}"' EXIT
+          for attempt in 1 2 3 4 5 6; do
+            if timeout 60s gh attestation verify "${subject}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --signer-workflow "${signer}" \
+              --format json >"${verification_output}"; then
+              ruby -rjson -e '
+                results = JSON.parse(File.read(ARGV.fetch(0)))
+                abort "no verified provenance attestation" unless results.is_a?(Array) && !results.empty?
+              ' "${verification_output}"
+              exit 0
+            fi
+            if [[ ${attempt} -eq 6 ]]; then
+              echo "candidate provenance verification failed after ${attempt} attempts" >&2
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
+
       - name: Publish attested digest to release discovery tags
         id: promote
         shell: bash
+        working-directory: candidate
         env:
           ATTESTED_DIGEST: ${{ steps.publish_candidate.outputs.digest }}
           DOCKER_CONFIG: ${{ runner.temp }}/pingora-docker-config

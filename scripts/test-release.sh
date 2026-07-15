@@ -65,6 +65,9 @@ if ruby "$ROOT_DIR/scripts/extract-docker-push-digest.rb" "$TMP_DIR/push-ambiguo
   exit 1
 fi
 
+python3 "$ROOT_DIR/scripts/test_vendor_provenance.py"
+python3 "$ROOT_DIR/scripts/verify-vendor-provenance.py"
+
 mkdir -p "$TMP_DIR/archive/layer" "$TMP_DIR/archive/blobs/sha256"
 printf '{"architecture":"amd64","os":"linux"}\n' >"$TMP_DIR/archive/config.json"
 config_sha=$(sha256sum "$TMP_DIR/archive/config.json" | cut -d' ' -f1)
@@ -156,10 +159,18 @@ grep -Fq "name: verified-image-\${{ github.sha }}" "$ROOT_DIR/.github/workflows/
 grep -Fq 'CONTAINER_GATE_IMAGE_ARCHIVE:' "$ROOT_DIR/.github/workflows/ci.yml"
 grep -Fq "run-id: \${{ github.event.workflow_run.id }}" "$ROOT_DIR/.github/workflows/cd.yml"
 grep -Fq "name: verified-image-\${{ github.event.workflow_run.head_sha }}" "$ROOT_DIR/.github/workflows/cd.yml"
-grep -Fq 'scripts/image-artifact.sh verify' "$ROOT_DIR/.github/workflows/cd.yml"
+grep -Fq 'publication-control/scripts/image-artifact.sh verify' "$ROOT_DIR/.github/workflows/cd.yml"
 grep -Fqx 'channel = "1.85.1"' "$ROOT_DIR/rust-toolchain.toml"
+grep -Fqx '# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e' "$ROOT_DIR/Dockerfile"
+grep -Fq '# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e' "$ROOT_DIR/compose.test.yml"
+grep -Fq 'test "$(rustc --version)" = "rustc 1.85.1 (4eb161250 2025-03-15)"' "$ROOT_DIR/Dockerfile"
+grep -Fq 'test "$$(rustc --version)" = "rustc 1.85.1 (4eb161250 2025-03-15)"' "$ROOT_DIR/compose.test.yml"
 grep -Fq 'PROPTEST_CASES=4096' "$ROOT_DIR/scripts/verify.sh"
-grep -Fq 'bounded transport tag `candidate-staging`' "$ROOT_DIR/README.md"
+grep -Fq 'bounded transport reference `candidate-staging`' "$ROOT_DIR/README.md"
+grep -Fq 'never executes helper code from the candidate checkout' "$ROOT_DIR/README.md"
+grep -Fq 'tracked allowlisted files and rejects tracked symlinks' "$ROOT_DIR/README.md"
+grep -Fq '361b69af0234d2e4d10234e2efd106bb3b8147c575d52f45604a46aaf26def7a' "$ROOT_DIR/README.md"
+grep -Fq '“Bounded” means one mutable staging reference, not bounded GHCR blob/manifest storage' "$ROOT_DIR/README.md"
 if grep -Fq 'candidate unique to the CD run attempt' "$ROOT_DIR/README.md"; then
   echo "README still documents the obsolete unbounded candidate scheme" >&2
   exit 1
@@ -181,15 +192,30 @@ assert(linux_env.fetch('CONTAINER_GATE_IMAGE_METADATA') == metadata,
        'authoritative artifact metadata path must be a static Linux-safe absolute path')
 
 linux_steps = linux.fetch('steps')
+pre_checkout_index = linux_steps.index { |step| step['name'] == 'Initialize workflow-run failure evidence' }
+checkout_index = linux_steps.index { |step| step['name'] == 'Check out repository' }
+bootstrap_index = linux_steps.index { |step| step['name'] == 'Initialize exact-SHA verification evidence' }
 install_index = linux_steps.index { |step| step['name'] == 'Install actionlint' }
 lint_index = linux_steps.index { |step| step['name'] == 'Check workflow schemas' }
 tools_index = linux_steps.index { |step| step['name'] == 'Install native and release-gate tools' }
 contracts_index = linux_steps.index { |step| step['name'] == 'Run verification contract tests' }
 verify_index = linux_steps.index { |step| step['name'] == 'Run authoritative release gate' }
-assert(install_index && lint_index && tools_index && contracts_index && verify_index &&
-       install_index < lint_index && lint_index < tools_index &&
+assert(pre_checkout_index && checkout_index && bootstrap_index && install_index && lint_index && tools_index &&
+       contracts_index && verify_index && pre_checkout_index < checkout_index && checkout_index < bootstrap_index &&
+       bootstrap_index < install_index && install_index < lint_index && lint_index < tools_index &&
        tools_index < contracts_index && contracts_index < verify_index,
-       'schema checking, exact tools, and verification contracts must precede the authoritative gate')
+       'exact-SHA bootstrap, schema checking, exact tools, and contracts must precede the gate')
+pre_checkout_script = linux_steps.fetch(pre_checkout_index).fetch('run')
+assert(pre_checkout_script.include?('${RUNNER_TEMP}/verification-bootstrap') &&
+       pre_checkout_script.include?('source_sha\\t%s\\n') &&
+       pre_checkout_script.include?('"${GITHUB_SHA}"'),
+       'checkout failures must retain exact-SHA evidence outside the workspace')
+bootstrap_script = linux_steps.fetch(bootstrap_index).fetch('run')
+assert(bootstrap_script.include?('mkdir -p .verification-logs') &&
+       bootstrap_script.include?('source_sha\\t%s\\n') &&
+       bootstrap_script.include?('"${GITHUB_SHA}"') &&
+       bootstrap_script.include?('.verification-logs/bootstrap.tsv'),
+       'pre-verifier failures must retain an exact-SHA bootstrap artifact')
 contracts_script = linux_steps.fetch(contracts_index).fetch('run')
 assert(contracts_script.include?('bash scripts/test-release.sh') &&
        contracts_script.include?('bash scripts/test-verify.sh'),
@@ -230,7 +256,8 @@ assert(verification_evidence && verification_evidence.fetch('if') == 'always()',
        'exact-SHA verification evidence must upload on both success and failure')
 evidence_with = verification_evidence.fetch('with')
 assert(evidence_with.fetch('name').include?('${{ github.sha }}') &&
-       evidence_with.fetch('path').include?('.verification-logs/'),
+       evidence_with.fetch('path').include?('.verification-logs/') &&
+       evidence_with.fetch('path').include?('${{ runner.temp }}/verification-bootstrap/'),
        'verification evidence artifact must bind logs and manifest to the exact source SHA')
 assert(evidence_with.fetch('include-hidden-files') == true,
        'verification evidence upload must include the hidden .verification-logs directory')
@@ -245,27 +272,70 @@ assert(concurrency.fetch('group') == 'pingora-container-publication' &&
        'publication must remain serialized without canceling an active publication')
 
 publish_steps = cd.fetch('jobs').fetch('publish').fetch('steps')
+trusted_checkout_index = publish_steps.index { |step| step['name'] == 'Check out immutable publication controls' }
+candidate_checkout_index = publish_steps.index { |step| step['name'] == 'Check out verified candidate without credentials' }
+authorization_index = publish_steps.index { |step| step['name'] == 'Authorize candidate from trusted default-branch history' }
+gh_install_index = publish_steps.index { |step| step['name'] == 'Install pinned attestation verifier' }
+release_index = publish_steps.index { |step| step['name'] == 'Select one strict SemVer release tag' }
+assert(trusted_checkout_index && candidate_checkout_index && authorization_index && gh_install_index && release_index &&
+       trusted_checkout_index < candidate_checkout_index && candidate_checkout_index < authorization_index &&
+       authorization_index < gh_install_index && gh_install_index < release_index,
+       'immutable controls and default-branch ancestry must authorize the candidate before release selection')
+gh_install_script = publish_steps.fetch(gh_install_index).fetch('run')
+assert(gh_install_script.include?('gh_2.95.0_linux_amd64.tar.gz') &&
+       gh_install_script.include?('25d1e4729e8808c9ed3d613e96ebd3f3e44446f2d368c89d878a71a36ddb3d8c') &&
+       gh_install_script.include?('test "$(gh --version | head -n 1)" = "gh version 2.95.0 (2026-06-17)"'),
+       'attestation verification must use the exact checksum-pinned gh CLI')
+trusted_checkout = publish_steps.fetch(trusted_checkout_index).fetch('with')
+assert(trusted_checkout.fetch('ref') == '${{ github.workflow_sha }}' &&
+       trusted_checkout.fetch('path') == 'publication-control' &&
+       trusted_checkout.fetch('persist-credentials') == false,
+       'privileged CD controls must come from the immutable workflow revision without credentials')
+candidate_checkout = publish_steps.fetch(candidate_checkout_index).fetch('with')
+assert(candidate_checkout.fetch('ref') == '${{ github.event.workflow_run.head_sha }}' &&
+       candidate_checkout.fetch('path') == 'candidate' &&
+       candidate_checkout.fetch('persist-credentials') == false,
+       'candidate checkout must remain isolated and credential-free')
+authorization = publish_steps.fetch(authorization_index)
+authorization_script = authorization.fetch('run')
+assert(!authorization.key?('working-directory') &&
+       authorization_script.include?('git -C candidate show-ref --verify --quiet "${default_ref}"') &&
+       authorization_script.include?('test "$(git -C candidate rev-parse HEAD)" = "${VERIFIED_SHA}"') &&
+       authorization_script.include?('git -C candidate merge-base --is-ancestor') &&
+       authorization_script.include?('refs/remotes/origin/${TRUSTED_DEFAULT_BRANCH}') &&
+       authorization_script.include?('git check-ref-format --branch "${TRUSTED_DEFAULT_BRANCH}"'),
+       'candidate must equal the verified SHA and be reachable from the trusted default branch')
+release_step = publish_steps.fetch(release_index)
+release_script = release_step.fetch('run')
+assert(release_step.fetch('working-directory') == 'candidate' &&
+       release_script.include?('../publication-control/scripts/release-policy.rb') &&
+       !release_script.match?(/(^|[[:space:]])ruby scripts\//),
+       'release policy must execute only from immutable publication controls')
 download = publish_steps.find { |step| step['name'] == 'Download exact image from the verified workflow run' }
 assert(download.fetch('with').fetch('path') == '${{ runner.temp }}/pingora-verified-image',
        'download path must preserve the verified artifact directory contract')
 candidate = publish_steps.find { |step| step['name'] == 'Verify and load the tested image bytes' }
 candidate_script = candidate.fetch('run')
 assert(candidate_script.include?('${RUNNER_TEMP}/pingora-verified-image/image.tar') &&
-       candidate_script.include?('${RUNNER_TEMP}/pingora-verified-image/metadata.env'),
+       candidate_script.include?('${RUNNER_TEMP}/pingora-verified-image/metadata.env') &&
+       candidate_script.include?('publication-control/scripts/image-artifact.sh verify'),
        'CD verification must consume the downloaded archive and metadata paths')
 
 candidate_publish_index = publish_steps.index { |step| step['name'] == 'Publish bounded staging manifest' }
 attest_index = publish_steps.index { |step| step['name'] == 'Attest candidate image provenance' }
+verify_attestation_index = publish_steps.index { |step| step['name'] == 'Verify candidate image provenance' }
 promotion_index = publish_steps.index { |step| step['name'] == 'Publish attested digest to release discovery tags' }
 cleanup_index = publish_steps.index { |step| step['name'] == 'Clean up registry credentials' }
-assert(candidate_publish_index && attest_index && promotion_index && cleanup_index &&
-       candidate_publish_index < attest_index && attest_index < promotion_index &&
+assert(candidate_publish_index && attest_index && verify_attestation_index &&
+       promotion_index && cleanup_index && candidate_publish_index < attest_index &&
+       attest_index < verify_attestation_index && verify_attestation_index < promotion_index &&
        promotion_index < cleanup_index,
-       'candidate publication, attestation, promotion, and credential cleanup must remain ordered')
+       'candidate publication, attestation verification, promotion, and credential cleanup must remain ordered')
 candidate_publish = publish_steps.fetch(candidate_publish_index)
 candidate_publish_script = candidate_publish.fetch('run')
 candidate_publish_env = candidate_publish.fetch('env')
 attest = publish_steps.fetch(attest_index)
+verify_attestation = publish_steps.fetch(verify_attestation_index)
 promotion_script = publish_steps.fetch(promotion_index).fetch('run')
 cleanup = publish_steps.fetch(cleanup_index)
 assert(!candidate_publish_env.key?('PUBLICATION_RUN_ID') &&
@@ -275,10 +345,13 @@ assert(candidate_publish_script.include?('candidate_tag="candidate-staging"') &&
        candidate_publish_script.include?('docker push "${image}:${candidate_tag}" 2>&1 | tee "${push_output_file}"'),
        'candidate publication must reuse one bounded internal staging tag and retain push output')
 assert(candidate_publish_script.include?('candidate_digest=$(ruby') &&
-       candidate_publish_script.include?('scripts/extract-docker-push-digest.rb "${push_output_file}"') &&
+       candidate_publish_script.include?('../publication-control/scripts/extract-docker-push-digest.rb "${push_output_file}"') &&
        candidate_publish_script.include?('"${image}@${candidate_digest}"') &&
        !candidate_publish_script.include?('remote_digest "${image}:${candidate_tag}"'),
        'attested digest must come directly from the successful push result and be verified by digest')
+assert(candidate_publish.fetch('working-directory') == 'candidate' &&
+       publish_steps.fetch(promotion_index).fetch('working-directory') == 'candidate',
+       'all remote tag rechecks must run in the isolated candidate checkout')
 assert(!candidate_publish_script.include?('require_absent_tag "${image}:${VERSION_TAG}"') &&
        !candidate_publish_script.include?('require_absent_tag "${image}:${sha_tag}"'),
        'a rerun must reach idempotent promotion after a partially completed prior promotion')
@@ -287,6 +360,19 @@ assert(!candidate_publish_script.include?('--tag "${image}:${VERSION_TAG}"') &&
        'candidate publication must not expose public release tags before attestation')
 assert(attest.fetch('env').fetch('DOCKER_CONFIG') == '${{ runner.temp }}/pingora-docker-config',
        'registry credentials must remain available while provenance is pushed')
+attest_with = attest.fetch('with')
+assert(attest_with.fetch('subject-name') == '${{ steps.publish_candidate.outputs.image }}' &&
+       attest_with.fetch('subject-digest') == '${{ steps.publish_candidate.outputs.digest }}' &&
+       attest_with.fetch('push-to-registry') == true,
+       'provenance must bind and push the exact push-derived image digest')
+verify_attestation_script = verify_attestation.fetch('run')
+assert(verify_attestation.fetch('env').fetch('DOCKER_CONFIG') == '${{ runner.temp }}/pingora-docker-config' &&
+       verify_attestation.fetch('env').fetch('GH_TOKEN') == '${{ github.token }}' &&
+       verify_attestation_script.include?('gh attestation verify "${subject}"') &&
+       verify_attestation_script.include?('--repo "${GITHUB_REPOSITORY}"') &&
+       verify_attestation_script.include?('--signer-workflow "${signer}"') &&
+       verify_attestation_script.include?('"oci://${PUBLISHED_IMAGE}@${ATTESTED_DIGEST}"'),
+       'promotion must require digest-bound provenance from the expected repository workflow')
 assert(promotion_script.include?('publish_discovery_tag "${image}:${VERSION_TAG}"') &&
        promotion_script.include?('publish_discovery_tag "${image}:${sha_tag}"') &&
        promotion_script.include?('test "$(remote_digest "${reference}")" = "${ATTESTED_DIGEST}"') &&

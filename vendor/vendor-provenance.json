@@ -1,0 +1,25 @@
+{
+  "crate": "pingora-load-balancing",
+  "version": "0.8.1",
+  "archive": "upstream/pingora-load-balancing-0.8.1.crate",
+  "archive_sha256": "361b69af0234d2e4d10234e2efd106bb3b8147c575d52f45604a46aaf26def7a",
+  "vendor_dir": "pingora-load-balancing-0.8.1",
+  "allowed_missing": [
+    ".cargo_vcs_info.json",
+    "Cargo.lock"
+  ],
+  "patched_files": {
+    "Cargo.toml": {
+      "upstream_sha256": "bf424d84d890d1d40f90a57402af04024bbc853f10f6a820c0e3e70251ef4e23",
+      "vendored_sha256": "979c72ab32c70ef69d2814ffc027002e30c58695d61e4f97e0f7c1a4b340ac02"
+    },
+    "Cargo.toml.orig": {
+      "upstream_sha256": "705b177dd9b1df27fbc78683e613af0a3471a5de8403ae48a406f9d9a4889d86",
+      "vendored_sha256": "a5143ed9b4b843fa885c582c1f5ccdf5edeb1389f8734de1fe37e91bd703b50a"
+    },
+    "src/lib.rs": {
+      "upstream_sha256": "ef19d4f4087eceedd5999b7a1429180fc112d2cd9e329513cc7431663c7a6b95",
+      "vendored_sha256": "89198f4e892e7ce21f43217c0294038bcd052479fdda86504b56e0a569d3074c"
+    }
+  }
+}

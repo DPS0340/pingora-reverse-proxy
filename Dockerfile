@@ -8,6 +8,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 ENV RUSTUP_TOOLCHAIN=1.85.1
+RUN test "$(rustc --version)" = "rustc 1.85.1 (4eb161250 2025-03-15)"
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./

@@ -47,7 +47,7 @@ services:
     build:
       context: "${JUPYTERHUB_E2E_BUILD_CONTEXT:-.}"
       dockerfile_inline: |
-        # syntax=docker/dockerfile:1
+        # syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
         FROM rust:1.85-bookworm@sha256:e51d0265072d2d9d5d320f6a44dde6b9ef13653b035098febd68cce8fa7c0bc4
         RUN apt-get update \
             && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -73,6 +73,7 @@ services:
             PATH="/opt/jupyterhub/bin:$${PATH}" \
             NO_PROXY="127.0.0.1,localhost,.localhost" \
             no_proxy="127.0.0.1,localhost,.localhost"
+        RUN test "$$(rustc --version)" = "rustc 1.85.1 (4eb161250 2025-03-15)"
         WORKDIR /workspace
         COPY . /workspace
         RUN --mount=type=cache,id=pingora-jupyterhub-e2e-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \

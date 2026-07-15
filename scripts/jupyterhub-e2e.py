@@ -179,11 +179,50 @@ class CommandRunner:
             terminate_group(self.active)
 
 
+BUILD_CONTEXT_ROOT_FILES = frozenset(
+    {"Cargo.toml", "Cargo.lock", "rust-toolchain.toml"}
+)
+BUILD_CONTEXT_DIRECTORIES = frozenset({"src", "tests", "scripts", "vendor"})
+
+
 def copy_build_context(workspace: Path, destination: Path) -> None:
-    for name in ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml"):
-        shutil.copy2(workspace / name, destination / name)
-    for name in ("src", "tests", "scripts", "vendor"):
-        shutil.copytree(workspace / name, destination / name, symlinks=True)
+    result = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(workspace),
+            "ls-files",
+            "-z",
+            "--",
+            *sorted(BUILD_CONTEXT_ROOT_FILES),
+            *sorted(BUILD_CONTEXT_DIRECTORIES),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    relative_paths = [
+        Path(os.fsdecode(raw)) for raw in result.stdout.split(b"\0") if raw
+    ]
+    tracked = {path.as_posix() for path in relative_paths}
+    missing = sorted(BUILD_CONTEXT_ROOT_FILES - tracked)
+    if missing:
+        raise GateError(f"required tracked build inputs are missing: {missing!r}")
+
+    for relative in relative_paths:
+        if relative.is_absolute() or ".." in relative.parts:
+            raise GateError(f"unsafe tracked build path: {relative}")
+        if relative.parts[0] not in BUILD_CONTEXT_ROOT_FILES | BUILD_CONTEXT_DIRECTORIES:
+            raise GateError(f"tracked path is outside the build allowlist: {relative}")
+        source = workspace / relative
+        if source.is_symlink():
+            raise GateError(
+                f"symbolic links are forbidden in the JupyterHub build context: {relative}"
+            )
+        if not source.is_file():
+            raise GateError(f"tracked build input is not a regular file: {relative}")
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
 
 
 def docker_ids(command: list[str]) -> list[str]:

@@ -24,8 +24,34 @@ jobs:
       CONTAINER_GATE_SOURCE_SHA: ${{ github.sha }}
       CONTAINER_GATE_WORKFLOW_RUN_ID: ${{ github.run_id }}
     steps:
+      - name: Initialize workflow-run failure evidence
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          evidence="${RUNNER_TEMP}/verification-bootstrap"
+          mkdir -p "${evidence}"
+          {
+            printf 'schema\tpingora-workflow-bootstrap-v1\n'
+            printf 'source_sha\t%s\n' "${GITHUB_SHA}"
+            printf 'workflow_run_id\t%s\n' "${GITHUB_RUN_ID}"
+            printf 'status\tpre-checkout\n'
+          } > "${RUNNER_TEMP}/verification-bootstrap/bootstrap.tsv"
+
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Initialize exact-SHA verification evidence
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p .verification-logs
+          {
+            printf 'schema\tpingora-verification-bootstrap-v1\n'
+            printf 'source_sha\t%s\n' "${GITHUB_SHA}"
+            printf 'workflow_run_id\t%s\n' "${GITHUB_RUN_ID}"
+            printf 'status\tpre-verifier\n'
+          } > .verification-logs/bootstrap.tsv
 
       - name: Install actionlint
         shell: bash
@@ -111,6 +137,7 @@ jobs:
           include-hidden-files: true
           retention-days: 14
           path: |
+            ${{ runner.temp }}/verification-bootstrap/
             .verification-logs/
             **/*.proptest-regressions
             proptest-regressions/

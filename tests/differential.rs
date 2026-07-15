@@ -562,9 +562,10 @@ fn oracle_port_lease_holds_the_listener_until_child_launch() {
     let lease = PortLease::new();
     let port = lease.port();
     assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_err());
+    // Dropping the lease intentionally opens a handoff race with the child that
+    // will own the port. Do not assert that this test process can reclaim it:
+    // another concurrent oracle process is allowed to win that race.
     drop(lease);
-    std::net::TcpListener::bind(("127.0.0.1", port))
-        .expect("released differential port can be bound again");
 }
 
 #[test]
