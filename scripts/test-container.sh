@@ -15,6 +15,8 @@ TOKEN="task13-container-token-${RUN_ID}"
 SOURCE_SHA=${CONTAINER_GATE_SOURCE_SHA:-$(git rev-parse HEAD)}
 TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/pingora-container-test.XXXXXX")
 SENTINEL="$ROOT_DIR/src/task13-untracked-secret-sentinel-${RUN_ID}.pem"
+TRACKED_INPUT="$ROOT_DIR/src/lib.rs"
+TRACKED_INPUT_BACKUP="$TMP_DIR/src-lib.original"
 INJECT_FAILURE=${CONTAINER_GATE_INJECT_FAILURE:-}
 CLEANUP_ENABLED=0
 
@@ -27,6 +29,9 @@ cleanup() {
     "$ROOT_DIR/scripts/cleanup-container-resources.sh" \
       "$TIMEOUT_BIN" "$OWNER_LABEL" "$IMAGE" \
       "$CONTAINER" "$UID_CONTAINER" "$GID_CONTAINER" "$TMP_CONTAINER" || cleanup_status=1
+  fi
+  if [[ -f "$TRACKED_INPUT_BACKUP" ]]; then
+    cp "$TRACKED_INPUT_BACKUP" "$TRACKED_INPUT"
   fi
   rm -f "$SENTINEL"
   rm -rf "$TMP_DIR"
@@ -71,11 +76,23 @@ CLEANUP_ENABLED=1
 cd "$ROOT_DIR"
 
 install -m 0600 /dev/null "$SENTINEL"
+cp "$TRACKED_INPUT" "$TRACKED_INPUT_BACKUP"
+printf '\n// dirty workspace content must never enter a production image\n' >>"$TRACKED_INPUT"
 "$ROOT_DIR/scripts/build-container-context.sh" "$TMP_DIR/context.tar"
 if tar -tf "$TMP_DIR/context.tar" | grep -Fq "${SENTINEL#"$ROOT_DIR/"}"; then
   echo "untracked secret sentinel entered the container build context" >&2
   exit 1
 fi
+if tar -xOf "$TMP_DIR/context.tar" src/lib.rs | grep -Fq \
+  'dirty workspace content must never enter a production image'; then
+  echo "dirty tracked content entered the immutable HEAD container context" >&2
+  exit 1
+fi
+git show HEAD:src/lib.rs >"$TMP_DIR/head-lib.rs"
+tar -xOf "$TMP_DIR/context.tar" src/lib.rs >"$TMP_DIR/archive-lib.rs"
+cmp "$TMP_DIR/head-lib.rs" "$TMP_DIR/archive-lib.rs"
+cp "$TRACKED_INPUT_BACKUP" "$TRACKED_INPUT"
+rm -f "$TRACKED_INPUT_BACKUP"
 
 "$TIMEOUT_BIN" "$BUILD_TIMEOUT" docker build \
     --pull \

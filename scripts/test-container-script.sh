@@ -4,7 +4,14 @@ set -euo pipefail
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/pingora-container-script-test.XXXXXX")
 SENTINEL="$ROOT_DIR/src/task13-untracked-secret-sentinel-$$.pem"
-trap 'rm -f "$SENTINEL"; rm -rf "$TMP_DIR"' EXIT INT TERM
+TRACKED_INPUT="$ROOT_DIR/src/lib.rs"
+cp "$TRACKED_INPUT" "$TMP_DIR/tracked-input.original"
+cleanup() {
+  cp "$TMP_DIR/tracked-input.original" "$TRACKED_INPUT" 2>/dev/null || true
+  rm -f "$SENTINEL"
+  rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT INT TERM
 install -m 0600 /dev/null "$SENTINEL"
 
 "$ROOT_DIR/scripts/build-container-context.sh" "$TMP_DIR/context.tar"
@@ -21,6 +28,18 @@ if grep -Ev '^(Dockerfile|\.dockerignore|Cargo\.toml|Cargo\.lock|rust-toolchain\
   exit 1
 fi
 grep -Fqx '**' "$ROOT_DIR/.dockerignore"
+
+printf '\n// dirty workspace content must never enter a production image\n' >>"$TRACKED_INPUT"
+"$ROOT_DIR/scripts/build-container-context.sh" "$TMP_DIR/dirty-context.tar"
+if tar -xOf "$TMP_DIR/dirty-context.tar" src/lib.rs | grep -Fq \
+  'dirty workspace content must never enter a production image'; then
+  echo "dirty tracked content entered the immutable HEAD container context" >&2
+  exit 1
+fi
+git -C "$ROOT_DIR" show HEAD:src/lib.rs >"$TMP_DIR/head-lib.rs"
+tar -xOf "$TMP_DIR/dirty-context.tar" src/lib.rs >"$TMP_DIR/archive-lib.rs"
+cmp "$TMP_DIR/head-lib.rs" "$TMP_DIR/archive-lib.rs"
+cp "$TMP_DIR/tracked-input.original" "$TRACKED_INPUT"
 
 mkdir "$TMP_DIR/invalid-injection-tmp"
 set +e

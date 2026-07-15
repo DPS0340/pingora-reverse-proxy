@@ -7,28 +7,35 @@ if (( $# != 1 )); then
 fi
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-OUTPUT=$1
-LIST=$(mktemp "${TMPDIR:-/tmp}/pingora-context-list.XXXXXX")
-trap 'rm -f "$LIST"' EXIT INT TERM
-cd "$ROOT_DIR"
-
-git ls-files -z -- \
-  Dockerfile .dockerignore Cargo.toml Cargo.lock rust-toolchain.toml src vendor \
-  >"$LIST"
+mkdir -p "$(dirname "$1")"
+OUTPUT_DIR=$(cd "$(dirname "$1")" && pwd)
+OUTPUT="$OUTPUT_DIR/$(basename "$1")"
+TEMP=$(mktemp "$OUTPUT_DIR/.pingora-context.XXXXXX")
+trap 'rm -f "$TEMP"' EXIT INT TERM
+readonly INPUTS=(
+  Dockerfile .dockerignore Cargo.toml Cargo.lock rust-toolchain.toml src vendor
+)
 
 for required in Dockerfile .dockerignore Cargo.toml Cargo.lock rust-toolchain.toml; do
-  if ! tr '\0' '\n' <"$LIST" | grep -Fqx "$required"; then
+  if ! git -C "$ROOT_DIR" cat-file -e "HEAD:$required"; then
     echo "required tracked build input is missing: $required" >&2
     exit 1
   fi
 done
 
-while IFS= read -r -d '' path; do
-  if [[ -L "$path" ]]; then
-    echo "symbolic links are forbidden in the container build context: $path" >&2
+while IFS= read -r -d '' entry; do
+  metadata=${entry%%$'\t'*}
+  path=${entry#*$'\t'}
+  mode=${metadata%% *}
+  if [[ "$mode" != 100644 && "$mode" != 100755 ]]; then
+    echo "only regular HEAD files are allowed in the container build context: $path ($mode)" >&2
     exit 1
   fi
-done <"$LIST"
+done < <(git -C "$ROOT_DIR" ls-tree -rz HEAD -- "${INPUTS[@]}")
 
-mkdir -p "$(dirname "$OUTPUT")"
-tar -cf "$OUTPUT" --null -T "$LIST"
+git -C "$ROOT_DIR" archive \
+  --format=tar \
+  --output="$TEMP" \
+  HEAD \
+  -- "${INPUTS[@]}"
+mv -f "$TEMP" "$OUTPUT"
