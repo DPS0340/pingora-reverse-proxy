@@ -448,9 +448,10 @@ class PortReservation:
                     + (_port_cursor + offset) % (PORT_RANGE_END - PORT_RANGE_START + 1)
                 )
                 listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 try:
                     listener.bind(("127.0.0.1", candidate))
+                    listener.listen(1)
                 except OSError:
                     listener.close()
                     if port:

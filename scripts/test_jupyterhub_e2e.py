@@ -184,6 +184,7 @@ class PortReservationTests(unittest.TestCase):
     def test_reservation_holds_the_port_until_explicit_release(self) -> None:
         reservation = HARNESS.PortReservation()
         contender = HARNESS.socket.socket(HARNESS.socket.AF_INET, HARNESS.socket.SOCK_STREAM)
+        contender.setsockopt(HARNESS.socket.SOL_SOCKET, HARNESS.socket.SO_REUSEADDR, 1)
         with self.assertRaises(OSError):
             contender.bind(("127.0.0.1", reservation.port))
         contender.close()
@@ -195,6 +196,24 @@ class PortReservationTests(unittest.TestCase):
             replacement.bind(("127.0.0.1", port))
         finally:
             replacement.close()
+
+    def test_exact_reservation_can_reclaim_a_time_wait_port(self) -> None:
+        server = HARNESS.socket.socket(HARNESS.socket.AF_INET, HARNESS.socket.SOCK_STREAM)
+        server.setsockopt(HARNESS.socket.SOL_SOCKET, HARNESS.socket.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", 0))
+        port = server.getsockname()[1]
+        server.listen(1)
+        client = HARNESS.socket.create_connection(("127.0.0.1", port))
+        accepted, _ = server.accept()
+        accepted.shutdown(HARNESS.socket.SHUT_WR)
+        accepted.close()
+        self.assertEqual(client.recv(1), b"")
+        client.close()
+        server.close()
+
+        reservation = HARNESS.PortReservation(port)
+        self.addCleanup(reservation.release)
+        self.assertEqual(reservation.port, port)
 
     def test_managed_process_releases_reservations_at_popen_handoff(self) -> None:
         events: list[str] = []
