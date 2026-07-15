@@ -1095,6 +1095,12 @@ installed from a checked-in hash lock with `pip --require-hashes`. The JupyterHu
 image build also fixes `RUSTUP_TOOLCHAIN` to the digest-pinned base image's
 installed Rust 1.85.1 toolchain; it does not download a moving `stable` release.
 
+`SocketOwner`'s two regular-file cleanup fixtures keep the original test file
+descriptor open, matching the live Unix listener that pins its socket inode in
+production. This prevents Linux overlay filesystems from recycling the unlinked
+fixture inode for a foreign replacement and turning an identity test into a
+false match; GitHub run `29401632373` exposed that test-only race.
+
 GHCR does not provide a conditional-create guarantee for the OCI manifest PUT
 used by this workflow. CD therefore treats SemVer and SHA tags as mutable
 discovery references rather than immutability boundaries. It attests the

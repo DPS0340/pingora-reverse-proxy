@@ -2337,6 +2337,10 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary socket ownership directory");
         let path = directory.path().join("public.sock");
         fs::write(&path, b"owned").expect("write owned entry");
+        // A live Unix listener pins its socket inode while SocketOwner runs.
+        // Keep the regular-file fixture equally faithful so Linux cannot
+        // recycle the unlinked inode for the foreign replacement.
+        let _original = fs::File::open(&path).expect("pin owned entry inode");
         let mut owner = SocketOwner::from_path(path.clone()).expect("capture socket identity");
 
         owner.cleanup_for_test(
@@ -2366,6 +2370,9 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary socket ownership directory");
         let path = directory.path().join("public.sock");
         fs::write(&path, b"owned").expect("write owned entry");
+        // Match production's live Unix-listener descriptor and prevent the
+        // regular-file test inode from being recycled after the unlink hook.
+        let _original = fs::File::open(&path).expect("pin owned entry inode");
         let mut owner = SocketOwner::from_path(path.clone()).expect("capture socket identity");
 
         let quarantine = owner.cleanup_for_test(
