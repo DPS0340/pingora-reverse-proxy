@@ -577,34 +577,31 @@ fn oracle_port_lease_uses_non_ephemeral_handoff_ports() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn oracle_launch_lock_subprocess_helper() {
     let Ok(lock_path) = std::env::var("ORACLE_LOCK_HELPER_PATH") else {
         return;
     };
-    let port: u16 = std::env::var("ORACLE_LOCK_HELPER_PORT")
-        .expect("helper port")
-        .parse()
-        .expect("numeric helper port");
+    let socket = std::env::var("ORACLE_LOCK_HELPER_SOCKET").expect("helper socket path");
     let ready = std::env::var("ORACLE_LOCK_HELPER_READY").expect("helper ready path");
     let _lock = LaunchLock::acquire_at(std::path::Path::new(&lock_path));
-    let _listener = std::net::TcpListener::bind(("127.0.0.1", port))
-        .expect("serialized helper owns released port");
+    let _listener = std::os::unix::net::UnixListener::bind(&socket)
+        .expect("serialized helper owns unique socket path");
     std::fs::write(ready, b"ready").expect("publish helper bind readiness");
     std::thread::sleep(std::time::Duration::from_millis(200));
 }
 
+#[cfg(unix)]
 #[test]
-fn cross_process_launch_barrier_holds_lease_until_serialized_binder_can_run() {
+fn cross_process_launch_barrier_serializes_a_unique_binder() {
     let directory = tempfile::tempdir().expect("launch barrier directory");
     let lock_path = directory.path().join("launch.lock");
+    let socket = directory.path().join("helper.sock");
     let ready = directory.path().join("ready");
-    // Keep concurrent oracle launches from claiming the released handoff port
-    // while this private-lock subprocess is waking up to bind it.
+    // Keep concurrent oracle launches outside this private-lock subprocess test.
     let _suite_lock = LaunchLock::acquire();
     let lock = LaunchLock::acquire_at(&lock_path);
-    let lease = PortLease::new();
-    let port = lease.port();
     let mut helper = std::process::Command::new(std::env::current_exe().expect("test executable"))
         .args([
             "--exact",
@@ -612,29 +609,28 @@ fn cross_process_launch_barrier_holds_lease_until_serialized_binder_can_run() {
             "--nocapture",
         ])
         .env("ORACLE_LOCK_HELPER_PATH", &lock_path)
-        .env("ORACLE_LOCK_HELPER_PORT", port.to_string())
+        .env("ORACLE_LOCK_HELPER_SOCKET", &socket)
         .env("ORACLE_LOCK_HELPER_READY", &ready)
         .spawn()
-        .expect("spawn serialized port binder");
+        .expect("spawn serialized socket binder");
     std::thread::sleep(std::time::Duration::from_millis(100));
     assert!(!ready.exists(), "binder crossed the process launch lock");
     assert!(
-        std::net::TcpListener::bind(("127.0.0.1", port)).is_err(),
-        "port lease was released before the child handoff"
+        !socket.exists(),
+        "unique socket was bound before the child handoff"
     );
-    drop(lease);
     drop(lock);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while !ready.exists() {
         assert!(
             std::time::Instant::now() < deadline,
-            "helper never bound port"
+            "helper never bound unique socket"
         );
         std::thread::yield_now();
     }
     assert!(
-        std::net::TcpListener::bind(("127.0.0.1", port)).is_err(),
-        "serialized child did not own the handed-off port"
+        std::os::unix::net::UnixStream::connect(&socket).is_ok(),
+        "serialized child did not own the unique socket"
     );
     assert!(helper.wait().expect("serialized helper exit").success());
 }
