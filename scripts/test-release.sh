@@ -232,6 +232,8 @@ evidence_with = verification_evidence.fetch('with')
 assert(evidence_with.fetch('name').include?('${{ github.sha }}') &&
        evidence_with.fetch('path').include?('.verification-logs/'),
        'verification evidence artifact must bind logs and manifest to the exact source SHA')
+assert(evidence_with.fetch('include-hidden-files') == true,
+       'verification evidence upload must include the hidden .verification-logs directory')
 
 concurrency = cd.fetch('concurrency')
 assert(concurrency.keys.sort == ['cancel-in-progress', 'group'],

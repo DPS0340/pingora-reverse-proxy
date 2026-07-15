@@ -108,6 +108,7 @@ jobs:
         with:
           name: linux-verification-${{ github.sha }}-${{ github.run_id }}
           if-no-files-found: ignore
+          include-hidden-files: true
           retention-days: 14
           path: |
             .verification-logs/
