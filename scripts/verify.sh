@@ -61,7 +61,7 @@ run_phase() {
 # Release-gate order is contractual. Do not reorder these phases.
 run_phase 01-fmt 180s cargo fmt --all -- --check
 run_phase 02-clippy 1800s cargo clippy --locked --all-targets --all-features -- -D warnings
-run_phase 03-tests 2400s env PROPTEST_CASES=4096 cargo test --locked --all-targets --all-features
+run_phase 03-tests 2400s env PROPTEST_CASES=4096 DIFFERENTIAL_ALL_TARGETS=1 ./scripts/test-differential.sh
 run_phase 04-differential 1800s just test-differential
 run_phase 05-jupyterhub 1800s just test-jupyterhub
 run_phase 06-container 2400s just test-container

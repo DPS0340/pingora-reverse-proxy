@@ -117,9 +117,13 @@ fi
 
 redis_endpoint="$("${compose[@]}" -f compose.test.yml port redis 6379)"
 redis_port="${redis_endpoint##*:}"
+cargo_args=(--test differential -- --nocapture)
+if [[ "${DIFFERENTIAL_ALL_TARGETS:-0}" == 1 ]]; then
+    cargo_args=(--locked --all-targets --all-features)
+fi
 set -m
 TEST_REDIS_URL="redis://127.0.0.1:${redis_port}" \
-    cargo test --test differential -- --nocapture &
+    cargo test "${cargo_args[@]}" &
 active_pid=$!
 active_pgid="$active_pid"
 observed_pgid="$(ps -o pgid= -p "$active_pid")"

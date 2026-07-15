@@ -21,7 +21,8 @@ use hyper_util::rt::TokioIo;
 use pingora::http::ResponseHeader;
 use pingora::proxy::Session;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
@@ -456,7 +457,7 @@ impl ProxyErrorRenderer {
                 kind: "CA certificate",
                 source,
             })?;
-            let certificates = rustls_pemfile::certs(&mut pem.as_slice())
+            let certificates = CertificateDer::pem_slice_iter(&pem)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|_| ErrorRendererBuildError::InvalidCa)?;
             if certificates.is_empty() {
@@ -495,7 +496,7 @@ impl ProxyErrorRenderer {
                         source,
                     }
                 })?;
-                let certificates = rustls_pemfile::certs(&mut pem.as_slice())
+                let certificates = CertificateDer::pem_slice_iter(&pem)
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|_| ErrorRendererBuildError::InvalidIdentity)?;
                 let key_pem =
@@ -503,9 +504,8 @@ impl ProxyErrorRenderer {
                         kind: "client key",
                         source,
                     })?;
-                let private_key = rustls_pemfile::private_key(&mut key_pem.as_slice())
-                    .map_err(|_| ErrorRendererBuildError::InvalidIdentity)?
-                    .ok_or(ErrorRendererBuildError::InvalidIdentity)?;
+                let private_key = PrivateKeyDer::from_pem_slice(&key_pem)
+                    .map_err(|_| ErrorRendererBuildError::InvalidIdentity)?;
                 if certificates.is_empty() {
                     return Err(ErrorRendererBuildError::InvalidIdentity);
                 }
@@ -1139,6 +1139,34 @@ mod tests {
             assert_eq!(
                 error.to_string(),
                 "invalid custom-error TLS CA certificate bundle"
+            );
+        }
+
+        for invalid in [b"".as_slice(), b"not PEM data".as_slice()] {
+            let directory = tempfile::tempdir().unwrap();
+            let cert = directory.path().join("client.pem");
+            let key = directory.path().join("client.key");
+            fs::write(&cert, invalid).unwrap();
+            fs::write(&key, invalid).unwrap();
+            let tls = TlsConfig {
+                key: Some(key),
+                cert: Some(cert),
+                ca: None,
+                key_passphrase: None,
+                request_cert: false,
+                reject_unauthorized: true,
+                protocol: None,
+                ciphers: None,
+                dhparam: None,
+            };
+            let error = match ProxyErrorRenderer::with_tls_policy(None, None, true, Some(&tls)) {
+                Ok(_) => panic!("empty and malformed client identities must fail eagerly"),
+                Err(error) => error,
+            };
+            assert!(matches!(error, ErrorRendererBuildError::InvalidIdentity));
+            assert_eq!(
+                error.to_string(),
+                "invalid custom-error TLS client identity"
             );
         }
 

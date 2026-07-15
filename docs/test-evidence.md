@@ -1063,3 +1063,70 @@ Bash lifecycle script was unaffected and passed its complete `9/9` suite.
 Formatting, Bash/Node syntax, warnings-denied Clippy, debug and release checks,
 whitespace validation, and the final resource audit passed. The sole warning
 remains the established vendored Pingora OpenSSL deprecation.
+
+### Task 14 release verification and dependency closure (2026-07-15)
+
+Task 14 began by reproducing the Task 13 lockfile rather than accepting the
+previous green functional gate as security evidence. `cargo audit --deny
+warnings` failed with four vulnerabilities and seven denied warnings:
+`RUSTSEC-2024-0421` (`idna 0.5.0`), `RUSTSEC-2024-0437` (`protobuf 2.28.0`),
+`RUSTSEC-2025-0009` (`ring 0.17.8`), `RUSTSEC-2025-0055`
+(`tracing-subscriber 0.3.18`), the unmaintained `adler 1.0.2`, `daemonize
+0.5.0`, `derivative 2.2.0`, `paste 1.0.15`, and `rustls-pemfile 2.2.0`, the
+unsound `rand 0.8.5`, and yanked `spin 0.9.8`.
+
+The remediation moved Prometheus to 0.14 and protobuf to 3.7.2, updated the
+vulnerable direct/transitive graph, replaced `rustls-pemfile` parsing with the
+`rustls-pki-types` PEM API, and applies two narrow Pingora 0.8.1 patches under
+`vendor/`: the published `daemonize` dependency is replaced by `daemonix`,
+Pingora core shares Prometheus 0.14 instead of retaining the vulnerable
+protobuf 2 line, and Pingora load balancing drops its unused `derivative`
+dependency. The vendored OpenSSL name conversion uses the
+non-deprecated, interior-NUL-safe API. Production Rust 1.85 compatibility is
+preserved by selecting `url 2.5.4`, `idna 1.0.3`, `idna_adapter 1.2.1`, and the
+compatible ICU4X 2.1 releases instead of the newer Rust-1.86-only graph.
+`webpki-roots` was safely unified on 1.0.8. The dynamic CHP oracle scripts were
+added to the explicit Docker context so clean container runs do not depend on
+untracked workspace files.
+
+`cargo tree --locked -d` was reviewed after remediation. Fifteen duplicate
+package families remain. They are incompatible published major/minor lines,
+not duplicate resolutions that Cargo can safely unify: Pingora 0.8.1 retains
+older `ahash`/`hashbrown`/`indexmap`, `bitflags`, `socket2`, `syn`, and
+`thiserror` contracts while the application and current runtime crates require
+the newer lines; the `getrandom`/`rand`/`rand_chacha`/`rand_core` lines are
+split across Pingora and the current test/runtime ecosystem; and
+`cpufeatures`, `r-efi`, and `windows-sys` are target-specific transitive API
+lines. Removing another line would require changing a published upstream API,
+not a lockfile unification. The directly controllable `webpki-roots` duplicate
+was removed.
+
+The final pre-commit source tree ran `bash scripts/verify.sh` with logs in
+`.verification-logs/task14-final-pass3` and returned zero. The observed phase
+results were:
+
+| Phase | Elapsed | Result |
+|---|---:|---|
+| `cargo fmt --all -- --check` | 0.0 s | PASS |
+| warnings-denied Clippy | 6.2 s | PASS |
+| all-target/all-feature tests and checks | 247.5 s | PASS, 403 Rust tests across 14 suites |
+| dedicated Node 20 / CHP 5.3.0 differential | 83.6 s | PASS, 35 scenarios plus the isolated launch-lock helper |
+| JupyterHub 5.5.0 clean Linux E2E | 801.1 s | PASS, 12 harness tests, the Linux ACL contract, and 18/18 scenarios on both memory and Redis |
+| production container build and smoke | 183.8 s | PASS on Rust 1.85.1, non-root/distroless runtime and OCI labels verified |
+| Helm render/policy checks | 2.9 s | PASS |
+| `cargo audit --deny warnings` | 0.8 s | PASS, 352 dependencies and zero findings |
+| `cargo deny check advisories licenses bans sources` | 1.1 s | PASS |
+
+The host-side run used `rustc/cargo 1.96.0`, Docker 27.5.1-rd with Compose
+2.33.0, Helm 3.17.1, Just 1.56.0, cargo-audit 0.22.2, and cargo-deny 0.20.2.
+The production image independently compiled with the repository's Rust 1.85.1
+MSRV. The clean Linux JupyterHub builder resolved its pinned stable toolchain
+and exercised JupyterHub 5.5.0 with Python 3.12.12.
+
+A mechanical audit of CHP 5.3.0 `bin/configurable-http-proxy` lines 24–120 found
+48 long options and the compatibility matrix contains exactly the same 48:
+no missing or extra option. The matrix references 26 named Rust contract tests;
+every referenced name exists in the source. The documented intentional
+boundaries remain explicit: RC4 cannot be re-enabled, client-side certificate
+request flags are rejected rather than ignored, and arbitrary Node storage
+modules are replaced by typed memory, Redis, or authenticated sidecar backends.

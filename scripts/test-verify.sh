@@ -88,6 +88,8 @@ grep -Fqx exact-failure-log "$TMP_DIR/failure.log"
 mapfile -t phases < <(sed -n 's/^run_phase \([^ ]*\).*/\1/p' "$ROOT_DIR/scripts/verify.sh")
 expected=(01-fmt 02-clippy 03-tests 04-differential 05-jupyterhub 06-container 07-helm 08-audit 09-deny)
 test "${phases[*]}" = "${expected[*]}"
+grep -Fq 'DIFFERENTIAL_ALL_TARGETS=1 ./scripts/test-differential.sh' "$ROOT_DIR/scripts/verify.sh"
+grep -Fq 'cargo_args=(--locked --all-targets --all-features)' "$ROOT_DIR/scripts/test-differential.sh"
 if grep -Fq -- '--foreground' "$ROOT_DIR/scripts/verify.sh"; then
   echo "verify still uses foreground-only timeout semantics" >&2
   exit 1

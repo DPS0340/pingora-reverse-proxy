@@ -24,9 +24,9 @@ openssl = "0.10"
 pingora = { version = "0.8.1", features = ["proxy", "openssl"] }
 prometheus = "0.14"
 redis = { version = "0.32", features = ["aio", "tokio-comp"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-pemfile = "2"
+rustls-pki-types = "1"
 rustix = { version = "1", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -38,7 +38,7 @@ tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = { version = "2", features = ["serde"] }
-webpki-roots = "0.26"
+webpki-roots = "1"
 
 [dev-dependencies]
 proptest = "1.7"
@@ -49,3 +49,4 @@ wiremock = "0.6"
 
 [patch.crates-io]
 pingora-core = { path = "vendor/pingora-core-0.8.1" }
+pingora-load-balancing = { path = "vendor/pingora-load-balancing-0.8.1" }

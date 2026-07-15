@@ -8,7 +8,7 @@
 
 A dynamic HTTP and WebSocket reverse proxy built with [Pingora](https://github.com/cloudflare/pingora). It implements the route-management API and routing behavior expected by JupyterHub's [Configurable HTTP Proxy (CHP) 5.3.0](https://github.com/jupyterhub/configurable-http-proxy/tree/5.3.0), without requiring Node.js in the proxy process.
 
-> **Project status:** the CHP-compatible runtime, memory, Redis, and HTTP sidecar route stores, hardened production image, production Helm chart, differential oracle, and JupyterHub 5.5 external-proxy flow are implemented and tested. See [Operations](docs/operations.md) before deploying.
+> **Project status:** the CHP-compatible runtime, memory, Redis, and HTTP sidecar route stores, hardened production image, production Helm chart, differential oracle, and JupyterHub 5.5 external-proxy flow are implemented and tested. Review the [CHP compatibility matrix](docs/compatibility.md), [test evidence](docs/test-evidence.md), and [operations guide](docs/operations.md) before deploying.
 
 ## Why this project?
 
@@ -287,6 +287,17 @@ just test-helm           # lint and structurally assert rendered chart variants
 ```
 
 Both integration gates require Docker. They create isolated resources and enforce teardown checks.
+
+Run the complete clean-Linux release gate, including dependency policy, the
+differential oracle, JupyterHub, container, and Helm checks, with:
+
+```bash
+bash scripts/verify.sh
+```
+
+This canonical gate additionally requires GNU `timeout`, `cargo-audit`,
+`cargo-deny`, Docker, and Helm. Its ordered phase logs are written under
+`.verification-logs/`.
 
 ## Container and Helm deployment
 

@@ -6,3 +6,5 @@
 !rust-toolchain.toml
 !src/**
 !vendor/**
+!scripts/chp-oracle.mjs
+!scripts/chp-runtime.mjs
