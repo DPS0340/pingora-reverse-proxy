@@ -193,6 +193,25 @@ candidate_script = candidate.fetch('run')
 assert(candidate_script.include?('${RUNNER_TEMP}/pingora-verified-image/image.tar') &&
        candidate_script.include?('${RUNNER_TEMP}/pingora-verified-image/metadata.env'),
        'CD verification must consume the downloaded archive and metadata paths')
+
+candidate_publish_index = publish_steps.index { |step| step['name'] == 'Publish immutable candidate manifest' }
+attest_index = publish_steps.index { |step| step['name'] == 'Attest candidate image provenance' }
+promotion_index = publish_steps.index { |step| step['name'] == 'Promote attested digest to immutable release tags' }
+assert(candidate_publish_index && attest_index && promotion_index &&
+       candidate_publish_index < attest_index && attest_index < promotion_index,
+       'candidate provenance must be published before public SemVer/SHA tag promotion')
+candidate_publish_script = publish_steps.fetch(candidate_publish_index).fetch('run')
+promotion_script = publish_steps.fetch(promotion_index).fetch('run')
+assert(candidate_publish_script.include?('candidate-${VERIFIED_SHA}-${WORKFLOW_RUN_ID}-${WORKFLOW_RUN_ATTEMPT}') &&
+       candidate_publish_script.include?('docker push "${image}:${candidate_tag}"'),
+       'candidate publication must be immutable and unique per workflow attempt')
+assert(!candidate_publish_script.include?('--tag "${image}:${VERSION_TAG}"') &&
+       !candidate_publish_script.include?('--tag "${image}:${sha_tag}"'),
+       'candidate publication must not expose public release tags before attestation')
+assert(promotion_script.include?('--tag "${image}:${VERSION_TAG}"') &&
+       promotion_script.include?('--tag "${image}:${sha_tag}"') &&
+       promotion_script.include?('"${image}@${ATTESTED_DIGEST}"'),
+       'post-attestation promotion must attach both immutable public tags to the attested digest')
 RUBY
 if grep -Eq 'docker (build([[:space:]]|$)|buildx build([[:space:]]|$))' "$ROOT_DIR/.github/workflows/cd.yml"; then
   echo "CD rebuilds instead of promoting the tested image" >&2
@@ -212,4 +231,4 @@ if grep -Eh '^[[:space:]]*uses:' "$ROOT_DIR/.github/workflows/ci.yml" "$ROOT_DIR
   exit 1
 fi
 
-printf 'release gate passed: strict SemVer, collision-free tags, exact archive identity, and no-rebuild promotion\n'
+printf 'release gate passed: strict SemVer, collision-free tags, exact archive identity, provenance-before-promotion, and no-rebuild promotion\n'

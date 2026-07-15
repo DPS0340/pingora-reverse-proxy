@@ -112,6 +112,7 @@ if [[ "${DIFFERENTIAL_SKIP_RUNTIME_PROBE:-0}" != 1 ]]; then
     probe="$(docker run --rm --label "$CHP_ORACLE_RUN_LABEL" "$CHP_ORACLE_IMAGE" node /usr/local/bin/chp-oracle.mjs --runtime-probe)"
     [[ "$probe" == *'"node":"v20.'* ]]
     [[ "$probe" == *'"package":"configurable-http-proxy@5.3.0"'* ]]
+    [[ "$probe" == *'"commit":"5651b9d7449aea6c6a390ecd81a9955146a2b05f"'* ]]
     [[ "$probe" == *'"source":"/opt/chp-5.3.0"'* ]]
 fi
 

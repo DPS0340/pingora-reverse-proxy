@@ -30,6 +30,21 @@ fn canonical_harness_builds_and_launches_the_shipped_binary() {
         "the E2E image must build the deployable binary with the lockfile"
     );
     assert!(
+        compose.contains("97b3154610726b5b7d8768f1e89a4d910e002854")
+            && compose.contains("525dfd807f318f19158bb28f31568866d95411a644635d4334e701f6e8f28bdb"),
+        "the E2E image must install JupyterHub from the exact checksum-pinned baseline commit"
+    );
+    assert!(
+        compose.contains("2e38d1767742d41911cfc2160cad485eae2698f98ed291308c7d3be090c757a0")
+            && compose.contains("verify-jupyterhub-source.py"),
+        "the exact wheel must retain runtime assets while a build gate compares its code to the pinned commit"
+    );
+    assert!(
+        harness.contains("EXPECTED_JUPYTERHUB_COMMIT")
+            && harness.contains("/opt/jupyterhub-source-commit"),
+        "the E2E runtime must prove the exact JupyterHub source commit"
+    );
+    assert!(
         compose.contains("/usr/local/bin/pingora-reverse-proxy"),
         "the E2E image must install the deployable binary"
     );

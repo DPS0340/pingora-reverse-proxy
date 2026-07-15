@@ -7,16 +7,18 @@ import { pathToFileURL } from "node:url";
 import { validateNodeMajor } from "./chp-runtime.mjs";
 
 const expectedVersion = "5.3.0";
+const expectedSourceCommit = "5651b9d7449aea6c6a390ecd81a9955146a2b05f";
 const requestedSource = process.env.CHP_SOURCE_DIR || "/opt/chp-5.3.0";
 const source = fs.realpathSync(requestedSource);
 if (source.split(path.sep).includes("node_modules")) {
   throw new Error("refusing global node_modules source; use the pinned in-image CHP tree");
 }
 const packagePath = path.join(source, "package.json");
+const sourceCommitPath = path.join(source, ".source-commit");
 const configProxyPath = path.join(source, "lib", "configproxy.js");
 const cliPath = path.join(source, "bin", "configurable-http-proxy");
 
-for (const required of [packagePath, configProxyPath, cliPath]) {
+for (const required of [sourceCommitPath, packagePath, configProxyPath, cliPath]) {
   const resolved = fs.realpathSync(required);
   if (resolved !== source && !resolved.startsWith(`${source}${path.sep}`)) {
     throw new Error(`CHP source member escaped the pinned source directory: ${required}`);
@@ -24,6 +26,10 @@ for (const required of [packagePath, configProxyPath, cliPath]) {
 }
 
 const packageJson = JSON.parse(fs.readFileSync(packagePath, "utf8"));
+const sourceCommit = fs.readFileSync(sourceCommitPath, "utf8").trim();
+if (sourceCommit !== expectedSourceCommit) {
+  throw new Error(`expected CHP source commit ${expectedSourceCommit}, got ${sourceCommit}`);
+}
 if (
   packageJson.name !== "configurable-http-proxy" ||
   packageJson.version !== expectedVersion
@@ -60,6 +66,7 @@ if (process.argv[2] === "--runtime-probe") {
     `${JSON.stringify({
       node: process.version,
       package: `${packageJson.name}@${packageJson.version}`,
+      commit: sourceCommit,
       source,
     })}\n`
   );

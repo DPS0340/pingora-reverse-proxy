@@ -7,6 +7,17 @@ equivalent” means the same purpose is provided through a Rust-native mechanism
 “Intentional difference” means startup rejects an unsafe or binary-incompatible
 request with an actionable error; it is never silently ignored.
 
+The differential oracle is built from CHP commit
+`5651b9d7449aea6c6a390ecd81a9955146a2b05f` using source-archive SHA-256
+`7e749e76b39de0e0d3c204440e1c929e89fbe14a8241390d01053500e41be2ec`;
+its runtime probe must report the same commit. The JupyterHub consumer image
+installs the universal JupyterHub 5.5.0 wheel at
+SHA-256 `2e38d1767742d41911cfc2160cad485eae2698f98ed291308c7d3be090c757a0`,
+verifies commit `97b3154610726b5b7d8768f1e89a4d910e002854` from source-archive
+SHA-256 `525dfd807f318f19158bb28f31568866d95411a644635d4334e701f6e8f28bdb`,
+and byte-compares the installed Python modules and templates to that source tree
+before emitting its runtime source marker.
+
 The configuration contract is exercised by `tests/config_contract.rs`. Runtime
 behavior is exercised by the proxy, TLS/Unix, WebSocket, store, differential,
 and JupyterHub suites named below; this matrix does not infer support from CLI
@@ -163,8 +174,8 @@ remain outside that documented boundary.
 | `--client-ssl-key` | Identical | Target-facing client identity key; requires its certificate; `all_supported_tls_options_are_preserved`, `validation_errors_are_explicit_and_non_panicking`. |
 | `--client-ssl-cert` | Identical | Target-facing client identity certificate; `all_supported_tls_options_are_preserved`. |
 | `--client-ssl-ca` | Identical | Target trust CA, including CA-only configuration; `all_supported_tls_options_are_preserved`, `client_ca_can_configure_target_trust_without_a_client_identity`. |
-| `--client-ssl-request-cert` | Identical | Preserved target-facing TLS request-cert setting; `all_supported_tls_options_are_preserved`. |
-| `--client-ssl-reject-unauthorized` | Identical | Preserved target-facing TLS rejection setting; `all_supported_tls_options_are_preserved`. |
+| `--client-ssl-request-cert` | **Intentional difference** | Fails startup clearly instead of accepting a target-facing request-cert mode that has no meaningful client-side equivalent; `client_certificate_request_flags_are_rejected_instead_of_ignored`. |
+| `--client-ssl-reject-unauthorized` | **Intentional difference** | Fails startup clearly instead of silently accepting an unsupported target-facing rejection switch; upstream verification remains controlled by `--insecure` and target CA configuration; `client_certificate_request_flags_are_rejected_instead_of_ignored`. |
 | `--default-target` | Identical | Accepts validated HTTP(S), `http+unix`, and `unix+http` targets. Unix HTTP strictly validates every escape, decodes the complete WHATWG `host` (hostname plus any authority port suffix) as UTF-8 like `decodeURIComponent(target.host)`, and requires a non-empty, NUL-free absolute socket path; `proxy_and_process_options_match_chp_surface`, `default_and_error_targets_accept_valid_unix_http_urls`, `unix_http_validation_includes_the_whatwg_host_port_suffix`, `unix_http_targets_reject_invalid_or_unusable_socket_hosts`. |
 | `--error-target` | Identical | Applies the same strict TCP or Unix HTTP target validation as the default target, conflicts with error path, and appends a trailing slash to every target string that does not already end in one, matching CHP before the target is reparsed; `proxy_and_process_options_match_chp_surface`, `default_and_error_targets_accept_valid_unix_http_urls`, `non_root_error_targets_gain_a_trailing_slash_like_chp`, `unix_http_validation_includes_the_whatwg_host_port_suffix`, `unix_http_targets_reject_invalid_or_unusable_socket_hosts`. |
 | `--error-path` | Identical | Selects filesystem error pages and conflicts with error target; `error_path_is_supported`, `validation_errors_are_explicit_and_non_panicking`. |
@@ -188,6 +199,34 @@ remain outside that documented boundary.
 | `--proxy-timeout` | Identical | Typed target response timeout in milliseconds. Zero is deliberately preserved because CHP passes it directly to the proxy library instead of applying a falsy default; `proxy_and_process_options_match_chp_surface`, `timeout_zero_semantics_match_chp`. |
 | `--storage-backend` | **Semantic equivalent with intentional Node-module difference** | `memory`, `redis`, and the versioned HTTP/JSON v1 `sidecar` are implemented typed selections. Arbitrary Node module names/paths fail startup because Rust cannot `require()` Node classes. Runtime coverage includes `sidecar_store_satisfies_backend_neutral_contract` and `shipped_binary_loads_authenticated_sidecar_before_listener_readiness`; configuration coverage includes `supported_storage_backends_are_typed` and `validation_errors_are_explicit_and_non_panicking`. |
 | `--keep-alive-timeout` | Identical | Typed keep-alive timeout in milliseconds; omission and explicit zero both normalize to CHP's 5000 ms runtime default; `proxy_and_process_options_match_chp_surface`, `omitted_keep_alive_timeout_uses_chp_runtime_default`, `timeout_zero_semantics_match_chp`. |
+
+## Public behavior compatibility matrix
+
+This table audits externally observable CHP and JupyterHub behavior separately
+from the CLI surface. `Identical` rows are checked against the pinned CHP oracle;
+backend and lifecycle rows marked semantic equivalent or extension have explicit
+Rust and consumer-level contracts instead of an unexplained difference.
+
+| Public behavior | Status | Contract tests / scenarios |
+|---|---|---|
+| Management API authentication, CRUD, encoded route keys, JSON errors, and unknown metadata | Identical | `chp_and_rust_agree_on_api_crud_and_encoded_unicode_route`, `crud_scenarios_compare_populated_route_tables_at_each_mutation`, `arbitrary_authorization_headers_always_return_a_response`, `post_preserves_unknown_jupyterhub_metadata`. |
+| Inactivity query parsing and strictly-older filtering | Identical | `both_inactivity_query_spellings_filter_strictly_older_routes`, `inactive_since_accepts_the_pinned_timezone_stable_date_parse_subset`, `invalid_inactivity_timestamp_matches_chp_400_body`. |
+| Longest-prefix/root route selection and all prepend/include-prefix combinations | Identical | `chp_and_rust_agree_on_longest_http_route_selection`, `chp_and_rust_agree_on_every_path_option_combination`, `deepest_route_with_data_wins`, `root_route_is_the_fallback`. |
+| Host routing and decoded host/path boundary handling | Identical | `chp_and_rust_agree_on_host_routing_and_redirect_policy`, `network_host_routing_selects_the_host_prefixed_route`, `uri_host_routing_prefix_is_removed_at_a_decoded_path_boundary`. |
+| HTTP forwarding, request path/query, hop-header scrubbing, custom headers, origin and X-Forwarded policy | Identical | `network_registered_route_streams_request_and_applies_forwarding_policy`, `network_forwarding_runs_before_custom_headers_and_final_hop_scrub_preserves_websocket`, `uri_request_headers_apply_custom_origin_and_forwarded_host_policy`, `comparator_preserves_duplicate_and_non_utf8_semantic_headers`. |
+| WebSocket upgrade, headers/query, binary messages, close, and unavailable upstream | Identical | `chp_and_rust_agree_on_websocket_upgrade_and_messages`, `websocket_messages_cross_the_selected_user_route`, `public_unix_socket_carries_websocket_binary_headers_query_and_close`, `unavailable_websocket_upstream_returns_empty_503_handshake`. |
+| Request/response activity timestamps and HTTP/WebSocket phase deduplication | Identical | `network_http_response_activity_waits_for_successful_completion_like_chp`, `network_redirect_request_and_response_body_traffic_records_activity_like_chp`, `chp_activity_phases_dedupe_each_direction_and_ignore_http_response_chunks`, `activity_updates_do_not_change_alias_matcher_order`. |
+| Health plus default/custom 404, typed 500, empty 503, file and target fallback behavior | Identical | `chp_and_rust_agree_on_custom_404_and_503_errors`, `chp_and_rust_agree_on_health_errors_and_metric_schema`, `network_typed_internal_errors_are_500_and_custom_failure_uses_reason_phrase`, `network_custom_and_file_errors_follow_chp_fallback_policy`. |
+| Redirect status/Location rewriting and protocol/host/port rules | Identical | `chp_and_rust_agree_on_host_routing_and_redirect_policy`, `network_redirects_are_untouched_by_default_and_rewritten_when_enabled`, `uri_redirect_rewrite_matrix_matches_http_proxy`, `redirect_without_host_is_400_and_host_uses_the_exact_https_port`. |
+| Request/proxy/keep-alive timeouts and downstream/upstream connection reuse | Identical | `timeout_zero_semantics_match_chp`, `omitted_keep_alive_timeout_uses_chp_runtime_default`, `network_reuses_the_same_downstream_socket_and_upstream_connection`, `network_custom_error_slow_and_oversized_responses_fall_back_within_bounds`. |
+| Public and API TLS, encrypted keys, strict/optional mTLS, and upstream certificate/hostname verification | Identical except the two startup-rejected client request flags documented above | `chp_and_rust_agree_on_public_tls`, `chp_and_rust_agree_on_public_mutual_tls`, `public_and_api_https_accept_encrypted_listener_keys`, `optional_client_certificates_accept_absent_untrusted_and_trusted_for_public_and_api`, `uri_http_peer_defaults_to_certificate_and_hostname_verification`, `client_certificate_request_flags_are_rejected_instead_of_ignored`. |
+| Public/API/metrics Unix sockets and Unix upstream targets | Identical | `chp_and_rust_agree_on_unix_public_api_and_metrics_sockets`, `public_api_and_metrics_unix_sockets_serve_and_are_cleaned_up`, `selected_route_reaches_a_real_unix_upstream_with_path_and_query`, `uri_unix_http_peer_uses_the_decoded_socket_path`. |
+| CHP metric families, metadata, labels, values, deltas, and response/route counters | Identical | `metrics_expose_exact_chp_families_and_status_labels`, `metric_comparator_rejects_unexpected_families_help_types_labels_and_values`, `network_metrics_count_web_requests_proxy_statuses_and_route_lookups`, `metrics_match_completed_responses_and_successful_operation_promises`. |
+| In-memory route storage and atomic published snapshots | Semantic equivalent | `memory_store_matches_reference_state_machine`, `memory_store_satisfies_backend_neutral_contract`, `registry_loads_and_exposes_complete_store_snapshot`, `failed_persistence_never_publishes_route`. |
+| Redis persistence, restart recovery, mutation ambiguity, and credential-redacted failure | Semantic equivalent first-class backend | `redis_store_satisfies_backend_neutral_contract`, `redis_restart_persistence_recovers_complete_routes_without_clearing`, `redis_every_dispatched_mutator_reply_loss_is_indeterminate`, `redis_unavailable_startup_is_bounded_typed_and_redacts_credentials`. |
+| HTTP/JSON v1 sidecar persistence and authenticated startup | Rust extension replacing arbitrary in-process Node storage modules | `sidecar_store_satisfies_backend_neutral_contract`, `sidecar_put_is_idempotent_and_restart_reconnect_preserves_state`, `sidecar_optional_bearer_auth_authenticates_every_endpoint`, `shipped_binary_loads_authenticated_sidecar_before_listener_readiness`. |
+| JupyterHub 5.5.0 external-proxy consumption: API reconciliation, escaped users, login, user server, kernel WebSocket, restart, and host routing | Compatible consumer gate | `canonical_harness_builds_and_launches_the_shipped_binary`; required scenarios `proxy_api_add_get_delete`, `proxy_route_reconciliation`, `escaped_route_unicode`, `login`, `single_user_page`, `kernel_websocket_message_flow`, `hub_restart_existing_route_usable`, `proxy_restart_backend_state`, and `host_routing` pass on memory and Redis. |
+| PID ownership, non-clobber startup, graceful HTTP/WebSocket drain, and run-owned cleanup | Operationally hardened semantic equivalent | `existing_pid_or_socket_paths_are_refused_without_deleting_the_owner`, `sigterm_drains_an_active_websocket_before_ordered_exit`, `traffic_admission_closes_and_drains_64_concurrent_requests`, `socket_cleanup_never_deletes_a_boundary_replacement`. |
 
 ## Environment variables
 

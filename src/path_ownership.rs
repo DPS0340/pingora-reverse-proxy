@@ -10,6 +10,23 @@ use std::os::fd::AsRawFd;
 
 const QUARANTINE_ATTEMPTS: usize = 8;
 
+#[cfg(unix)]
+#[inline]
+#[allow(clippy::unnecessary_cast)]
+fn stat_mode_bits(mode: libc::mode_t) -> u32 {
+    // mode_t is u16 on Apple targets and u32 on Linux/Android.
+    mode as u32
+}
+
+#[cfg(unix)]
+#[inline]
+#[allow(clippy::unnecessary_cast)]
+fn stat_device_id(device: libc::dev_t) -> u64 {
+    // dev_t is signed on Apple targets and u64 on Linux/Android. Preserve the
+    // existing bitwise identity normalization without scattering target-specific casts.
+    device as u64
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) struct FileIdentity {
     #[cfg(unix)]
@@ -370,16 +387,17 @@ where
 
     let initial = rustix::fs::statat(parent, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
-    if initial.st_mode as u32 & libc::S_IFMT as u32 != libc::S_IFDIR as u32
+    if stat_mode_bits(initial.st_mode) & stat_mode_bits(libc::S_IFMT)
+        != stat_mode_bits(libc::S_IFDIR)
         || initial.st_uid != effective_uid
-        || initial.st_mode as u32 & 0o7777 & !0o700 != 0
+        || stat_mode_bits(initial.st_mode) & 0o7777 & !0o700 != 0
     {
         return Err(io::Error::other(
             "private directory failed provisional type, owner, or mode authentication",
         ));
     }
     let identity = FileIdentity {
-        device: initial.st_dev as u64,
+        device: stat_device_id(initial.st_dev),
         inode: initial.st_ino,
     };
     let mut identity_guard = PrivateNamespaceGuard {
@@ -396,11 +414,12 @@ where
     chmodat_portable(parent, name, 0o700)?;
     let normalized = rustix::fs::statat(parent, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
-    if normalized.st_dev as u64 != identity.device
+    if stat_device_id(normalized.st_dev) != identity.device
         || normalized.st_ino != identity.inode
-        || normalized.st_mode as u32 & libc::S_IFMT as u32 != libc::S_IFDIR as u32
+        || stat_mode_bits(normalized.st_mode) & stat_mode_bits(libc::S_IFMT)
+            != stat_mode_bits(libc::S_IFDIR)
         || normalized.st_uid != effective_uid
-        || normalized.st_mode as u32 & 0o7777 != 0o700
+        || stat_mode_bits(normalized.st_mode) & 0o7777 != 0o700
     {
         return Err(io::Error::other(
             "private directory failed normalized identity authentication",
@@ -411,7 +430,7 @@ where
     let directory = open_directory_at(parent, name)?;
     let opened = directory.metadata()?;
     if FileIdentity::from_metadata(&opened)? != identity
-        || opened.mode() & libc::S_IFMT as u32 != libc::S_IFDIR as u32
+        || opened.mode() & stat_mode_bits(libc::S_IFMT) != stat_mode_bits(libc::S_IFDIR)
         || opened.uid() != effective_uid
         || opened.mode() & 0o7777 != 0o700
     {
@@ -427,7 +446,7 @@ where
 #[cfg(unix)]
 fn boundary_mode_is_safe(mode: u32, owner: libc::uid_t, effective_uid: libc::uid_t) -> bool {
     (owner == effective_uid || owner == 0)
-        && (mode & 0o022 == 0 || mode & libc::S_ISVTX as u32 != 0)
+        && (mode & 0o022 == 0 || mode & stat_mode_bits(libc::S_ISVTX) != 0)
 }
 
 #[cfg(unix)]
@@ -442,7 +461,7 @@ fn authenticate_boundary_directory(directory: &File) -> io::Result<BoundaryAutho
 
     let metadata = directory.metadata()?;
     let mode = metadata.mode();
-    if mode & libc::S_IFMT as u32 != libc::S_IFDIR as u32
+    if mode & stat_mode_bits(libc::S_IFMT) != stat_mode_bits(libc::S_IFDIR)
         || !boundary_mode_is_safe(mode, metadata.uid(), unsafe { libc::geteuid() })
     {
         return Err(io::Error::other(
@@ -452,7 +471,7 @@ fn authenticate_boundary_directory(directory: &File) -> io::Result<BoundaryAutho
     authenticate_directory_acl(directory)?;
     Ok(BoundaryAuthority {
         owner: metadata.uid(),
-        rename_authority: mode & (libc::S_ISVTX as u32 | 0o022),
+        rename_authority: mode & (stat_mode_bits(libc::S_ISVTX) | 0o022),
     })
 }
 
@@ -464,8 +483,8 @@ fn authenticate_child_identity(
 ) -> io::Result<()> {
     let stat = rustix::fs::statat(parent, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
-    if stat.st_mode as u32 & libc::S_IFMT as u32 != libc::S_IFDIR as u32
-        || stat.st_dev as u64 != identity.device
+    if stat_mode_bits(stat.st_mode) & stat_mode_bits(libc::S_IFMT) != stat_mode_bits(libc::S_IFDIR)
+        || stat_device_id(stat.st_dev) != identity.device
         || stat.st_ino != identity.inode
     {
         return Err(io::Error::other("boundary path component identity changed"));
@@ -573,7 +592,7 @@ impl PrivateDirectory {
         Ok(OwnedPath {
             public_path: path,
             identity: FileIdentity {
-                device: stat.st_dev as u64,
+                device: stat_device_id(stat.st_dev),
                 inode: stat.st_ino,
             },
             active: true,
@@ -634,9 +653,10 @@ impl Drop for PrivateDirectory {
         )
         .ok()
         .is_some_and(|stat| {
-            self.identity.device == stat.st_dev as u64
+            self.identity.device == stat_device_id(stat.st_dev)
                 && self.identity.inode == stat.st_ino
-                && stat.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFDIR as u32
+                && stat_mode_bits(stat.st_mode) & stat_mode_bits(libc::S_IFMT)
+                    == stat_mode_bits(libc::S_IFDIR)
         });
         if matches {
             // POSIX has no identity-conditional rmdir-by-handle. The random
@@ -749,7 +769,7 @@ impl OwnedPath {
         Ok(Self {
             public_path: path,
             identity: FileIdentity {
-                device: stat.st_dev as u64,
+                device: stat_device_id(stat.st_dev),
                 inode: stat.st_ino,
             },
             active: true,
@@ -803,7 +823,8 @@ impl OwnedPath {
             rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
         )
         .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
-        Ok(self.identity.device == stat.st_dev as u64 && self.identity.inode == stat.st_ino)
+        Ok(self.identity.device == stat_device_id(stat.st_dev)
+            && self.identity.inode == stat.st_ino)
     }
 
     #[cfg(unix)]
@@ -814,10 +835,11 @@ impl OwnedPath {
             rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
         )
         .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
-        if self.identity.device != stat.st_dev as u64
+        if self.identity.device != stat_device_id(stat.st_dev)
             || self.identity.inode != stat.st_ino
-            || stat.st_mode as u32 & libc::S_IFMT as u32 != libc::S_IFSOCK as u32
-            || mode.is_some_and(|mode| stat.st_mode as u32 & 0o777 != mode)
+            || stat_mode_bits(stat.st_mode) & stat_mode_bits(libc::S_IFMT)
+                != stat_mode_bits(libc::S_IFSOCK)
+            || mode.is_some_and(|mode| stat_mode_bits(stat.st_mode) & 0o777 != mode)
         {
             return Err(io::Error::other("owned Unix socket identity changed"));
         }
@@ -1032,7 +1054,8 @@ impl OwnedPath {
         )
         .ok()
         .is_some_and(|stat| {
-            self.identity.device == stat.st_dev as u64 && self.identity.inode == stat.st_ino
+            self.identity.device == stat_device_id(stat.st_dev)
+                && self.identity.inode == stat.st_ino
         })
     }
 
@@ -1082,7 +1105,7 @@ impl OwnedPath {
             rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
         )
         .map(|stat| FileIdentity {
-            device: stat.st_dev as u64,
+            device: stat_device_id(stat.st_dev),
             inode: stat.st_ino,
         })
         .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
@@ -1168,9 +1191,10 @@ impl Drop for ProvisionalPrivateDirectoryGuard<'_> {
         )
         .ok()
         .is_some_and(|stat| {
-            stat.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFDIR as u32
+            stat_mode_bits(stat.st_mode) & stat_mode_bits(libc::S_IFMT)
+                == stat_mode_bits(libc::S_IFDIR)
                 && stat.st_uid == self.effective_uid
-                && stat.st_mode as u32 & 0o7777 & !0o700 == 0
+                && stat_mode_bits(stat.st_mode) & 0o7777 & !0o700 == 0
         });
         if safe_to_remove {
             let _ = rustix::fs::unlinkat(self.parent, &self.name, rustix::fs::AtFlags::REMOVEDIR);
@@ -1203,7 +1227,8 @@ impl Drop for PrivateNamespaceGuard<'_> {
         )
         .ok()
         .is_some_and(|stat| {
-            self.identity.device == stat.st_dev as u64 && self.identity.inode == stat.st_ino
+            self.identity.device == stat_device_id(stat.st_dev)
+                && self.identity.inode == stat.st_ino
         });
         if matches {
             let _ = rustix::fs::unlinkat(self.parent, &self.name, rustix::fs::AtFlags::REMOVEDIR);

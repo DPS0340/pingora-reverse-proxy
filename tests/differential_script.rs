@@ -43,7 +43,7 @@ case " $* " in
   *" run "*)
     if [ "${FAIL_RUNTIME_PROBE:-0}" = 1 ]; then exit 24; fi
     if [ "${INTERRUPT_STAGE:-}" = runtime-probe ]; then sleep "${FAKE_STAGE_DELAY:-0}"; fi
-    printf '%s\n' '{"node":"v20.20.2","package":"configurable-http-proxy@5.3.0","source":"/opt/chp-5.3.0"}'
+    printf '%s\n' '{"node":"v20.20.2","package":"configurable-http-proxy@5.3.0","commit":"5651b9d7449aea6c6a390ecd81a9955146a2b05f","source":"/opt/chp-5.3.0"}'
     ;;
 esac
 exit 0
@@ -394,9 +394,10 @@ fn just_recipe_executes_the_standalone_differential_script() {
 }
 
 #[test]
-fn oracle_image_uses_upstream_lock_and_validates_packed_source_integrity() {
+fn oracle_image_uses_exact_upstream_commit_archive_and_validates_integrity() {
     let compose = std::fs::read_to_string("compose.test.yml").expect("read compose fixture");
     assert!(compose.contains("npm ci --omit=dev"));
-    assert!(compose.contains("e55dd25c47058ab05cdcba58b59f4009f49b2fe16f329aa528bf2c233e337cb2"));
-    assert!(compose.contains("e5abb83b5d9d10514758d9bd63b1319b4e9361cd429cc3afbe9b4f4d4f37570ecdcfd8f48d4a90430283475c53e7682a5fe5fa0fc52e3bbe7875075491e058b9"));
+    assert!(compose.contains("5651b9d7449aea6c6a390ecd81a9955146a2b05f"));
+    assert!(compose.contains("7e749e76b39de0e0d3c204440e1c929e89fbe14a8241390d01053500e41be2ec"));
+    assert!(compose.contains("/opt/chp-5.3.0/.source-commit"));
 }

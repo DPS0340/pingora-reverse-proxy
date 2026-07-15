@@ -459,6 +459,11 @@ fn fake_chp_source(name: &str, version: &str) -> tempfile::TempDir {
     )
     .expect("fake CHP package");
     std::fs::write(
+        source.path().join(".source-commit"),
+        "5651b9d7449aea6c6a390ecd81a9955146a2b05f\n",
+    )
+    .expect("fake CHP source commit");
+    std::fs::write(
         source.path().join("lib/configproxy.js"),
         "export default {};\n",
     )
@@ -769,6 +774,7 @@ fn oracle_image_runs_actual_node_20_and_exact_chp_source() {
         .as_str()
         .is_some_and(|node| node.starts_with("v20.")));
     assert_eq!(probe["package"], "configurable-http-proxy@5.3.0");
+    assert_eq!(probe["commit"], "5651b9d7449aea6c6a390ecd81a9955146a2b05f");
     assert_eq!(probe["source"], "/opt/chp-5.3.0");
 }
 

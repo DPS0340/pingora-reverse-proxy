@@ -38,6 +38,8 @@ PINNED_PACKAGES = {
     "requests": "2.32.4",
     "websocket-client": "1.8.0",
 }
+EXPECTED_JUPYTERHUB_COMMIT = "97b3154610726b5b7d8768f1e89a4d910e002854"
+JUPYTERHUB_SOURCE_COMMIT_PATH = Path("/opt/jupyterhub-source-commit")
 USERS = ("river", "秀樹", "has@", "space user")
 REQUIRED_SCENARIOS = frozenset(
     {
@@ -1272,6 +1274,14 @@ def assert_pinned_runtime(recorder: Recorder) -> None:
         actual = version(package)
         if actual != expected:
             raise GateError(f"{package} is {actual}, expected {expected}")
+    try:
+        source_commit = JUPYTERHUB_SOURCE_COMMIT_PATH.read_text(encoding="ascii").strip()
+    except OSError as error:
+        raise GateError(f"cannot read JupyterHub source commit marker: {error}") from error
+    if source_commit != EXPECTED_JUPYTERHUB_COMMIT:
+        raise GateError(
+            f"JupyterHub source commit is {source_commit}, expected {EXPECTED_JUPYTERHUB_COMMIT}"
+        )
     assert_command_version(
         ["jupyterhub-singleuser", "--version"],
         "5.5.0",
@@ -1318,6 +1328,7 @@ def scenario_main(proxy_binary: Path) -> int:
     summary = {
         "backend": backend,
         "jupyterhub": "5.5.0",
+        "jupyterhub_commit": EXPECTED_JUPYTERHUB_COMMIT,
         "scenarios": verified_scenarios,
     }
     print(f"JUPYTERHUB_E2E_SUMMARY={json.dumps(summary, ensure_ascii=False, sort_keys=True)}")

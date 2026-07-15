@@ -91,8 +91,8 @@ jobs:
           install -d -m 0700 "${DOCKER_CONFIG}"
           echo "${GHCR_TOKEN}" | timeout 30s docker login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
 
-      - name: Recheck release authority and promote the exact manifest
-        id: publish
+      - name: Publish immutable candidate manifest
+        id: publish_candidate
         shell: bash
         env:
           DOCKER_CONFIG: ${{ runner.temp }}/pingora-docker-config
@@ -160,36 +160,107 @@ jobs:
           timeout 30s docker image tag "${VERIFIED_IMAGE_ID}" "${image}:${candidate_tag}"
           timeout 600s docker push "${image}:${candidate_tag}"
           candidate_digest=$(remote_digest "${image}:${candidate_tag}")
+          {
+            echo "image=${image}"
+            echo "digest=${candidate_digest}"
+          } >> "${GITHUB_OUTPUT}"
 
+      - name: Attest candidate image provenance
+        id: attest
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-name: ${{ steps.publish_candidate.outputs.image }}
+          subject-digest: ${{ steps.publish_candidate.outputs.digest }}
+          push-to-registry: true
+
+      - name: Re-authenticate to GHCR for promotion
+        shell: bash
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/pingora-docker-config
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          install -d -m 0700 "${DOCKER_CONFIG}"
+          echo "${GHCR_TOKEN}" | timeout 30s docker login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Promote attested digest to immutable release tags
+        id: promote
+        shell: bash
+        env:
+          ATTESTED_DIGEST: ${{ steps.publish_candidate.outputs.digest }}
+          DOCKER_CONFIG: ${{ runner.temp }}/pingora-docker-config
+          PUBLISHED_IMAGE: ${{ steps.publish_candidate.outputs.image }}
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+          VERSION_TAG: ${{ steps.release.outputs.docker_tag }}
+          VERIFIED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -Eeuo pipefail
+          trap 'timeout 30s docker logout ghcr.io >/dev/null 2>&1 || true; rm -rf -- "${DOCKER_CONFIG}"' EXIT
+          image="${PUBLISHED_IMAGE}"
+          sha_tag="sha-${VERIFIED_SHA}"
+          [[ ${VERIFIED_SHA} =~ ^[0-9a-f]{40}$ ]]
+          [[ ${ATTESTED_DIGEST} =~ ^sha256:[0-9a-f]{64}$ ]]
+
+          recheck_release_tag() {
+            timeout 60s git fetch --force --no-tags origin \
+              "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+            test "$(git rev-list -n 1 "${RELEASE_TAG}")" = "${VERIFIED_SHA}"
+          }
+
+          remote_digest() {
+            local reference=$1 output error_file
+            error_file=$(mktemp "${RUNNER_TEMP}/remote-manifest.XXXXXX")
+            if output=$(timeout 60s docker buildx imagetools inspect \
+              "${reference}" --format '{{json .Manifest}}' 2>"${error_file}"); then
+              rm -f "${error_file}"
+              ruby -rjson -e '
+                digest = JSON.parse(STDIN.read).fetch("digest")
+                abort "invalid remote digest" unless /\Asha256:[0-9a-f]{64}\z/.match?(digest)
+                puts digest
+              ' <<<"${output}"
+              return 0
+            fi
+            if grep -Eiq '((^|: )not found$|manifest unknown|not found: manifest|no such manifest)' "${error_file}"; then
+              rm -f "${error_file}"
+              return 1
+            fi
+            cat "${error_file}" >&2
+            rm -f "${error_file}"
+            return 2
+          }
+
+          require_absent_tag() {
+            local reference=$1 existing status
+            set +e
+            existing=$(remote_digest "${reference}")
+            status=$?
+            set -e
+            if (( status == 0 )); then
+              echo "refusing to overwrite existing image tag ${reference} at ${existing}" >&2
+              exit 1
+            fi
+            (( status == 1 )) || exit "${status}"
+          }
+
+          recheck_release_tag
           require_absent_tag "${image}:${VERSION_TAG}"
           require_absent_tag "${image}:${sha_tag}"
-          recheck_release_tag
           timeout 120s docker buildx imagetools create \
             --prefer-index=false \
             --tag "${image}:${VERSION_TAG}" \
             --tag "${image}:${sha_tag}" \
             --metadata-file "${RUNNER_TEMP}/promotion-metadata.json" \
-            "${image}@${candidate_digest}"
+            "${image}@${ATTESTED_DIGEST}"
           promotion_digest=$(ruby -rjson -e \
             'puts JSON.parse(File.read(ARGV.fetch(0))).fetch("containerimage.descriptor").fetch("digest")' \
             "${RUNNER_TEMP}/promotion-metadata.json")
-          test "${promotion_digest}" = "${candidate_digest}"
-          test "$(remote_digest "${image}:${VERSION_TAG}")" = "${candidate_digest}"
-          test "$(remote_digest "${image}:${sha_tag}")" = "${candidate_digest}"
+          test "${promotion_digest}" = "${ATTESTED_DIGEST}"
+          test "$(remote_digest "${image}:${VERSION_TAG}")" = "${ATTESTED_DIGEST}"
+          test "$(remote_digest "${image}:${sha_tag}")" = "${ATTESTED_DIGEST}"
           {
-            echo "image=${image}"
-            echo "digest=${candidate_digest}"
             echo "version_ref=${image}:${VERSION_TAG}"
             echo "sha_ref=${image}:${sha_tag}"
           } >> "${GITHUB_OUTPUT}"
-
-      - name: Attest published image provenance
-        id: attest
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
-        with:
-          subject-name: ${{ steps.publish.outputs.image }}
-          subject-digest: ${{ steps.publish.outputs.digest }}
-          push-to-registry: true
 
       - name: Report digest and provenance
         shell: bash
@@ -197,8 +268,8 @@ jobs:
           {
             echo "Release: ${{ steps.release.outputs.release_tag }}"
             echo "Verified source: ${{ github.event.workflow_run.head_sha }}"
-            echo "Published digest: ${{ steps.publish.outputs.digest }}"
-            echo "Version ref: ${{ steps.publish.outputs.version_ref }}"
-            echo "Commit ref: ${{ steps.publish.outputs.sha_ref }}"
+            echo "Published digest: ${{ steps.publish_candidate.outputs.digest }}"
+            echo "Version ref: ${{ steps.promote.outputs.version_ref }}"
+            echo "Commit ref: ${{ steps.promote.outputs.sha_ref }}"
             echo "Attestation: ${{ steps.attest.outputs.attestation-url }}"
           } >> "${GITHUB_STEP_SUMMARY}"
