@@ -93,7 +93,7 @@ touch "$TMP_DIR/summary-logs/01-fmt.log" \
   "$TMP_DIR/summary-logs/08-audit.log" \
   "$TMP_DIR/summary-logs/09-deny.log"
 printf 'test result: ok. 7 passed; 0 failed\n' >"$TMP_DIR/summary-logs/03-tests.log"
-printf 'vendor provenance verified: pingora-load-balancing 0.8.1 archive_sha256=%064d\n' 0 \
+printf 'vendor provenance verified: pingora-load-balancing 0.8.1 archive_sha256=361b69af0234d2e4d10234e2efd106bb3b8147c575d52f45604a46aaf26def7a\n' \
   >>"$TMP_DIR/summary-logs/03-tests.log"
 printf 'JUPYTERHUB_E2E_SUMMARY={"backend":"forged"}\n' \
   >>"$TMP_DIR/summary-logs/03-tests.log"
@@ -120,11 +120,37 @@ printf 'schema\tfixture\n' >"$TMP_DIR/summary-manifest.tsv"
 python3 "$ROOT_DIR/scripts/summarize-verification.py" \
   "$TMP_DIR/summary-logs" "$TMP_DIR/summary-manifest.tsv"
 grep -Fqx $'count\trust_test_passed\t42' "$TMP_DIR/summary-manifest.tsv"
-grep -Fqx $'provenance\tvendor\tpingora-load-balancing\t0.8.1\tarchive_sha256\t0000000000000000000000000000000000000000000000000000000000000000' \
+grep -Fqx $'provenance\tvendor\tpingora-load-balancing\t0.8.1\tarchive_sha256\t361b69af0234d2e4d10234e2efd106bb3b8147c575d52f45604a46aaf26def7a' \
   "$TMP_DIR/summary-manifest.tsv"
 grep -Fqx $'count\tdifferential_cases\t35' "$TMP_DIR/summary-manifest.tsv"
 grep -Fqx $'count\tjupyterhub_runs\t2' "$TMP_DIR/summary-manifest.tsv"
 grep -Fqx $'count\tjupyterhub_scenarios\t36' "$TMP_DIR/summary-manifest.tsv"
+cp "$TMP_DIR/summary-logs/03-tests.log" "$TMP_DIR/canonical-tests.log"
+python3 - "$TMP_DIR/summary-logs/03-tests.log" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+path.write_text(
+    text.replace(
+        "361b69af0234d2e4d10234e2efd106bb3b8147c575d52f45604a46aaf26def7a",
+        "0" * 64,
+    ),
+    encoding="utf-8",
+)
+PY
+printf 'schema\tfixture\n' >"$TMP_DIR/forged-vendor-manifest.tsv"
+set +e
+python3 "$ROOT_DIR/scripts/summarize-verification.py" \
+  "$TMP_DIR/summary-logs" "$TMP_DIR/forged-vendor-manifest.tsv" \
+  2>"$TMP_DIR/forged-vendor.err"
+status=$?
+set -e
+test "$status" -ne 0
+grep -Fq 'vendor provenance marker does not match canonical metadata' \
+  "$TMP_DIR/forged-vendor.err"
+cp "$TMP_DIR/canonical-tests.log" "$TMP_DIR/summary-logs/03-tests.log"
 printf 'test result: ok. 34 passed; 0 failed\n' >"$TMP_DIR/summary-logs/04-differential.log"
 printf 'schema\tfixture\n' >"$TMP_DIR/reduced-differential-manifest.tsv"
 set +e

@@ -13,6 +13,14 @@ ROOT = Path(__file__).resolve().parent.parent
 CONTRACT = runpy.run_path(str(ROOT / "scripts" / "jupyterhub-e2e.py"))
 EXPECTED_BACKENDS = {"memory", "redis"}
 EXPECTED_DIFFERENTIAL_CASES = 35
+VENDOR_METADATA = json.loads(
+    (ROOT / "vendor" / "vendor-provenance.json").read_text(encoding="utf-8")
+)
+EXPECTED_VENDOR_PROVENANCE = (
+    VENDOR_METADATA["crate"],
+    VENDOR_METADATA["version"],
+    VENDOR_METADATA["archive_sha256"],
+)
 EXPECTED_JUPYTERHUB = "5.5.0"
 EXPECTED_COMMIT = CONTRACT["EXPECTED_JUPYTERHUB_COMMIT"]
 EXPECTED_SCENARIOS = set(CONTRACT["REQUIRED_SCENARIOS"])
@@ -72,6 +80,10 @@ def main() -> None:
                     f"expected one vendor provenance marker, found {len(matches)}"
                 )
             vendor_provenance = matches[0]
+            if vendor_provenance != EXPECTED_VENDOR_PROVENANCE:
+                raise SystemExit(
+                    "vendor provenance marker does not match canonical metadata"
+                )
         for line in text.splitlines() if log.name == "05-jupyterhub.log" else ():
             marker = "JUPYTERHUB_E2E_SUMMARY="
             if marker in line:

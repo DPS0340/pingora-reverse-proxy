@@ -11,6 +11,7 @@ import json
 import os
 import platform
 import re
+import select
 import secrets
 import signal
 import socket
@@ -186,7 +187,7 @@ class CommandRunner:
 
 
 BUILD_CONTEXT_ROOT_FILES = frozenset(
-    {"Cargo.toml", "Cargo.lock", "rust-toolchain.toml"}
+    {"Cargo.toml", "Cargo.lock", "compose.test.yml", "rust-toolchain.toml"}
 )
 BUILD_CONTEXT_DIRECTORIES = frozenset({"src", "tests", "scripts", "vendor"})
 
@@ -331,7 +332,6 @@ def cleanup_docker_run(
 
 def supervisor_main() -> int:
     workspace = Path(__file__).resolve().parents[1]
-    compose_file = workspace / "compose.test.yml"
     compose = compose_command()
     selection = os.environ.get("STORE_BACKEND")
     if selection is None:
@@ -361,6 +361,7 @@ def supervisor_main() -> int:
     with tempfile.TemporaryDirectory(prefix="jupyterhub-e2e-build-") as build_dir:
         context = Path(build_dir)
         copy_build_context(workspace, context)
+        compose_file = context / "compose.test.yml"
         env = os.environ.copy()
         env.update(
             {
@@ -373,14 +374,14 @@ def supervisor_main() -> int:
         try:
             runner.run(
                 [*base, "build", "jupyterhub-e2e"],
-                cwd=workspace,
+                cwd=context,
                 env=env,
                 timeout=BUILD_TIMEOUT,
             )
             if "redis" in backends:
                 runner.run(
                     [*base, "up", "-d", "redis"],
-                    cwd=workspace,
+                    cwd=context,
                     env=env,
                     timeout=60,
                 )
@@ -388,7 +389,7 @@ def supervisor_main() -> int:
                 while True:
                     ready = subprocess.run(
                         [*base, "exec", "-T", "redis", "redis-cli", "ping"],
-                        cwd=workspace,
+                        cwd=context,
                         env=env,
                         check=False,
                         capture_output=True,
@@ -414,7 +415,7 @@ def supervisor_main() -> int:
                         f"STORE_BACKEND={backend}",
                         "jupyterhub-e2e",
                     ],
-                    cwd=workspace,
+                    cwd=context,
                     env=env,
                     timeout=COMMAND_TIMEOUT,
                 )
@@ -423,7 +424,7 @@ def supervisor_main() -> int:
         finally:
             runner.interrupt()
             cleanup_failures = cleanup_docker_run(
-                compose, compose_file, workspace, env, project
+                compose, compose_file, context, env, project
             )
     for signum, handler in previous_handlers.items():
         signal.signal(signum, handler)
@@ -470,8 +471,103 @@ class PortReservation:
             self._socket.close()
             self._socket = None
 
+    def take_socket(self) -> socket.socket:
+        if self._socket is None:
+            raise GateError("port reservation socket was already released")
+        listener = self._socket
+        self._socket = None
+        return listener
+
     def __del__(self) -> None:
         self.release()
+
+
+class TcpToUnixBridge:
+    def __init__(self, reservation: PortReservation, unix_path: Path) -> None:
+        self.port = reservation.port
+        self.unix_path = unix_path
+        self._listener = reservation.take_socket()
+        self._listener.listen(128)
+        self._listener.settimeout(0.2)
+        self._stopping = threading.Event()
+        self._connections: set[socket.socket] = set()
+        self._connections_lock = threading.Lock()
+        self.error: BaseException | None = None
+        self._thread = threading.Thread(
+            target=self._accept_loop,
+            name=f"tcp-unix-bridge-{self.port}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _accept_loop(self) -> None:
+        while not self._stopping.is_set():
+            try:
+                client, _ = self._listener.accept()
+            except socket.timeout:
+                continue
+            except OSError as error:
+                if not self._stopping.is_set():
+                    self.error = error
+                return
+            worker = threading.Thread(
+                target=self._forward,
+                args=(client,),
+                name=f"tcp-unix-forward-{self.port}",
+                daemon=True,
+            )
+            worker.start()
+
+    def _forward(self, client: socket.socket) -> None:
+        upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sockets = (client, upstream)
+        with self._connections_lock:
+            self._connections.update(sockets)
+        try:
+            upstream.settimeout(HTTP_TIMEOUT)
+            upstream.connect(str(self.unix_path))
+            upstream.settimeout(None)
+            while not self._stopping.is_set():
+                readable, _, _ = select.select(sockets, (), (), 0.2)
+                for source in readable:
+                    data = source.recv(64 * 1024)
+                    if not data:
+                        return
+                    destination = upstream if source is client else client
+                    destination.sendall(data)
+        except OSError:
+            return
+        finally:
+            with self._connections_lock:
+                self._connections.difference_update(sockets)
+            for connection in sockets:
+                try:
+                    connection.close()
+                except OSError:
+                    pass
+
+    def assert_healthy(self) -> None:
+        if self.error is not None:
+            raise GateError(f"TCP-to-UDS bridge on port {self.port} failed: {self.error}")
+        if not self._thread.is_alive() and not self._stopping.is_set():
+            raise GateError(f"TCP-to-UDS bridge on port {self.port} exited")
+
+    def close(self) -> None:
+        if self._stopping.is_set():
+            return
+        self._stopping.set()
+        self._listener.close()
+        with self._connections_lock:
+            connections = tuple(self._connections)
+        for connection in connections:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            connection.close()
+        self._thread.join(timeout=2)
+        if self._thread.is_alive():
+            raise GateError(f"TCP-to-UDS bridge on port {self.port} did not stop")
 
 
 def reserve_ports(count: int) -> list[PortReservation]:
@@ -492,14 +588,11 @@ class ManagedProcess:
         cwd: Path,
         log_path: Path,
         secrets_to_redact: tuple[str, ...],
-        port_reservations: tuple[PortReservation, ...] = (),
     ) -> None:
         self.name = name
         self.log_path = log_path
         self.secrets = secrets_to_redact
         self._log = log_path.open("wb")
-        for reservation in port_reservations:
-            reservation.release()
         self.process = subprocess.Popen(
             command,
             cwd=cwd,
@@ -567,7 +660,15 @@ class ScenarioRuntime:
             (self.proxy_token, self.api_token, self.password),
         )
         self.processes: list[ManagedProcess] = []
+        self.bridges: list[TcpToUnixBridge] = []
         self.lingering_groups: set[int] = set()
+
+    def add_bridge(
+        self, reservation: PortReservation, unix_path: Path
+    ) -> TcpToUnixBridge:
+        bridge = TcpToUnixBridge(reservation, unix_path)
+        self.bridges.append(bridge)
+        return bridge
 
     def start_process(
         self,
@@ -575,7 +676,6 @@ class ScenarioRuntime:
         command: list[str],
         env: dict[str, str],
         cwd: Path,
-        port_reservations: tuple[PortReservation, ...] = (),
     ) -> ManagedProcess:
         process = ManagedProcess(
             name,
@@ -584,7 +684,6 @@ class ScenarioRuntime:
             cwd,
             self.root / f"{name}-{len(self.processes)}.log",
             self.secrets,
-            port_reservations,
         )
         self.processes.append(process)
         return process
@@ -621,12 +720,23 @@ class ScenarioRuntime:
             except ProcessLookupError:
                 pass
         wait_for("run-owned processes to exit", lambda: not self.leaked_pids(), timeout=10)
+        bridge_failures = []
+        for bridge in reversed(self.bridges):
+            try:
+                bridge.close()
+            except BaseException as error:
+                bridge_failures.append(str(error))
+        if bridge_failures:
+            raise GateError("; ".join(bridge_failures))
 
     def diagnostics(self) -> str:
         parts = []
         for process in self.processes:
             tail = process.tail() if not process._log.closed else "<log closed>"
             parts.append(f"--- {process.name} (pid {process.process.pid}) ---\n{tail}")
+        for bridge in self.bridges:
+            if bridge.error is not None:
+                parts.append(f"--- bridge {bridge.port} ---\n{bridge.error}")
         return "\n".join(parts)
 
 
@@ -644,7 +754,10 @@ class ExternalProxy:
         self.name = name
         self.public_port = public_port.port
         self.api_port = api_port.port
-        self._reservations = [public_port, api_port]
+        self.public_socket = runtime.root / f"{name}-public.sock"
+        self.api_socket = runtime.root / f"{name}-api.sock"
+        self.public_bridge = runtime.add_bridge(public_port, self.public_socket)
+        self.api_bridge = runtime.add_bridge(api_port, self.api_socket)
         self.route_key = route_key
         self.host_routing = host_routing
         self.process: ManagedProcess | None = None
@@ -662,11 +775,8 @@ class ExternalProxy:
         return {"Authorization": f"token {self.runtime.proxy_token}"}
 
     def start(self) -> None:
-        if not self._reservations:
-            self._reservations = [
-                PortReservation(self.public_port),
-                PortReservation(self.api_port),
-            ]
+        self.public_bridge.assert_healthy()
+        self.api_bridge.assert_healthy()
         env = os.environ.copy()
         env.update(
             {
@@ -677,14 +787,10 @@ class ExternalProxy:
         )
         command = [
             str(self.runtime.proxy_binary),
-            "--ip",
-            "127.0.0.1",
-            "--port",
-            str(self.public_port),
-            "--api-ip",
-            "127.0.0.1",
-            "--api-port",
-            str(self.api_port),
+            "--socket",
+            str(self.public_socket),
+            "--api-socket",
+            str(self.api_socket),
             "--storage-backend",
             self.runtime.backend,
         ]
@@ -695,12 +801,12 @@ class ExternalProxy:
             command,
             env,
             self.runtime.root,
-            tuple(self._reservations),
         )
-        self._reservations.clear()
 
         def ready() -> bool:
             assert self.process is not None
+            self.public_bridge.assert_healthy()
+            self.api_bridge.assert_healthy()
             if self.process.exited():
                 raise GateError(f"external proxy exited:\n{self.process.tail()}")
             import requests
@@ -769,11 +875,12 @@ class Hub:
         self.name = name
         self.proxy = proxy
         self.hub_port = hub_port.port
-        self._reservation: PortReservation | None = hub_port
         self.directory = directory
         self.subdomain = subdomain
         self.process: ManagedProcess | None = None
         directory.mkdir(parents=True)
+        self.hub_socket = directory / "hub.sock"
+        self.bridge = runtime.add_bridge(hub_port, self.hub_socket)
         self.config = directory / "jupyterhub_config.py"
         self._write_config()
 
@@ -792,6 +899,7 @@ class Hub:
 
     def _write_config(self) -> None:
         subdomain_host = self.public_url if self.subdomain else ""
+        hub_bind_url = f"unix+http://{quote(str(self.hub_socket), safe='')}"
         config = f"""\
 import os
 
@@ -804,7 +912,7 @@ c.Spawner.default_url = "/tree"
 c.Spawner.http_timeout = 30
 c.Spawner.start_timeout = 45
 c.JupyterHub.bind_url = {self.public_url + '/'!r}
-c.JupyterHub.hub_bind_url = {self.direct_url!r}
+c.JupyterHub.hub_bind_url = {hub_bind_url!r}
 c.JupyterHub.hub_connect_url = {self.direct_url!r}
 c.JupyterHub.db_url = {('sqlite:///' + str(self.directory / 'jupyterhub.sqlite'))!r}
 c.JupyterHub.cookie_secret_file = {str(self.directory / 'jupyterhub_cookie_secret')!r}
@@ -830,8 +938,7 @@ c.JupyterHub.subdomain_host = {subdomain_host!r}
         self.config.write_text(config, encoding="utf-8")
 
     def start(self) -> None:
-        if self._reservation is None:
-            self._reservation = PortReservation(self.hub_port)
+        self.bridge.assert_healthy()
         env = build_hub_environment(
             os.environ,
             {
@@ -849,12 +956,11 @@ c.JupyterHub.subdomain_host = {subdomain_host!r}
             ["jupyterhub", "-f", str(self.config)],
             env,
             self.directory,
-            (self._reservation,),
         )
-        self._reservation = None
 
         def ready() -> bool:
             assert self.process is not None
+            self.bridge.assert_healthy()
             if self.process.exited():
                 raise GateError(f"JupyterHub exited:\n{self.process.tail()}")
             import requests
@@ -880,7 +986,6 @@ c.JupyterHub.subdomain_host = {subdomain_host!r}
         assert self.process is not None
         self.runtime.lingering_groups.add(self.process.pgid)
         self.process.stop_parent_only()
-        self._reservation = PortReservation(self.hub_port)
 
     def stop_final(self) -> None:
         if self.process is not None and not self.process.exited():

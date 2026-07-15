@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -156,12 +157,16 @@ class HubStartupFenceTests(unittest.TestCase):
 
     def test_hub_config_disallows_background_spawner_initialization(self) -> None:
         with tempfile.TemporaryDirectory() as root:
+            def add_bridge(reservation, _unix_path):
+                reservation.release()
+                return SimpleNamespace()
+
             proxy = SimpleNamespace(
                 public_port=8000,
                 api_url="http://127.0.0.1:8001",
             )
             hub = HARNESS.Hub(
-                SimpleNamespace(),
+                SimpleNamespace(add_bridge=add_bridge),
                 "test-hub",
                 proxy,
                 HARNESS.PortReservation(),
@@ -173,7 +178,7 @@ class HubStartupFenceTests(unittest.TestCase):
 
 
 class PortReservationTests(unittest.TestCase):
-    def test_dynamic_reservation_uses_non_ephemeral_handoff_range(self) -> None:
+    def test_dynamic_reservation_uses_non_ephemeral_broker_range(self) -> None:
         reservation = HARNESS.PortReservation()
         try:
             self.assertGreaterEqual(reservation.port, 20_000)
@@ -215,32 +220,42 @@ class PortReservationTests(unittest.TestCase):
         self.addCleanup(reservation.release)
         self.assertEqual(reservation.port, port)
 
-    def test_managed_process_releases_reservations_at_popen_handoff(self) -> None:
-        events: list[str] = []
+    @unittest.skipUnless(hasattr(HARNESS.socket, "AF_UNIX"), "Unix sockets unavailable")
+    def test_tcp_to_unix_bridge_keeps_listener_and_forwards_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            unix_path = Path(root) / "backend.sock"
+            backend = HARNESS.socket.socket(HARNESS.socket.AF_UNIX, HARNESS.socket.SOCK_STREAM)
+            backend.bind(str(unix_path))
+            backend.listen(1)
+            backend.settimeout(2)
 
-        class Reservation:
-            def release(self) -> None:
-                events.append("release")
+            def echo() -> None:
+                connection, _ = backend.accept()
+                with connection:
+                    connection.sendall(connection.recv(4))
 
-        def launch(*_args, **_kwargs):
-            events.append("popen")
-            return SimpleNamespace(pid=123)
-
-        with tempfile.TemporaryDirectory() as root, mock.patch.object(
-            HARNESS.subprocess, "Popen", side_effect=launch
-        ):
-            process = HARNESS.ManagedProcess(
-                "test",
-                ["ignored"],
-                {},
-                Path(root),
-                Path(root) / "process.log",
-                (),
-                port_reservations=(Reservation(),),
-            )
-            process._log.close()
-
-        self.assertEqual(events, ["release", "popen"])
+            thread = threading.Thread(target=echo, daemon=True)
+            thread.start()
+            reservation = HARNESS.PortReservation()
+            bridge = HARNESS.TcpToUnixBridge(reservation, unix_path)
+            try:
+                with HARNESS.socket.create_connection(("127.0.0.1", reservation.port)) as client:
+                    client.sendall(b"ping")
+                    self.assertEqual(client.recv(4), b"ping")
+                contender = HARNESS.socket.socket(
+                    HARNESS.socket.AF_INET, HARNESS.socket.SOCK_STREAM
+                )
+                contender.setsockopt(
+                    HARNESS.socket.SOL_SOCKET, HARNESS.socket.SO_REUSEADDR, 1
+                )
+                with self.assertRaises(OSError):
+                    contender.bind(("127.0.0.1", reservation.port))
+                contender.close()
+            finally:
+                bridge.close()
+                backend.close()
+                thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
 
 
 class PersistenceTests(unittest.TestCase):
@@ -326,7 +341,12 @@ class BuildContextTests(unittest.TestCase):
         workspace = root / "workspace"
         workspace.mkdir()
         subprocess.run(["git", "init", "--quiet"], cwd=workspace, check=True)
-        for name in ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml"):
+        for name in (
+            "Cargo.toml",
+            "Cargo.lock",
+            "compose.test.yml",
+            "rust-toolchain.toml",
+        ):
             (workspace / name).write_text(f"tracked {name}\n", encoding="utf-8")
         for directory, file_name in (
             ("src", "lib.rs"),
@@ -411,6 +431,22 @@ class BuildContextTests(unittest.TestCase):
             self.assertEqual(
                 (destination / "src" / "lib.rs").read_text(encoding="utf-8"),
                 "tracked src/lib.rs\n",
+            )
+
+    def test_build_context_uses_head_compose_instead_of_dirty_control(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            workspace = self.make_workspace(Path(root))
+            (workspace / "compose.test.yml").write_text(
+                "dirty compose injection\n", encoding="utf-8"
+            )
+            destination = Path(root) / "context"
+            destination.mkdir()
+
+            HARNESS.copy_build_context(workspace, destination)
+
+            self.assertEqual(
+                (destination / "compose.test.yml").read_text(encoding="utf-8"),
+                "tracked compose.test.yml\n",
             )
 
     @unittest.skipUnless(hasattr(os, "symlink"), "symlinks are unavailable")
