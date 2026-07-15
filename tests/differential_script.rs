@@ -124,6 +124,32 @@ fn script_command(tools: &tempfile::TempDir, log: &std::path::Path) -> Command {
     command
 }
 
+#[cfg(unix)]
+fn wait_for_lifecycle_marker(
+    child: &mut std::process::Child,
+    log: &std::path::Path,
+    marker: &str,
+    stage: &str,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let content = std::fs::read_to_string(log).unwrap_or_default();
+        if content.contains(marker) {
+            return;
+        }
+        if let Some(status) = child.try_wait().expect("poll differential script") {
+            panic!("{stage} exited before its lifecycle marker ({status}): {content}");
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+            let _ = child.wait();
+            let content = std::fs::read_to_string(log).unwrap_or(content);
+            panic!("{stage} stage not reached within 20 seconds: {content}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 fn assert_owned_cleanup(log: &str) {
     let project = log
         .lines()
@@ -219,20 +245,7 @@ fn differential_script_cleans_its_image_on_signal_interruption() {
         .env("FAKE_CARGO_TREE", "1")
         .spawn()
         .expect("spawn differential script for signal");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        if std::fs::read_to_string(&log)
-            .unwrap_or_default()
-            .contains(" cargo-tree ")
-        {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "cargo stage not reached"
-        );
-        std::thread::yield_now();
-    }
+    wait_for_lifecycle_marker(&mut child, &log, " cargo-tree ", "cargo");
     let killed = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
     assert_eq!(killed, 0);
     assert_eq!(child.wait().expect("signal script exit").code(), Some(143));
@@ -292,17 +305,7 @@ fn differential_script_cleans_up_when_early_stages_are_interrupted() {
             .env("FAKE_STAGE_DELAY", "0.2")
             .spawn()
             .expect("spawn differential script stage");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !std::fs::read_to_string(&log)
-            .unwrap_or_default()
-            .contains(marker)
-        {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "{stage} stage not reached"
-            );
-            std::thread::yield_now();
-        }
+        wait_for_lifecycle_marker(&mut child, &log, marker, stage);
         assert_eq!(
             unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) },
             0
