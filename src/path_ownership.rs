@@ -1275,8 +1275,10 @@ fn random_private_name() -> io::Result<OsString> {
     let mut random = [0_u8; 16];
     openssl::rand::rand_bytes(&mut random)
         .map_err(|_| io::Error::other("could not generate a private cleanup name"))?;
-    let suffix: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
-    Ok(OsString::from(format!(".chp-cleanup-{suffix}")))
+    Ok(OsString::from(format!(
+        ".chp-cleanup-{}",
+        hex_suffix(&random)
+    )))
 }
 
 #[cfg(unix)]
@@ -1286,8 +1288,20 @@ fn random_stage_name() -> io::Result<OsString> {
     let mut random = [0_u8; 10];
     openssl::rand::rand_bytes(&mut random)
         .map_err(|_| io::Error::other("could not generate a private publication name"))?;
-    let suffix: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
-    Ok(OsString::from(format!(".chp-stage-{suffix}")))
+    Ok(OsString::from(format!(
+        ".chp-stage-{}",
+        hex_suffix(&random)
+    )))
+}
+
+fn hex_suffix(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut suffix = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut suffix, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    suffix
 }
 
 #[cfg(any(

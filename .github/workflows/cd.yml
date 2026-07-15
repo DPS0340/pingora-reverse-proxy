@@ -91,7 +91,7 @@ jobs:
           install -d -m 0700 "${DOCKER_CONFIG}"
           echo "${GHCR_TOKEN}" | timeout 30s docker login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
 
-      - name: Publish run-unique candidate manifest
+      - name: Publish bounded staging manifest
         id: publish_candidate
         shell: bash
         env:
@@ -99,15 +99,11 @@ jobs:
           RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
           VERIFIED_IMAGE_ID: ${{ steps.candidate.outputs.verified_image_id }}
           VERIFIED_SHA: ${{ github.event.workflow_run.head_sha }}
-          PUBLICATION_RUN_ID: ${{ github.run_id }}
-          PUBLICATION_RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -Eeuo pipefail
           image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${IMAGE_NAME}"
-          candidate_tag="candidate-${VERIFIED_SHA}-${PUBLICATION_RUN_ID}-${PUBLICATION_RUN_ATTEMPT}"
+          candidate_tag="candidate-staging"
           [[ ${VERIFIED_SHA} =~ ^[0-9a-f]{40}$ ]]
-          [[ ${PUBLICATION_RUN_ID} =~ ^[0-9]+$ ]]
-          [[ ${PUBLICATION_RUN_ATTEMPT} =~ ^[0-9]+$ ]]
 
           recheck_release_tag() {
             timeout 60s git fetch --force --no-tags origin \
@@ -127,9 +123,14 @@ jobs:
           }
 
           recheck_release_tag
+          push_output_file=$(mktemp "${RUNNER_TEMP}/candidate-push.XXXXXX")
+          trap 'rm -f -- "${push_output_file}"' EXIT
           timeout 30s docker image tag "${VERIFIED_IMAGE_ID}" "${image}:${candidate_tag}"
-          timeout 600s docker push "${image}:${candidate_tag}"
-          candidate_digest=$(remote_digest "${image}:${candidate_tag}")
+          timeout 600s docker push "${image}:${candidate_tag}" 2>&1 | tee "${push_output_file}"
+          candidate_digest=$(ruby scripts/extract-docker-push-digest.rb "${push_output_file}")
+          test "$(remote_digest "${image}@${candidate_digest}")" = "${candidate_digest}"
+          rm -f -- "${push_output_file}"
+          trap - EXIT
           {
             echo "image=${image}"
             echo "digest=${candidate_digest}"

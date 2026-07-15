@@ -1347,11 +1347,14 @@ fn unix_http(path: &Path, request: &[u8]) -> Vec<u8> {
 
 #[cfg(unix)]
 fn percent_encode_path(path: &Path) -> String {
-    path.as_os_str()
-        .as_encoded_bytes()
-        .iter()
-        .map(|byte| format!("%{byte:02X}"))
-        .collect()
+    use std::fmt::Write as _;
+
+    let bytes = path.as_os_str().as_encoded_bytes();
+    let mut encoded = String::with_capacity(bytes.len() * 3);
+    for byte in bytes {
+        write!(&mut encoded, "%{byte:02X}").expect("writing to a String cannot fail");
+    }
+    encoded
 }
 
 #[cfg(unix)]

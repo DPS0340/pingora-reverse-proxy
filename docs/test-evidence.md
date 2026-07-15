@@ -1082,9 +1082,10 @@ vulnerable direct/transitive graph, replaced `rustls-pemfile` parsing with the
 Pingora core shares Prometheus 0.14 instead of retaining the vulnerable
 protobuf 2 line. Pingora load balancing replaces `derivative` with manual
 `Backend` trait implementations that preserve the upstream rule that extension
-data is cloned and debug-visible but ignored by equality, ordering, and hashing;
-the root dev graph activates and directly tests the patched crate. The vendored OpenSSL name conversion uses the
-non-deprecated, interior-NUL-safe API. Production Rust 1.85 compatibility is
+data is cloned and debug-visible but ignored by equality, ordering, and hashing.
+Root regressions also prove that address and weight remain identity/hash inputs
+and that `PartialOrd` agrees with `Ord`. The vendored OpenSSL name conversion
+uses the non-deprecated, interior-NUL-safe API. Production Rust 1.85 compatibility is
 preserved by selecting `url 2.5.4`, `idna 1.0.3`, `idna_adapter 1.2.1`, and the
 compatible ICU4X 2.1 releases instead of the newer Rust-1.86-only graph.
 `webpki-roots` was safely unified on 1.0.8. The dynamic CHP oracle scripts were
@@ -1102,16 +1103,24 @@ fixture inode for a foreign replacement and turning an identity test into a
 false match; GitHub run `29401632373` exposed that test-only race.
 
 GHCR does not provide a conditional-create guarantee for the OCI manifest PUT
-used by this workflow. CD therefore treats SemVer and SHA tags as mutable
-discovery references rather than immutability boundaries. It attests the
-run-unique candidate digest before writing those references, treats every
-registry error as fatal instead of parsing error text as absence, and reports
-the digest and provenance as the only deployment identity.
+used by this workflow. CD therefore treats staging, SemVer, and SHA tags as
+mutable references rather than immutability boundaries. Publication uses one
+serialized, bounded `candidate-staging` transport tag, captures the manifest
+digest directly from the successful `docker push` result, verifies the
+digest-qualified identity, and never re-resolves the mutable candidate tag as a
+trust decision. It attests that digest before writing discovery references,
+treats every registry error as fatal instead of parsing error text as absence,
+and reports the digest and provenance as the only deployment identity.
+The fail-closed parser accepts exactly one canonical Docker push digest line;
+zero and multiple matches are executable negative tests. A Docker 27.5.1 push
+to a temporary local registry also produced a parser digest identical to the
+digest-qualified `buildx imagetools inspect` result, followed by complete test
+registry/container/tag cleanup.
 
-`cargo tree --locked -d` was reviewed after remediation. Fifteen duplicate
+`cargo tree --locked -d` was reviewed after remediation. Fourteen duplicate
 package families remain. They are incompatible published major/minor lines,
 not duplicate resolutions that Cargo can safely unify: Pingora 0.8.1 retains
-older `ahash`/`hashbrown`/`indexmap`, `bitflags`, `socket2`, `syn`, and
+older `hashbrown`/`indexmap`, `bitflags`, `socket2`, `syn`, and
 `thiserror` contracts while the application and current runtime crates require
 the newer lines; the `getrandom`/`rand`/`rand_chacha`/`rand_core` lines are
 split across Pingora and the current test/runtime ecosystem; and
@@ -1120,27 +1129,34 @@ lines. Removing another line would require changing a published upstream API,
 not a lockfile unification. The directly controllable `webpki-roots` duplicate
 was removed.
 
-The final pre-commit source tree ran `bash scripts/verify.sh` with logs in
-`.verification-logs/task14-final-pass3` and returned zero. The observed phase
-results were:
+The remediation worktree has passed the focused pre-commit checks below. These
+checks are implementation feedback, not release authorization:
 
-| Phase | Elapsed | Result |
-|---|---:|---|
-| `cargo fmt --all -- --check` | 0.0 s | PASS |
-| warnings-denied Clippy | 6.2 s | PASS |
-| all-target/all-feature tests and checks | 247.5 s | PASS, 403 Rust tests across 14 suites |
-| dedicated Node 20 / CHP 5.3.0 differential | 83.6 s | PASS, 35 scenarios plus the isolated launch-lock helper |
-| JupyterHub 5.5.0 clean Linux E2E | 801.1 s | PASS, 12 harness tests, the Linux ACL contract, and 18/18 scenarios on both memory and Redis |
-| production container build and smoke | 183.8 s | PASS on Rust 1.85.1, non-root shellless Debian slim runtime and OCI labels verified |
-| Helm render/policy checks | 2.9 s | PASS |
-| `cargo audit --deny warnings` | 0.8 s | PASS, 352 dependencies and zero findings |
-| `cargo deny check advisories licenses bans sources` | 1.1 s | PASS |
+| Check | Result |
+|---|---|
+| exact Rust 1.85.1 formatting and warnings-denied all-target/all-feature Clippy | PASS |
+| vendored `Backend` trait regressions | PASS, 2/2 |
+| TLS/Unix focused contract suite | PASS, 22/22 |
+| release policy, workflow schema, and push-digest parser contracts | PASS |
+| actual Docker push/parser/digest-qualified inspection and cleanup | PASS |
+| `cargo audit --deny warnings` | PASS, 351 dependencies and zero findings |
+| `cargo deny check advisories licenses bans sources` | PASS |
 
-The host-side run used `rustc/cargo 1.96.0`, Docker 27.5.1-rd with Compose
-2.33.0, Helm 3.17.1, Just 1.56.0, cargo-audit 0.22.2, and cargo-deny 0.20.2.
-The production image independently compiled with the repository's Rust 1.85.1
-MSRV. The clean Linux JupyterHub builder resolved its pinned stable toolchain
-and exercised JupyterHub 5.5.0 with Python 3.12.12.
+The immutable implementation commit must still pass `bash scripts/verify.sh` and
+exact-SHA GitHub Linux/macOS CI before release. Phase 03 sets
+`PROPTEST_CASES=4096`; the nine property runners therefore execute 36,864
+successful generated cases. Canonical phase logs and their exact commit metadata
+are external artifacts because a commit cannot embed its own SHA without
+changing that SHA. No table in this document substitutes for those exact-SHA
+artifacts.
+
+Project source builds, Clippy, and tests use exact Rust 1.85.1 from
+`rust-toolchain.toml`; CI rejects any other resolved compiler. CI builds the
+pinned Just 1.56.0, cargo-audit 0.22.2, and cargo-deny 0.20.2 binaries under a
+separate exact Rust 1.89.0 toolchain because those tool releases declare newer
+MSRVs, without changing the project compiler. Production and clean JupyterHub
+images independently verify Rust 1.85.1 before building; JupyterHub 5.5.0 runs
+with Python 3.12.12.
 
 A mechanical audit of CHP 5.3.0 `bin/configurable-http-proxy` lines 24–120 found
 48 long options and the compatibility matrix contains exactly the same 48:

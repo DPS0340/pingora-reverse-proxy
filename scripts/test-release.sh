@@ -49,6 +49,22 @@ for tag in "${invalid_tags[@]}"; do
   fi
 done
 
+push_digest=$(printf 'a%.0s' {1..64})
+printf 'The push refers to repository [example.invalid/image]\ncandidate-staging: digest: sha256:%s size: 1234\n' \
+  "$push_digest" >"$TMP_DIR/push-valid.log"
+test "$(ruby "$ROOT_DIR/scripts/extract-docker-push-digest.rb" "$TMP_DIR/push-valid.log")" = \
+  "sha256:$push_digest"
+printf 'push completed without a digest line\n' >"$TMP_DIR/push-missing.log"
+if ruby "$ROOT_DIR/scripts/extract-docker-push-digest.rb" "$TMP_DIR/push-missing.log" >/dev/null 2>&1; then
+  echo "missing Docker push digest was accepted" >&2
+  exit 1
+fi
+cat "$TMP_DIR/push-valid.log" "$TMP_DIR/push-valid.log" >"$TMP_DIR/push-ambiguous.log"
+if ruby "$ROOT_DIR/scripts/extract-docker-push-digest.rb" "$TMP_DIR/push-ambiguous.log" >/dev/null 2>&1; then
+  echo "ambiguous Docker push digests were accepted" >&2
+  exit 1
+fi
+
 mkdir -p "$TMP_DIR/archive/layer" "$TMP_DIR/archive/blobs/sha256"
 printf '{"architecture":"amd64","os":"linux"}\n' >"$TMP_DIR/archive/config.json"
 config_sha=$(sha256sum "$TMP_DIR/archive/config.json" | cut -d' ' -f1)
@@ -141,6 +157,8 @@ grep -Fq 'CONTAINER_GATE_IMAGE_ARCHIVE:' "$ROOT_DIR/.github/workflows/ci.yml"
 grep -Fq "run-id: \${{ github.event.workflow_run.id }}" "$ROOT_DIR/.github/workflows/cd.yml"
 grep -Fq "name: verified-image-\${{ github.event.workflow_run.head_sha }}" "$ROOT_DIR/.github/workflows/cd.yml"
 grep -Fq 'scripts/image-artifact.sh verify' "$ROOT_DIR/.github/workflows/cd.yml"
+grep -Fqx 'channel = "1.85.1"' "$ROOT_DIR/rust-toolchain.toml"
+grep -Fq 'PROPTEST_CASES=4096' "$ROOT_DIR/scripts/verify.sh"
 ruby -ryaml - "$ROOT_DIR/.github/workflows/ci.yml" "$ROOT_DIR/.github/workflows/cd.yml" <<'RUBY'
 def assert(condition, message)
   raise message unless condition
@@ -160,14 +178,33 @@ assert(linux_env.fetch('CONTAINER_GATE_IMAGE_METADATA') == metadata,
 linux_steps = linux.fetch('steps')
 install_index = linux_steps.index { |step| step['name'] == 'Install actionlint' }
 lint_index = linux_steps.index { |step| step['name'] == 'Check workflow schemas' }
+tools_index = linux_steps.index { |step| step['name'] == 'Install native and release-gate tools' }
 verify_index = linux_steps.index { |step| step['name'] == 'Run authoritative release gate' }
-assert(install_index && lint_index && verify_index && install_index < lint_index && lint_index < verify_index,
-       'checksum-pinned workflow schema checking must run before the authoritative release gate')
+assert(install_index && lint_index && tools_index && verify_index &&
+       install_index < lint_index && lint_index < tools_index && tools_index < verify_index,
+       'schema checking and exact release-tool installation must precede the authoritative gate')
 install_script = linux_steps.fetch(install_index).fetch('run')
 assert(install_script.include?('actionlint_1.7.12_linux_amd64.tar.gz'),
        'actionlint install must pin the Linux amd64 v1.7.12 archive')
 assert(install_script.include?('8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8'),
        'actionlint archive checksum must match the official v1.7.12 release')
+tools_script = linux_steps.fetch(tools_index).fetch('run')
+assert(tools_script.include?('rustup toolchain install 1.85.1 --profile minimal --component clippy,rustfmt') &&
+       tools_script.include?('rustup toolchain install 1.89.0 --profile minimal') &&
+       tools_script.include?('cargo +1.89.0 install --locked --version 1.56.0 just') &&
+       tools_script.include?('cargo +1.89.0 install --locked --version 0.22.2 cargo-audit') &&
+       tools_script.include?('cargo +1.89.0 install --locked --version 0.20.2 cargo-deny'),
+       'release tools with newer MSRVs must build under an exact isolated toolchain')
+linux_toolchain = linux_steps.find { |step| step['name'] == 'Record resolved Rust toolchain' }.fetch('run')
+assert(linux_toolchain.include?('rustc 1.85.1 (4eb161250 2025-03-15)'),
+       'authoritative Linux source gate must reject any compiler other than Rust 1.85.1')
+macos_steps = ci.fetch('jobs').fetch('rust-macos').fetch('steps')
+macos_install = macos_steps.find { |step| step['name'] == 'Install required native tools' }.fetch('run')
+assert(macos_install.include?('rustup toolchain install 1.85.1 --profile minimal --component clippy,rustfmt'),
+       'fresh macOS runners must install the exact project toolchain before source checks')
+macos_toolchain = macos_steps.find { |step| step['name'] == 'Record resolved Rust toolchain' }.fetch('run')
+assert(macos_toolchain.include?('rustc 1.85.1 (4eb161250 2025-03-15)'),
+       'macOS source checks must reject any compiler other than Rust 1.85.1')
 assert(linux_steps.fetch(lint_index).fetch('run').include?('actionlint .github/workflows/ci.yml .github/workflows/cd.yml'),
        'authoritative workflow schema check must cover CI and CD')
 
@@ -194,7 +231,7 @@ assert(candidate_script.include?('${RUNNER_TEMP}/pingora-verified-image/image.ta
        candidate_script.include?('${RUNNER_TEMP}/pingora-verified-image/metadata.env'),
        'CD verification must consume the downloaded archive and metadata paths')
 
-candidate_publish_index = publish_steps.index { |step| step['name'] == 'Publish run-unique candidate manifest' }
+candidate_publish_index = publish_steps.index { |step| step['name'] == 'Publish bounded staging manifest' }
 attest_index = publish_steps.index { |step| step['name'] == 'Attest candidate image provenance' }
 promotion_index = publish_steps.index { |step| step['name'] == 'Publish attested digest to release discovery tags' }
 cleanup_index = publish_steps.index { |step| step['name'] == 'Clean up registry credentials' }
@@ -208,12 +245,17 @@ candidate_publish_env = candidate_publish.fetch('env')
 attest = publish_steps.fetch(attest_index)
 promotion_script = publish_steps.fetch(promotion_index).fetch('run')
 cleanup = publish_steps.fetch(cleanup_index)
-assert(candidate_publish_env.fetch('PUBLICATION_RUN_ID') == '${{ github.run_id }}' &&
-       candidate_publish_env.fetch('PUBLICATION_RUN_ATTEMPT') == '${{ github.run_attempt }}',
-       'candidate identity must change when the CD workflow itself is rerun')
-assert(candidate_publish_script.include?('candidate-${VERIFIED_SHA}-${PUBLICATION_RUN_ID}-${PUBLICATION_RUN_ATTEMPT}') &&
-       candidate_publish_script.include?('docker push "${image}:${candidate_tag}"'),
-       'candidate publication must be unique per CD workflow attempt')
+assert(!candidate_publish_env.key?('PUBLICATION_RUN_ID') &&
+       !candidate_publish_env.key?('PUBLICATION_RUN_ATTEMPT'),
+       'serialized publication must not create an unbounded candidate tag per workflow attempt')
+assert(candidate_publish_script.include?('candidate_tag="candidate-staging"') &&
+       candidate_publish_script.include?('docker push "${image}:${candidate_tag}" 2>&1 | tee "${push_output_file}"'),
+       'candidate publication must reuse one bounded internal staging tag and retain push output')
+assert(candidate_publish_script.include?('candidate_digest=$(ruby') &&
+       candidate_publish_script.include?('scripts/extract-docker-push-digest.rb "${push_output_file}"') &&
+       candidate_publish_script.include?('"${image}@${candidate_digest}"') &&
+       !candidate_publish_script.include?('remote_digest "${image}:${candidate_tag}"'),
+       'attested digest must come directly from the successful push result and be verified by digest')
 assert(!candidate_publish_script.include?('require_absent_tag "${image}:${VERSION_TAG}"') &&
        !candidate_publish_script.include?('require_absent_tag "${image}:${sha_tag}"'),
        'a rerun must reach idempotent promotion after a partially completed prior promotion')
@@ -253,4 +295,4 @@ if grep -Eh '^[[:space:]]*uses:' "$ROOT_DIR/.github/workflows/ci.yml" "$ROOT_DIR
   exit 1
 fi
 
-printf 'release gate passed: strict SemVer, run-unique candidate, exact archive identity, provenance-before-discovery-tags, digest verification, and no rebuild\n'
+printf 'release gate passed: strict SemVer, bounded staging publication, push-result digest capture, exact archive identity, provenance-before-discovery-tags, digest verification, and no rebuild\n'

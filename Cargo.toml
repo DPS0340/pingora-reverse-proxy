@@ -30,7 +30,7 @@ rustls-pki-types = "1"
 rustix = { version = "1", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-socket2 = "0.5.7"
+socket2 = { version = "0.5.7", features = ["all"] }
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-openssl = "0.6"
@@ -46,7 +46,7 @@ proptest = "1.7"
 serial_test = "3"
 tempfile = "3"
 tokio-tungstenite = "0.27"
-wiremock = "0.6"
+wiremock = "=0.6.4"
 
 [patch.crates-io]
 pingora-core = { path = "vendor/pingora-core-0.8.1" }

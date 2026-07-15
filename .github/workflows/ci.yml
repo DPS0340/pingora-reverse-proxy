@@ -49,10 +49,11 @@ jobs:
           set -Eeuo pipefail
           timeout 300s sudo apt-get update
           timeout 300s sudo apt-get install -y --no-install-recommends clang cmake libclang-dev libssl-dev pkg-config ruby
-          timeout 300s rustup component add clippy rustfmt
-          timeout 1200s cargo install --locked --version 1.56.0 just
-          timeout 1200s cargo install --locked --version 0.22.2 cargo-audit
-          timeout 1200s cargo install --locked --version 0.20.2 cargo-deny
+          timeout 300s rustup toolchain install 1.85.1 --profile minimal --component clippy,rustfmt
+          timeout 300s rustup toolchain install 1.89.0 --profile minimal
+          timeout 1200s cargo +1.89.0 install --locked --version 1.56.0 just
+          timeout 1200s cargo +1.89.0 install --locked --version 0.22.2 cargo-audit
+          timeout 1200s cargo +1.89.0 install --locked --version 0.20.2 cargo-deny
           curl --fail --location --silent --show-error --max-time 60 \
             --output /tmp/helm.tar.gz https://get.helm.sh/helm-v3.18.3-linux-amd64.tar.gz
           echo '6ec85f306dd8fe9eb05c61ba4593182b2afcfefb52f21add3fe043ebbdc48e39  /tmp/helm.tar.gz' | sha256sum --check
@@ -61,7 +62,11 @@ jobs:
 
       - name: Record resolved Rust toolchain
         id: linux-toolchain
-        run: echo "rustc=$(timeout 15s rustc --version | sha256sum | cut -d' ' -f1)" >> "${GITHUB_OUTPUT}"
+        run: |
+          resolved_rustc=$(timeout 15s rustc --version)
+          test "${resolved_rustc}" = 'rustc 1.85.1 (4eb161250 2025-03-15)'
+          printf '%s\n' "${resolved_rustc}"
+          printf 'rustc=%s\n' "$(printf '%s' "${resolved_rustc}" | sha256sum | cut -d' ' -f1)" >> "${GITHUB_OUTPUT}"
 
       - name: Cache locked Cargo inputs and outputs
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
@@ -117,11 +122,15 @@ jobs:
         run: |
           set -Eeuo pipefail
           python3 -c 'import subprocess; subprocess.run(["brew", "install", "cmake", "coreutils", "openssl@3", "pkg-config"], check=True, timeout=1200)'
-          gtimeout 300s rustup component add clippy rustfmt
+          gtimeout 300s rustup toolchain install 1.85.1 --profile minimal --component clippy,rustfmt
 
       - name: Record resolved Rust toolchain
         id: macos-toolchain
-        run: echo "rustc=$(gtimeout 15s rustc --version | shasum -a 256 | cut -d' ' -f1)" >> "${GITHUB_OUTPUT}"
+        run: |
+          resolved_rustc=$(gtimeout 15s rustc --version)
+          test "${resolved_rustc}" = 'rustc 1.85.1 (4eb161250 2025-03-15)'
+          printf '%s\n' "${resolved_rustc}"
+          printf 'rustc=%s\n' "$(printf '%s' "${resolved_rustc}" | shasum -a 256 | cut -d' ' -f1)" >> "${GITHUB_OUTPUT}"
 
       - name: Cache locked Cargo inputs and outputs
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3

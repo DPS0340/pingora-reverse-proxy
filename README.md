@@ -50,7 +50,8 @@ The public proxy, management API, and metrics endpoint use separate listeners. B
 
 ## Requirements
 
-- Rust 1.85 or newer, as pinned in [`rust-toolchain.toml`](rust-toolchain.toml)
+- Rust 1.85.1, exactly pinned in [`rust-toolchain.toml`](rust-toolchain.toml) for source builds and tests
+- CI builds newer-MSRV release tools under a separate exact Rust 1.89.0 toolchain; those binaries do not change the project compiler
 - a C/C++ build toolchain
 - CMake and OpenSSL development headers
 - Git

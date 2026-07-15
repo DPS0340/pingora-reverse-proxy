@@ -2181,7 +2181,7 @@ fn docker_unix_http_blocking(
     path: &str,
     body: &[u8],
 ) -> RawHttpObservation {
-    let hex: String = body.iter().map(|byte| format!("{byte:02x}")).collect();
+    let hex = encode_hex(body);
     let output = Command::new("docker")
         .args([
             "exec", container, "node", "-e",
@@ -2217,6 +2217,17 @@ fn docker_unix_http_blocking(
     }
     let body = decode_hex(envelope["body"].as_str().expect("CHP Unix body hex"));
     (status, headers, body)
+}
+
+#[cfg(unix)]
+fn encode_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut hex, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    hex
 }
 
 #[cfg(unix)]
