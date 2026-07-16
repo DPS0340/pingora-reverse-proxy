@@ -1,63 +1,432 @@
-name: Build and push container image
+name: Publish verified container
+
 on:
-  push:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pingora-container-publication
+  cancel-in-progress: false
 
 env:
   IMAGE_NAME: pingora-reverse-proxy
 
-permissions:
-  pages: write
-  contents: write
-  packages: write
-  id-token: write
-
 jobs:
-  build-and-push-container-image:
+  rebuild-candidate:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
     steps:
-      - name: checkout
-        uses: actions/checkout@v2
-
-      - name: Build image
-        run: docker build . --file Dockerfile --tag $IMAGE_NAME --label "runnumber=${GITHUB_RUN_ID}"
-
-      - name: Log in to registry
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u $ --password-stdin
-
-      - name: Push image
-        run: |
-          IMAGE_ID=ghcr.io/${{ github.repository_owner }}/$IMAGE_NAME
-          IMAGE_ID=$(echo $IMAGE_ID | tr '[A-Z]' '[a-z]')
-          VERSION=$(echo "${{ github.ref }}" | sed -e 's,.*/\(.*\),\1,')
-
-          VERSION=latest
-          echo IMAGE_ID=$IMAGE_ID
-          echo VERSION=$VERSION
-
-          docker tag $IMAGE_NAME $IMAGE_ID:$VERSION
-          docker push $IMAGE_ID:$VERSION
-
-  deploy-github-pages:
-    runs-on: ubuntu-24.04
-    needs: build-and-push-container-image
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: checkout
-        uses: actions/checkout@v2
-
-      - name: tar & index helm chart
-        run: |
-          helm package ./helm-chart
-          helm repo index ./
-
-      - name: Upload GitHub Pages artifact
-        uses: actions/upload-pages-artifact@v3.0.1
+      - name: Check out immutable rebuild controls
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          path: ./
+          ref: ${{ github.workflow_sha }}
+          path: publication-control
+          persist-credentials: false
 
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+      - name: Check out candidate source without credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          path: candidate
+          persist-credentials: false
 
+      - name: Authorize exact candidate source for trusted rebuild
+        shell: bash
+        env:
+          TRUSTED_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          VERIFIED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -Eeuo pipefail
+          [[ ${VERIFIED_SHA} =~ ^[0-9a-f]{40}$ ]]
+          git check-ref-format --branch "${TRUSTED_DEFAULT_BRANCH}" >/dev/null
+          default_ref="refs/remotes/origin/${TRUSTED_DEFAULT_BRANCH}"
+          git -C candidate show-ref --verify --quiet "${default_ref}"
+          test "$(git -C candidate rev-parse HEAD)" = "${VERIFIED_SHA}"
+          git -C candidate merge-base --is-ancestor \
+            "${VERIFIED_SHA}" "${default_ref}"
+
+      - name: Rebuild and test exact candidate with trusted controls
+        shell: bash
+        env:
+          CONTAINER_GATE_IMAGE_ARCHIVE: ${{ runner.temp }}/trusted-rebuilt-image/image.tar
+          CONTAINER_GATE_IMAGE_METADATA: ${{ runner.temp }}/trusted-rebuilt-image/metadata.env
+          CONTAINER_GATE_SOURCE_ROOT: ${{ github.workspace }}/candidate
+          CONTAINER_GATE_SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+          CONTAINER_GATE_WORKFLOW_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -Eeuo pipefail
+          install -d -m 0700 "${RUNNER_TEMP}/trusted-rebuilt-image"
+          publication-control/scripts/test-container.sh
+
+      - name: Upload trusted rebuilt image
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: trusted-rebuilt-image-${{ github.event.workflow_run.head_sha }}
+          path: ${{ runner.temp }}/trusted-rebuilt-image
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  publish:
+    needs: rebuild-candidate
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+      packages: write
+    steps:
+      - name: Check out immutable publication controls
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: publication-control
+          persist-credentials: false
+
+      - name: Check out verified candidate without credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          fetch-tags: true
+          path: candidate
+          persist-credentials: false
+
+      - name: Authorize candidate from trusted default-branch history
+        shell: bash
+        env:
+          TRUSTED_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          VERIFIED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -Eeuo pipefail
+          [[ ${VERIFIED_SHA} =~ ^[0-9a-f]{40}$ ]]
+          git check-ref-format --branch "${TRUSTED_DEFAULT_BRANCH}" >/dev/null
+          default_ref="refs/remotes/origin/${TRUSTED_DEFAULT_BRANCH}"
+          git -C candidate show-ref --verify --quiet "${default_ref}"
+          test "$(git -C candidate rev-parse HEAD)" = "${VERIFIED_SHA}"
+          git -C candidate merge-base --is-ancestor \
+            "${VERIFIED_SHA}" "${default_ref}"
+
+      - name: Install pinned attestation verifier
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          archive="${RUNNER_TEMP}/gh_2.95.0_linux_amd64.tar.gz"
+          extracted="${RUNNER_TEMP}/gh_2.95.0_linux_amd64"
+          curl --fail --location --silent --show-error --max-time 60 \
+            --output "${archive}" \
+            https://github.com/cli/cli/releases/download/v2.95.0/gh_2.95.0_linux_amd64.tar.gz
+          echo "25d1e4729e8808c9ed3d613e96ebd3f3e44446f2d368c89d878a71a36ddb3d8c  ${archive}" | sha256sum --check
+          timeout 30s tar -xzf "${archive}" -C "${RUNNER_TEMP}"
+          timeout 30s sudo install -m 0755 "${extracted}/bin/gh" /usr/local/bin/gh
+          test "$(gh --version | head -n 1)" = "gh version 2.95.0 (2026-06-17)"
+          rm -rf -- "${archive}" "${extracted}"
+
+      - name: Select one strict SemVer release tag
+        id: release
+        shell: bash
+        working-directory: candidate
+        env:
+          VERIFIED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -Eeuo pipefail
+          [[ ${VERIFIED_SHA} =~ ^[0-9a-f]{40}$ ]]
+          mapfile -t tags_at_sha < <(git tag --points-at "${VERIFIED_SHA}")
+          release_tags=()
+          for tag in "${tags_at_sha[@]}"; do
+            if ruby ../publication-control/scripts/release-policy.rb "${tag}" >/dev/null 2>&1; then
+              release_tags+=("${tag}")
+            fi
+          done
+          if (( ${#release_tags[@]} != 1 )); then
+            echo "expected exactly one release tag on verified commit" >&2
+            exit 1
+          fi
+          ruby ../publication-control/scripts/release-policy.rb "${release_tags[0]}" >> "${GITHUB_OUTPUT}"
+
+      - name: Download exact trusted rebuilt image
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: trusted-rebuilt-image-${{ github.event.workflow_run.head_sha }}
+          path: ${{ runner.temp }}/pingora-verified-image
+
+      - name: Verify and load the tested image bytes
+        id: candidate
+        shell: bash
+        env:
+          VERIFIED_SHA: ${{ github.event.workflow_run.head_sha }}
+          VERIFIED_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -Eeuo pipefail
+          publication-control/scripts/image-artifact.sh verify \
+            "${RUNNER_TEMP}/pingora-verified-image/image.tar" \
+            "${RUNNER_TEMP}/pingora-verified-image/metadata.env" \
+            "${VERIFIED_SHA}" \
+            "${VERIFIED_RUN_ID}" | tee "${RUNNER_TEMP}/pingora-verified-image/verification.log"
+          grep -E '^verified_image_id=sha256:[0-9a-f]{64}$' \
+            "${RUNNER_TEMP}/pingora-verified-image/verification.log" >> "${GITHUB_OUTPUT}"
+
+      - name: Authenticate to GHCR
+        shell: bash
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/pingora-docker-config
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          install -d -m 0700 "${DOCKER_CONFIG}"
+          echo "${GHCR_TOKEN}" | timeout 30s docker login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Publish bounded staging manifest
+        id: publish_candidate
+        shell: bash
+        working-directory: candidate
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/pingora-docker-config
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+          VERIFIED_IMAGE_ID: ${{ steps.candidate.outputs.verified_image_id }}
+          VERIFIED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -Eeuo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${IMAGE_NAME}"
+          candidate_tag="candidate-staging"
+          [[ ${VERIFIED_SHA} =~ ^[0-9a-f]{40}$ ]]
+
+          recheck_release_tag() {
+            timeout 60s git fetch --force --no-tags origin \
+              "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+            test "$(git rev-list -n 1 "${RELEASE_TAG}")" = "${VERIFIED_SHA}"
+          }
+
+          remote_digest() {
+            local reference=$1 output
+            output=$(timeout 60s docker buildx imagetools inspect \
+              "${reference}" --format '{{json .Manifest}}')
+            ruby -rjson -e '
+              digest = JSON.parse(STDIN.read).fetch("digest")
+              abort "invalid remote digest" unless /\Asha256:[0-9a-f]{64}\z/.match?(digest)
+              puts digest
+            ' <<<"${output}"
+          }
+
+          recheck_release_tag
+          push_output_file=$(mktemp "${RUNNER_TEMP}/candidate-push.XXXXXX")
+          trap 'rm -f -- "${push_output_file}"' EXIT
+          timeout 30s docker image tag "${VERIFIED_IMAGE_ID}" "${image}:${candidate_tag}"
+          timeout 600s docker push "${image}:${candidate_tag}" 2>&1 | tee "${push_output_file}"
+          candidate_digest=$(ruby ../publication-control/scripts/extract-docker-push-digest.rb "${push_output_file}")
+          test "$(remote_digest "${image}@${candidate_digest}")" = "${candidate_digest}"
+          rm -f -- "${push_output_file}"
+          trap - EXIT
+          {
+            echo "image=${image}"
+            echo "digest=${candidate_digest}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Create trusted candidate provenance predicate
+        id: provenance
+        shell: bash
+        env:
+          CANDIDATE_SHA: ${{ github.event.workflow_run.head_sha }}
+          CI_WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
+          CONTROL_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -Eeuo pipefail
+          [[ ${CANDIDATE_SHA} =~ ^[0-9a-f]{40}$ ]]
+          [[ ${CONTROL_SHA} =~ ^[0-9a-f]{40}$ ]]
+          predicate="${RUNNER_TEMP}/candidate-provenance.json"
+          ruby -rjson -e '
+            path, repository, candidate, control, ci_run_id, run_id, run_attempt = ARGV
+            predicate = {
+              "buildDefinition" => {
+                "buildType" => "https://github.com/#{repository}/.github/workflows/ci.yml@#{candidate}",
+                "externalParameters" => {
+                  "candidate_sha" => candidate,
+                  "ci_workflow_run_id" => ci_run_id,
+                },
+                "internalParameters" => {"publication_control_sha" => control},
+                "resolvedDependencies" => [{
+                  "uri" => "git+https://github.com/#{repository}.git",
+                  "digest" => {"gitCommit" => candidate},
+                }],
+              },
+              "runDetails" => {
+                "builder" => {
+                  "id" => "https://github.com/#{repository}/.github/workflows/cd.yml@#{control}",
+                },
+                "metadata" => {
+                  "invocationId" => "https://github.com/#{repository}/actions/runs/#{run_id}/attempts/#{run_attempt}",
+                },
+              },
+            }
+            File.write(path, JSON.generate(predicate))
+          ' "${predicate}" "${GITHUB_REPOSITORY}" "${CANDIDATE_SHA}" "${CONTROL_SHA}" \
+            "${CI_WORKFLOW_RUN_ID}" "${GITHUB_RUN_ID}" "${GITHUB_RUN_ATTEMPT}"
+          echo "predicate=${predicate}" >>"${GITHUB_OUTPUT}"
+
+      - name: Attest candidate image provenance
+        id: attest
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/pingora-docker-config
+        with:
+          subject-name: ${{ steps.publish_candidate.outputs.image }}
+          subject-digest: ${{ steps.publish_candidate.outputs.digest }}
+          predicate-type: https://slsa.dev/provenance/v1
+          predicate-path: ${{ steps.provenance.outputs.predicate }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Verify candidate image provenance
+        shell: bash
+        env:
+          ATTESTED_DIGEST: ${{ steps.publish_candidate.outputs.digest }}
+          DOCKER_CONFIG: ${{ runner.temp }}/pingora-docker-config
+          EXPECTED_CANDIDATE_SHA: ${{ github.event.workflow_run.head_sha }}
+          EXPECTED_CONTROL_SHA: ${{ github.workflow_sha }}
+          EXPECTED_CI_RUN_ID: ${{ github.event.workflow_run.id }}
+          GH_TOKEN: ${{ github.token }}
+          PUBLISHED_IMAGE: ${{ steps.publish_candidate.outputs.image }}
+        run: |
+          set -Eeuo pipefail
+          [[ ${ATTESTED_DIGEST} =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ ${EXPECTED_CANDIDATE_SHA} =~ ^[0-9a-f]{40}$ ]]
+          [[ ${EXPECTED_CONTROL_SHA} =~ ^[0-9a-f]{40}$ ]]
+          subject="oci://${PUBLISHED_IMAGE}@${ATTESTED_DIGEST}"
+          signer="${GITHUB_REPOSITORY}/.github/workflows/cd.yml"
+          verification_output=$(mktemp "${RUNNER_TEMP}/attestation-verification.XXXXXX")
+          trap 'rm -f -- "${verification_output}"' EXIT
+          for attempt in 1 2 3 4 5 6; do
+            if timeout 60s gh attestation verify "${subject}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --signer-workflow "${signer}" \
+              --signer-digest "${EXPECTED_CONTROL_SHA}" \
+              --source-digest "${EXPECTED_CONTROL_SHA}" \
+              --predicate-type https://slsa.dev/provenance/v1 \
+              --bundle-from-oci \
+              --format json >"${verification_output}"; then
+              ruby -rjson -e '
+                results = JSON.parse(File.read(ARGV.fetch(0)))
+                candidate, control, ci_run_id, repository = ARGV.drop(1)
+                expected_builder = "https://github.com/#{repository}/.github/workflows/cd.yml@#{control}"
+                matching = Array(results).select do |result|
+                  statement = result.dig("verificationResult", "statement")
+                  next false unless statement.is_a?(Hash)
+                  predicate = statement["predicate"]
+                  next false unless statement["predicateType"] == "https://slsa.dev/provenance/v1" && predicate.is_a?(Hash)
+                  definition = predicate["buildDefinition"] || {}
+                  details = predicate["runDetails"] || {}
+                  dependencies = Array(definition["resolvedDependencies"])
+                  dependencies.any? { |dependency| dependency.dig("digest", "gitCommit") == candidate } &&
+                    definition.dig("externalParameters", "candidate_sha") == candidate &&
+                    definition.dig("externalParameters", "ci_workflow_run_id").to_s == ci_run_id &&
+                    definition.dig("internalParameters", "publication_control_sha") == control &&
+                    details.dig("builder", "id") == expected_builder
+                end
+                abort "no exact candidate/control provenance attestation" if matching.empty?
+              ' "${verification_output}" "${EXPECTED_CANDIDATE_SHA}" \
+                "${EXPECTED_CONTROL_SHA}" "${EXPECTED_CI_RUN_ID}" "${GITHUB_REPOSITORY}"
+              exit 0
+            fi
+            if [[ ${attempt} -eq 6 ]]; then
+              echo "candidate provenance verification failed after ${attempt} attempts" >&2
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
+
+      - name: Publish attested digest to release discovery tags
+        id: promote
+        shell: bash
+        working-directory: candidate
+        env:
+          ATTESTED_DIGEST: ${{ steps.publish_candidate.outputs.digest }}
+          DOCKER_CONFIG: ${{ runner.temp }}/pingora-docker-config
+          PUBLISHED_IMAGE: ${{ steps.publish_candidate.outputs.image }}
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+          VERSION_TAG: ${{ steps.release.outputs.docker_tag }}
+          VERIFIED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -Eeuo pipefail
+          image="${PUBLISHED_IMAGE}"
+          sha_tag="sha-${VERIFIED_SHA}"
+          [[ ${VERIFIED_SHA} =~ ^[0-9a-f]{40}$ ]]
+          [[ ${ATTESTED_DIGEST} =~ ^sha256:[0-9a-f]{64}$ ]]
+
+          recheck_release_tag() {
+            timeout 60s git fetch --force --no-tags origin \
+              "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+            test "$(git rev-list -n 1 "${RELEASE_TAG}")" = "${VERIFIED_SHA}"
+          }
+
+          remote_digest() {
+            local reference=$1 output
+            output=$(timeout 60s docker buildx imagetools inspect \
+              "${reference}" --format '{{json .Manifest}}')
+            ruby -rjson -e '
+              digest = JSON.parse(STDIN.read).fetch("digest")
+              abort "invalid remote digest" unless /\Asha256:[0-9a-f]{64}\z/.match?(digest)
+              puts digest
+            ' <<<"${output}"
+          }
+
+          publish_discovery_tag() {
+            local reference=$1 metadata_file promotion_digest
+            metadata_file=$(mktemp "${RUNNER_TEMP}/promotion-metadata.XXXXXX")
+            timeout 120s docker buildx imagetools create \
+              --prefer-index=false \
+              --tag "${reference}" \
+              --metadata-file "${metadata_file}" \
+              "${image}@${ATTESTED_DIGEST}"
+            promotion_digest=$(ruby -rjson -e \
+              'puts JSON.parse(File.read(ARGV.fetch(0))).fetch("containerimage.descriptor").fetch("digest")' \
+              "${metadata_file}")
+            rm -f "${metadata_file}"
+            test "${promotion_digest}" = "${ATTESTED_DIGEST}"
+            test "$(remote_digest "${reference}")" = "${ATTESTED_DIGEST}"
+          }
+
+          recheck_release_tag
+          publish_discovery_tag "${image}:${VERSION_TAG}"
+          publish_discovery_tag "${image}:${sha_tag}"
+          {
+            echo "version_ref=${image}:${VERSION_TAG}"
+            echo "sha_ref=${image}:${sha_tag}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Report digest and provenance
+        shell: bash
+        run: |
+          {
+            echo "Release: ${{ steps.release.outputs.release_tag }}"
+            echo "Verified source: ${{ github.event.workflow_run.head_sha }}"
+            echo "Published digest: ${{ steps.publish_candidate.outputs.digest }}"
+            echo "Version ref: ${{ steps.promote.outputs.version_ref }}"
+            echo "Commit ref: ${{ steps.promote.outputs.sha_ref }}"
+            echo "Attestation: ${{ steps.attest.outputs.attestation-url }}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Clean up registry credentials
+        if: ${{ always() }}
+        shell: bash
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/pingora-docker-config
+        run: |
+          timeout 30s docker logout ghcr.io >/dev/null 2>&1 || true
+          rm -rf -- "${DOCKER_CONFIG}"

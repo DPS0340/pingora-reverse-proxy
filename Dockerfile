@@ -1,22 +1,47 @@
-FROM debian:latest as builder
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 
-ARG BUILDARCH
-RUN apt-get -qq update \
-    && apt-get -qq install -y --no-install-recommends \
-       gcc g++ libfindbin-libs-perl \
-       make cmake libclang-dev git \
-       wget curl gnupg ca-certificates lsb-release \
-    && wget --no-check-certificate -O - https://openresty.org/package/pubkey.gpg | gpg --dearmor -o /usr/share/keyrings/openresty.gpg \
-    && if [ "${BUILDARCH}" = "arm64" ]; then URL="http://openresty.org/package/arm64/debian"; else URL="http://openresty.org/package/debian"; fi \
-    && echo "deb [arch=$BUILDARCH signed-by=/usr/share/keyrings/openresty.gpg] ${URL} $(lsb_release -sc) openresty" | tee /etc/apt/sources.list.d/openresty.list > /dev/null \
-    && apt-get -qq update \
-    && apt-get -qq install -y openresty --no-install-recommends
+FROM rust:1.85-bookworm@sha256:e51d0265072d2d9d5d320f6a44dde6b9ef13653b035098febd68cce8fa7c0bc4 AS builder
 
-RUN curl https://sh.rustup.rs -sSf | sh -s -- -y
-ENV PATH="/root/.cargo/bin:${PATH}"
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        clang cmake libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /var/opt/pingora
-COPY . .
-RUN cargo build
+ENV RUSTUP_TOOLCHAIN=1.85.1
+RUN test "$(rustc --version)" = "rustc 1.85.1 (4eb161250 2025-03-15)"
 
-ENTRYPOINT ["/var/opt/pingora/target/debug/pingora-reverse-proxy"]
+WORKDIR /build
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY vendor ./vendor
+COPY src ./src
+RUN --mount=type=cache,id=pingora-release-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=pingora-release-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=pingora-release-target,target=/build/target,sharing=locked \
+    cargo build --locked --release \
+    && install -D -m 0755 target/release/pingora-reverse-proxy /out/pingora-reverse-proxy \
+    && strip /out/pingora-reverse-proxy
+
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates libssl3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && find / -xdev -type d -perm -0002 ! -path /tmp -exec chmod o-w {} + \
+    && find / -xdev -type f -perm -0002 -exec chmod o-w {} + \
+    && rm -rf \
+        /usr/local/src /usr/src \
+        /usr/share/doc/bash /usr/share/menu/bash \
+        /usr/share/debianutils/shells.d/bash \
+    && rm -f /usr/bin/bash /usr/bin/dash /usr/bin/sh
+
+COPY --from=builder /out/pingora-reverse-proxy /usr/local/bin/pingora-reverse-proxy
+
+ENV HOME=/tmp \
+    TMPDIR=/tmp
+
+EXPOSE 8000 8001 8002
+USER 65532:65532
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/local/bin/pingora-reverse-proxy"]
+CMD ["--ip","0.0.0.0","--port","8000","--api-ip","0.0.0.0","--api-port","8001","--metrics-ip","0.0.0.0","--metrics-port","8002"]

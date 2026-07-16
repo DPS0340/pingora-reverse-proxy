@@ -1,0 +1,96 @@
+services:
+  chp:
+    image: "${CHP_ORACLE_IMAGE:-pingora-chp-oracle:5.3.0-node20}"
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM node:20.20.2-bookworm-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0
+        RUN mkdir -p /opt/chp-5.3.0
+        WORKDIR /opt/chp-5.3.0
+        ADD https://codeload.github.com/jupyterhub/configurable-http-proxy/tar.gz/5651b9d7449aea6c6a390ecd81a9955146a2b05f /tmp/chp-source.tar.gz
+        RUN echo "7e749e76b39de0e0d3c204440e1c929e89fbe14a8241390d01053500e41be2ec  /tmp/chp-source.tar.gz" | sha256sum -c - \
+            && tar -xzf /tmp/chp-source.tar.gz --strip-components=1 \
+            && rm /tmp/chp-source.tar.gz \
+            && node -e "const p=require('./package.json'); if(p.name!=='configurable-http-proxy'||p.version!=='5.3.0') process.exit(1)" \
+            && npm ci --omit=dev \
+            && printf '%s\n' '5651b9d7449aea6c6a390ecd81a9955146a2b05f' > /opt/chp-5.3.0/.source-commit \
+            && test "$(node --print "process.versions.node.split('.')[0]")" = "20"
+        COPY scripts/chp-oracle.mjs scripts/chp-runtime.mjs /usr/local/bin/
+    command: ["node", "/usr/local/bin/chp-oracle.mjs", "--runtime-probe"]
+
+  redis:
+    image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "127.0.0.1::6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 1s
+      retries: 20
+
+  sidecar:
+    image: python:3.13-alpine@sha256:399babc8b49529dabfd9c922f2b5eea81d611e4512e3ed250d75bd2e7683f4b0
+    command: ["python", "-m", "http.server", "8080"]
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/', timeout=1)
+      interval: 1s
+      timeout: 1s
+      retries: 20
+
+  jupyterhub-e2e:
+    image: "${JUPYTERHUB_E2E_IMAGE:-pingora-jupyterhub-e2e:local}"
+    build:
+      context: "${JUPYTERHUB_E2E_BUILD_CONTEXT:-.}"
+      dockerfile_inline: |
+        # syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+        FROM rust:1.85-bookworm@sha256:e51d0265072d2d9d5d320f6a44dde6b9ef13653b035098febd68cce8fa7c0bc4
+        RUN apt-get update \
+            && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                cmake libpam0g-dev python3-dev python3-pip python3-venv \
+            && rm -rf /var/lib/apt/lists/*
+        COPY tests/jupyterhub-requirements.txt /tmp/jupyterhub-requirements.txt
+        RUN python3 -m venv /opt/jupyterhub \
+            && /opt/jupyterhub/bin/python -m pip install --no-cache-dir \
+                --require-hashes -r /tmp/jupyterhub-requirements.txt \
+            && rm /tmp/jupyterhub-requirements.txt
+        ADD https://codeload.github.com/jupyterhub/jupyterhub/tar.gz/97b3154610726b5b7d8768f1e89a4d910e002854 /tmp/jupyterhub-source.tar.gz
+        COPY scripts/verify-jupyterhub-source.py /usr/local/bin/verify-jupyterhub-source.py
+        RUN echo "525dfd807f318f19158bb28f31568866d95411a644635d4334e701f6e8f28bdb  /tmp/jupyterhub-source.tar.gz" | sha256sum -c - \
+            && mkdir -p /opt/jupyterhub-source \
+            && tar -xzf /tmp/jupyterhub-source.tar.gz -C /opt/jupyterhub-source --strip-components=1 \
+            && rm /tmp/jupyterhub-source.tar.gz \
+            && /opt/jupyterhub/bin/python /usr/local/bin/verify-jupyterhub-source.py /opt/jupyterhub-source \
+            && printf '%s\n' '97b3154610726b5b7d8768f1e89a4d910e002854' > /opt/jupyterhub-source-commit
+        RUN for name in river '秀樹' 'has@' 'space user'; do \
+                useradd --badname --create-home --shell /bin/bash "$$name"; \
+            done
+        ENV RUSTUP_TOOLCHAIN="1.85.1-x86_64-unknown-linux-gnu" \
+            PATH="/opt/jupyterhub/bin:$${PATH}" \
+            NO_PROXY="127.0.0.1,localhost,.localhost" \
+            no_proxy="127.0.0.1,localhost,.localhost"
+        RUN test "$$(rustc --version)" = "rustc 1.85.1 (4eb161250 2025-03-15)"
+        WORKDIR /workspace
+        COPY . /workspace
+        RUN --mount=type=cache,id=pingora-jupyterhub-e2e-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+            --mount=type=cache,id=pingora-jupyterhub-e2e-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+            --mount=type=cache,id=pingora-jupyterhub-e2e-target,target=/workspace/target,sharing=locked \
+            cargo build --locked \
+            && install -m 0755 /workspace/target/debug/pingora-reverse-proxy /usr/local/bin/pingora-reverse-proxy \
+            && cargo test --locked --lib path_ownership::tests::posix_acl_probe_accepts_a_directory_without_extended_acls -- --exact \
+            && python3 scripts/test_jupyterhub_e2e.py -v \
+            && python3 -m pip check
+    init: true
+    environment:
+      STORE_BACKEND: "${STORE_BACKEND:-memory}"
+      PINGORA_REDIS_URL: "redis://redis:6379"
+    command:
+      - "python3"
+      - "scripts/jupyterhub-e2e.py"
+      - "--scenario"
+      - "--proxy-binary"
+      - "/usr/local/bin/pingora-reverse-proxy"

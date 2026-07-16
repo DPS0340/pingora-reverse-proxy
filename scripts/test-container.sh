@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+TIMEOUT_BIN=${TIMEOUT_BIN:-timeout}
+BUILD_TIMEOUT=${CONTAINER_BUILD_TIMEOUT_SECONDS:-1800}
+CONTROL_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+ROOT_DIR=$(cd "${CONTAINER_GATE_SOURCE_ROOT:-$CONTROL_DIR}" && pwd)
+RUN_ID="task13-container-$(date +%s)-$$"
+IMAGE="pingora-reverse-proxy:${RUN_ID}"
+CONTAINER="${RUN_ID}"
+UID_CONTAINER="${RUN_ID}-uid"
+GID_CONTAINER="${RUN_ID}-gid"
+TMP_CONTAINER="${RUN_ID}-tmp"
+OWNER_LABEL="io.pingora-reverse-proxy.test-owner=${RUN_ID}"
+TOKEN="task13-container-token-${RUN_ID}"
+SOURCE_SHA=${CONTAINER_GATE_SOURCE_SHA:-$(git rev-parse HEAD)}
+TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/pingora-container-test.XXXXXX")
+SENTINEL="$ROOT_DIR/src/task13-untracked-secret-sentinel-${RUN_ID}.pem"
+TRACKED_INPUT="$ROOT_DIR/src/lib.rs"
+TRACKED_INPUT_BACKUP="$TMP_DIR/src-lib.original"
+INJECT_FAILURE=${CONTAINER_GATE_INJECT_FAILURE:-}
+CLEANUP_ENABLED=0
+
+cleanup() {
+  local primary_status=$?
+  local cleanup_status=0
+  trap - EXIT
+
+  if (( CLEANUP_ENABLED )); then
+    "$CONTROL_DIR/scripts/cleanup-container-resources.sh" \
+      "$TIMEOUT_BIN" "$OWNER_LABEL" "$IMAGE" \
+      "$CONTAINER" "$UID_CONTAINER" "$GID_CONTAINER" "$TMP_CONTAINER" || cleanup_status=1
+  fi
+  if [[ -f "$TRACKED_INPUT_BACKUP" ]]; then
+    cp "$TRACKED_INPUT_BACKUP" "$TRACKED_INPUT"
+  fi
+  rm -f "$SENTINEL"
+  rm -rf "$TMP_DIR"
+
+  if (( primary_status != 0 )); then
+    exit "$primary_status"
+  fi
+  exit "$cleanup_status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if [[ ! $SOURCE_SHA =~ ^[0-9a-f]{40}$ ]]; then
+  echo "CONTAINER_GATE_SOURCE_SHA must be a full lowercase Git SHA" >&2
+  exit 2
+fi
+if { [[ -n ${CONTAINER_GATE_IMAGE_ARCHIVE:-} ]] && [[ -z ${CONTAINER_GATE_IMAGE_METADATA:-} ]]; } || \
+  { [[ -z ${CONTAINER_GATE_IMAGE_ARCHIVE:-} ]] && [[ -n ${CONTAINER_GATE_IMAGE_METADATA:-} ]]; }; then
+  echo "CONTAINER_GATE_IMAGE_ARCHIVE and CONTAINER_GATE_IMAGE_METADATA must be set together" >&2
+  exit 2
+fi
+
+if [[ -n "$INJECT_FAILURE" && "$INJECT_FAILURE" != "after-start" ]]; then
+  printf 'unsupported CONTAINER_GATE_INJECT_FAILURE: %s\n' "$INJECT_FAILURE" >&2
+  exit 2
+fi
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || {
+    printf 'required command is unavailable: %s\n' "$1" >&2
+    exit 1
+  }
+}
+
+require_command docker
+require_command curl
+require_command tar
+require_command "$TIMEOUT_BIN"
+require_command git
+CLEANUP_ENABLED=1
+cd "$ROOT_DIR"
+
+install -m 0600 /dev/null "$SENTINEL"
+cp "$TRACKED_INPUT" "$TRACKED_INPUT_BACKUP"
+printf '\n// dirty workspace content must never enter a production image\n' >>"$TRACKED_INPUT"
+"$CONTROL_DIR/scripts/build-container-context.sh" "$TMP_DIR/context.tar" "$ROOT_DIR" "$SOURCE_SHA"
+if tar -tf "$TMP_DIR/context.tar" | grep -Fq "${SENTINEL#"$ROOT_DIR/"}"; then
+  echo "untracked secret sentinel entered the container build context" >&2
+  exit 1
+fi
+if tar -xOf "$TMP_DIR/context.tar" src/lib.rs | grep -Fq \
+  'dirty workspace content must never enter a production image'; then
+  echo "dirty tracked content entered the immutable HEAD container context" >&2
+  exit 1
+fi
+git -C "$ROOT_DIR" show "$SOURCE_SHA":src/lib.rs >"$TMP_DIR/head-lib.rs"
+tar -xOf "$TMP_DIR/context.tar" src/lib.rs >"$TMP_DIR/archive-lib.rs"
+cmp "$TMP_DIR/head-lib.rs" "$TMP_DIR/archive-lib.rs"
+cp "$TRACKED_INPUT_BACKUP" "$TRACKED_INPUT"
+rm -f "$TRACKED_INPUT_BACKUP"
+
+"$TIMEOUT_BIN" "$BUILD_TIMEOUT" docker build \
+    --pull \
+    --label "$OWNER_LABEL" \
+    --label "org.opencontainers.image.revision=${SOURCE_SHA}" \
+    --label "org.opencontainers.image.source=https://github.com/dps0340/pingora-reverse-proxy" \
+    --tag "$IMAGE" \
+    - <"$TMP_DIR/context.tar"
+
+test "$("$TIMEOUT_BIN" 30 docker image inspect --format '{{.Config.User}}' "$IMAGE")" = "65532:65532"
+test "$("$TIMEOUT_BIN" 30 docker image inspect --format '{{json .Config.Entrypoint}}' "$IMAGE")" = '["/usr/local/bin/pingora-reverse-proxy"]'
+test "$("$TIMEOUT_BIN" 30 docker image inspect --format '{{json .Config.Cmd}}' "$IMAGE")" = '["--ip","0.0.0.0","--port","8000","--api-ip","0.0.0.0","--api-port","8001","--metrics-ip","0.0.0.0","--metrics-port","8002"]'
+
+effective_uid=$("$TIMEOUT_BIN" 30 docker run --rm \
+  --name "$UID_CONTAINER" \
+  --label "$OWNER_LABEL" \
+  --entrypoint /usr/bin/id \
+  "$IMAGE" -u)
+test "$effective_uid" = "65532"
+
+effective_gid=$("$TIMEOUT_BIN" 30 docker run --rm \
+  --name "$GID_CONTAINER" \
+  --label "$OWNER_LABEL" \
+  --entrypoint /usr/bin/id \
+  "$IMAGE" -g)
+test "$effective_gid" = "65532"
+
+"$TIMEOUT_BIN" 30 docker run --rm \
+  --name "$TMP_CONTAINER" \
+  --label "$OWNER_LABEL" \
+  --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,nodev,uid=65532,gid=65532,mode=1770 \
+  --cap-drop ALL \
+  --security-opt no-new-privileges \
+  --entrypoint /usr/bin/touch \
+  "$IMAGE" /tmp/write-probe
+
+"$TIMEOUT_BIN" 30 docker run --detach \
+  --name "$CONTAINER" \
+  --label "$OWNER_LABEL" \
+  --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,nodev,uid=65532,gid=65532,mode=1770 \
+  --cap-drop ALL \
+  --security-opt no-new-privileges \
+  --env "CONFIGPROXY_AUTH_TOKEN=${TOKEN}" \
+  --publish 127.0.0.1::8000 \
+  --publish 127.0.0.1::8001 \
+  --publish 127.0.0.1::8002 \
+  "$IMAGE" >/dev/null
+
+if [[ "$INJECT_FAILURE" == "after-start" ]]; then
+  printf 'injected container-gate failure after owned container start\n' >&2
+  exit 97
+fi
+
+public_port=$("$TIMEOUT_BIN" 30 docker port "$CONTAINER" 8000/tcp | sed -n '1s/.*://p')
+api_port=$("$TIMEOUT_BIN" 30 docker port "$CONTAINER" 8001/tcp | sed -n '1s/.*://p')
+metrics_port=$("$TIMEOUT_BIN" 30 docker port "$CONTAINER" 8002/tcp | sed -n '1s/.*://p')
+test -n "$public_port"
+test -n "$api_port"
+test -n "$metrics_port"
+
+deadline=$((SECONDS + 60))
+while true; do
+  if ! "$TIMEOUT_BIN" 15 docker inspect --format '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -qx true; then
+    "$TIMEOUT_BIN" 15 docker logs "$CONTAINER" >&2 || true
+    printf 'production container exited before readiness\n' >&2
+    exit 1
+  fi
+  health=$(curl --silent --show-error --max-time 2 "http://127.0.0.1:${public_port}/_chp_healthz" 2>/dev/null || true)
+  routes=$(curl --silent --show-error --max-time 2 \
+    --header "Authorization: token ${TOKEN}" \
+    "http://127.0.0.1:${api_port}/api/routes" 2>/dev/null || true)
+  metrics=$(curl --silent --show-error --max-time 2 "http://127.0.0.1:${metrics_port}/metrics" 2>/dev/null || true)
+  if [[ "$health" == '{"status":"OK"}' && "$routes" == '{}' && "$metrics" == *'api_route_get'* ]]; then
+    break
+  fi
+  if (( SECONDS >= deadline )); then
+    "$TIMEOUT_BIN" 15 docker logs "$CONTAINER" >&2 || true
+    printf 'container listeners did not become ready within 60 seconds\n' >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+test "$("$TIMEOUT_BIN" 30 docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "$CONTAINER")" = "true"
+test "$("$TIMEOUT_BIN" 30 docker inspect --format '{{.HostConfig.SecurityOpt}}' "$CONTAINER")" = '[no-new-privileges]'
+
+"$TIMEOUT_BIN" 60 docker export "$CONTAINER" | tar -tf - >"$TMP_DIR/rootfs.txt"
+grep -qx 'usr/local/bin/pingora-reverse-proxy' "$TMP_DIR/rootfs.txt"
+grep -qx 'etc/ssl/certs/ca-certificates.crt' "$TMP_DIR/rootfs.txt"
+if grep -Eq '^(bin|usr/bin)/(sh|dash|bash)$' "$TMP_DIR/rootfs.txt"; then
+  printf 'a command shell leaked into the runtime image\n' >&2
+  grep -E '^(bin|usr/bin)/(sh|dash|bash)$' "$TMP_DIR/rootfs.txt" >&2
+  exit 1
+fi
+if grep -Eq '(^|/)(Cargo\.(toml|lock)|\.git|target|src)(/|$)|(^|/)(cargo|rustc|gcc|g\+\+|cmake|make|git|bash)$' "$TMP_DIR/rootfs.txt"; then
+  printf 'build tools, source, or a debug tree leaked into the runtime image\n' >&2
+  grep -E '(^|/)(Cargo\.(toml|lock)|\.git|target|src)(/|$)|(^|/)(cargo|rustc|gcc|g\+\+|cmake|make|git|bash)$' "$TMP_DIR/rootfs.txt" >&2
+  exit 1
+fi
+
+"$TIMEOUT_BIN" 30 docker stop --time 15 "$CONTAINER" >/dev/null
+test "$("$TIMEOUT_BIN" 30 docker inspect --format '{{.State.ExitCode}}' "$CONTAINER")" = "0"
+
+if [[ -n ${CONTAINER_GATE_IMAGE_ARCHIVE:-} ]]; then
+  "$CONTROL_DIR/scripts/image-artifact.sh" create \
+    "$IMAGE" \
+    "$CONTAINER_GATE_IMAGE_ARCHIVE" \
+    "$CONTAINER_GATE_IMAGE_METADATA" \
+    "$SOURCE_SHA" \
+    "${CONTAINER_GATE_WORKFLOW_RUN_ID:-local}"
+fi
+
+printf 'container gate passed: uid/gid=65532 read-only-root health/api/metrics ready cleanup-owned=%s\n' "$RUN_ID"

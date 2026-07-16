@@ -1,27 +1,53 @@
 [package]
 name = "pingora-reverse-proxy"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/DPS0340/pingora-reverse-proxy"
 
 [dependencies]
-async-trait = "0.1.81"
-axum = "0.8.1"
-bytes = "1.7.1"
-dashmap = "6.0.1"
-env_logger = "0.11.5"
-futures = "0.3.31"
-http = "1.1.0"
-itertools = "0.13.0"
-lazy_mut = "0.1.0"
-log = "0.4.22"
-once_cell = "1.19.0"
-pingora = { version = "0.3.0", features = ["lb", "proxy"] }
-pingora-core = "0.5.0"
-pingora-error = "0.3.0"
-pingora-load-balancing = "0.3.0"
-pingora-proxy = "0.3.0"
-pingora-runtime = "0.4.0"
-redis = "0.25.4"
-regex = "1.10.6"
-serde_json = "1.0.120"
-tokio = { version = "1.43.0", features = ["rt", "rt-multi-thread"] }
+arc-swap = "1.7"
+async-trait = "0.1"
+axum = "0.8"
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+constant_time_eq = "0.4"
+futures-util = "0.3"
+http = "1"
+httparse = "1"
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12", "webpki-roots"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+libc = "0.2"
+openssl = "0.10"
+pingora = { version = "0.8.1", features = ["proxy", "openssl"] }
+prometheus = "0.14"
+redis = { version = "0.32", features = ["aio", "tokio-comp"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1"
+rustix = { version = "1", features = ["fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+socket2 = { version = "0.5.7", features = ["all"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-openssl = "0.6"
+tower = { version = "0.5", features = ["util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+url = { version = "2", features = ["serde"] }
+webpki-roots = "1"
+
+[dev-dependencies]
+pingora-load-balancing = "0.8.1"
+proptest = "1.7"
+serial_test = "3"
+tempfile = "3"
+tokio-tungstenite = "0.27"
+wiremock = "=0.6.4"
+
+[patch.crates-io]
+pingora-core = { path = "vendor/pingora-core-0.8.1" }
+pingora-load-balancing = { path = "vendor/pingora-load-balancing-0.8.1" }

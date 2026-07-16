@@ -1,0 +1,182 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*.*.*']
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+
+jobs:
+  verify-linux:
+    name: Authoritative Linux verification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CONTAINER_GATE_IMAGE_ARCHIVE: /tmp/pingora-verified-image/image.tar
+      CONTAINER_GATE_IMAGE_METADATA: /tmp/pingora-verified-image/metadata.env
+      CONTAINER_GATE_SOURCE_SHA: ${{ github.sha }}
+      CONTAINER_GATE_WORKFLOW_RUN_ID: ${{ github.run_id }}
+    steps:
+      - name: Initialize workflow-run failure evidence
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          evidence="${RUNNER_TEMP}/verification-bootstrap"
+          mkdir -p "${evidence}"
+          {
+            printf 'schema\tpingora-workflow-bootstrap-v1\n'
+            printf 'source_sha\t%s\n' "${GITHUB_SHA}"
+            printf 'workflow_run_id\t%s\n' "${GITHUB_RUN_ID}"
+            printf 'status\tpre-checkout\n'
+          } > "${RUNNER_TEMP}/verification-bootstrap/bootstrap.tsv"
+
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Initialize exact-SHA verification evidence
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p .verification-logs
+          {
+            printf 'schema\tpingora-verification-bootstrap-v1\n'
+            printf 'source_sha\t%s\n' "${GITHUB_SHA}"
+            printf 'workflow_run_id\t%s\n' "${GITHUB_RUN_ID}"
+            printf 'status\tpre-verifier\n'
+          } > .verification-logs/bootstrap.tsv
+
+      - name: Install actionlint
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          archive=/tmp/actionlint_1.7.12_linux_amd64.tar.gz
+          curl --fail --location --silent --show-error --max-time 60 \
+            --output "${archive}" \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  ${archive}" | sha256sum --check
+          timeout 30s tar -xzf "${archive}" -C /tmp actionlint
+          timeout 30s sudo install -m 0755 /tmp/actionlint /usr/local/bin/actionlint
+          test "$(actionlint -version | sed -n '1p')" = 1.7.12
+
+      - name: Check workflow schemas
+        run: actionlint .github/workflows/ci.yml .github/workflows/cd.yml
+
+      - name: Install native and release-gate tools
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          timeout 300s sudo apt-get update
+          timeout 300s sudo apt-get install -y --no-install-recommends clang cmake libclang-dev libssl-dev pkg-config ruby
+          timeout 300s rustup toolchain install 1.85.1 --profile minimal --component clippy,rustfmt
+          timeout 300s rustup toolchain install 1.89.0 --profile minimal
+          timeout 1200s cargo +1.89.0 install --locked --version 1.56.0 just
+          timeout 1200s cargo +1.89.0 install --locked --version 0.22.2 cargo-audit
+          timeout 1200s cargo +1.89.0 install --locked --version 0.20.2 cargo-deny
+          curl --fail --location --silent --show-error --max-time 60 \
+            --output /tmp/helm.tar.gz https://get.helm.sh/helm-v3.18.3-linux-amd64.tar.gz
+          echo '6ec85f306dd8fe9eb05c61ba4593182b2afcfefb52f21add3fe043ebbdc48e39  /tmp/helm.tar.gz' | sha256sum --check
+          timeout 60s tar -xzf /tmp/helm.tar.gz -C /tmp
+          timeout 30s sudo install -m 0755 /tmp/linux-amd64/helm /usr/local/bin/helm
+
+      - name: Record resolved Rust toolchain
+        id: linux-toolchain
+        run: |
+          resolved_rustc=$(timeout 15s rustc --version)
+          test "${resolved_rustc}" = 'rustc 1.85.1 (4eb161250 2025-03-15)'
+          printf '%s\n' "${resolved_rustc}"
+          printf 'rustc=%s\n' "$(printf '%s' "${resolved_rustc}" | sha256sum | cut -d' ' -f1)" >> "${GITHUB_OUTPUT}"
+
+      - name: Cache locked Cargo inputs and outputs
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: linux-cargo-${{ steps.linux-toolchain.outputs.rustc }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+
+      - name: Run verification contract tests
+        run: |
+          bash scripts/test-release.sh
+          bash scripts/test-verify.sh
+      - name: Run authoritative release gate
+        run: bash scripts/verify.sh
+
+      - name: Upload exact verified production image
+        id: verified-image
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: verified-image-${{ github.sha }}
+          path: |
+            ${{ env.CONTAINER_GATE_IMAGE_ARCHIVE }}
+            ${{ env.CONTAINER_GATE_IMAGE_METADATA }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Report verified artifact provenance
+        run: |
+          echo "Verified source: ${{ github.sha }}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "Workflow artifact SHA-256: ${{ steps.verified-image.outputs.artifact-digest }}" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux-verification-${{ github.sha }}-${{ github.run_id }}
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
+          path: |
+            ${{ runner.temp }}/verification-bootstrap/
+            .verification-logs/
+            **/*.proptest-regressions
+            proptest-regressions/
+
+  rust-macos:
+    name: macOS Rust checks
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install required native tools
+        run: |
+          set -Eeuo pipefail
+          python3 -c 'import subprocess; subprocess.run(["brew", "install", "cmake", "coreutils", "openssl@3", "pkg-config"], check=True, timeout=1200)'
+          gtimeout 300s rustup toolchain install 1.85.1 --profile minimal --component clippy,rustfmt
+
+      - name: Record resolved Rust toolchain
+        id: macos-toolchain
+        run: |
+          resolved_rustc=$(gtimeout 15s rustc --version)
+          test "${resolved_rustc}" = 'rustc 1.85.1 (4eb161250 2025-03-15)'
+          printf '%s\n' "${resolved_rustc}"
+          printf 'rustc=%s\n' "$(printf '%s' "${resolved_rustc}" | shasum -a 256 | cut -d' ' -f1)" >> "${GITHUB_OUTPUT}"
+
+      - name: Cache locked Cargo inputs and outputs
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: macos-cargo-${{ steps.macos-toolchain.outputs.rustc }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+
+      - name: Format, lint, and unit test
+        run: |
+          set -Eeuo pipefail
+          gtimeout 180s cargo fmt --all -- --check
+          gtimeout 1800s cargo clippy --locked --all-targets --all-features -- -D warnings
+          gtimeout 1800s cargo test --locked --lib --bins --all-features
