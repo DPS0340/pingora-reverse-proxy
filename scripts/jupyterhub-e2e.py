@@ -40,10 +40,10 @@ _PORT_ALLOCATION_LOCK = threading.Lock()
 _port_cursor = secrets.randbelow(PORT_RANGE_END - PORT_RANGE_START + 1)
 PINNED_PACKAGES = {
     "ipykernel": "6.30.1",
-    "jupyter-server": "2.17.0",
+    "jupyter-server": "2.20.0",
     "jupyterhub": "5.5.0",
     "nbclassic": "1.3.3",
-    "requests": "2.32.4",
+    "requests": "2.33.0",
     "websocket-client": "1.8.0",
 }
 EXPECTED_JUPYTERHUB_COMMIT = "97b3154610726b5b7d8768f1e89a4d910e002854"
