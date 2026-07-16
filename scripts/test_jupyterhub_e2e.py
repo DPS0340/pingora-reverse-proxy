@@ -77,6 +77,7 @@ class SecurityPinTests(unittest.TestCase):
         "jupyter[-_]server": "2.20.0",
         "pip": "26.1.2",
         "requests": "2.33.0",
+        "setuptools": "83.0.0",
         "wheel": "0.46.2",
     }
 
