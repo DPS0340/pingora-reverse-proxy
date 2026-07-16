@@ -1,11 +1,11 @@
 # Regenerate tests/jupyterhub-requirements.txt inside
 # python:3.13-alpine@sha256:399babc8b49529dabfd9c922f2b5eea81d611e4512e3ed250d75bd2e7683f4b0
-# with pip==25.1.1 and pip-tools==7.5.1:
+# with compiler pip==25.2 and pip-tools==7.5.1; the generated lock pins pip==26.1.2:
 # pip-compile --generate-hashes --allow-unsafe --strip-extras \
 #   --output-file=tests/jupyterhub-requirements.txt tests/jupyterhub-requirements.in
-pip==25.1.1
-setuptools==80.9.0
-wheel==0.45.1
+pip==26.1.2
+setuptools==83.0.0
+wheel==0.46.2
 Jinja2==3.1.6
 Mako==1.3.12
 MarkupSafe==3.0.3
@@ -49,7 +49,7 @@ jsonschema==4.26.0
 jupyter-events==0.12.1
 jupyter_client==8.9.1
 jupyter_core==5.9.1
-jupyter_server==2.17.0
+jupyter_server==2.20.0
 jupyter_server_terminals==0.5.4
 https://files.pythonhosted.org/packages/ed/6f/01600881e9e6acf27b7c1c7132d0fc945078a906080ec1758dc24f479132/jupyterhub-5.5.0-py3-none-any.whl#sha256=2e38d1767742d41911cfc2160cad485eae2698f98ed291308c7d3be090c757a0
 jupyterlab_pygments==0.3.0
@@ -82,7 +82,7 @@ python-dateutil==2.9.0.post0
 python-json-logger==4.1.0
 pyzmq==27.1.0
 referencing==0.37.0
-requests==2.32.4
+requests==2.33.0
 rfc3339-validator==0.1.4
 rfc3986-validator==0.1.1
 rfc3987-syntax==1.1.0

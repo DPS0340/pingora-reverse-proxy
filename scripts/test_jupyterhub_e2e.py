@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -69,6 +70,45 @@ class VersionProbeTests(unittest.TestCase):
                     "Python is 3.12.12, expected 3.11.2",
                 ):
                     HARNESS.assert_pinned_runtime(recorder)
+
+
+class SecurityPinTests(unittest.TestCase):
+    SECURITY_FLOORS = {
+        "jupyter[-_]server": "2.20.0",
+        "pip": "26.1.2",
+        "requests": "2.33.0",
+        "setuptools": "83.0.0",
+        "wheel": "0.46.2",
+    }
+
+    @staticmethod
+    def version_tuple(version: str) -> tuple[int, ...]:
+        return tuple(int(part) for part in version.split("."))
+
+    def assert_security_floors(self, requirements: Path) -> None:
+        contents = requirements.read_text(encoding="utf-8")
+        for package_pattern, floor in self.SECURITY_FLOORS.items():
+            match = re.search(rf"(?m)^{package_pattern}==([0-9.]+)", contents)
+            self.assertIsNotNone(match, package_pattern)
+            assert match is not None
+            self.assertGreaterEqual(
+                self.version_tuple(match.group(1)),
+                self.version_tuple(floor),
+                package_pattern,
+            )
+
+    def test_jupyterhub_dependency_inputs_and_lock_meet_security_floors(self) -> None:
+        tests = SCRIPT.parent.parent / "tests"
+        self.assert_security_floors(tests / "jupyterhub-requirements.in")
+        self.assert_security_floors(tests / "jupyterhub-requirements.txt")
+        self.assertGreaterEqual(
+            self.version_tuple(HARNESS.PINNED_PACKAGES["jupyter-server"]),
+            self.version_tuple("2.20.0"),
+        )
+        self.assertGreaterEqual(
+            self.version_tuple(HARNESS.PINNED_PACKAGES["requests"]),
+            self.version_tuple("2.33.0"),
+        )
 
 
 class ReconciliationTests(unittest.TestCase):

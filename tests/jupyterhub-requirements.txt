@@ -604,9 +604,9 @@ jupyter-events==0.12.1 \
     #   -r tests/jupyterhub-requirements.in
     #   jupyter-server
     #   jupyterhub
-jupyter-server==2.17.0 \
-    --hash=sha256:c38ea898566964c888b4772ae1ed58eca84592e88251d2cfc4d171f81f7e99d5 \
-    --hash=sha256:e8cb9c7db4251f51ed307e329b81b72ccf2056ff82d50524debde1ee1870e13f
+jupyter-server==2.20.0 \
+    --hash=sha256:b5778ba337d8015a3dc2b80803ecdd5ac18d3797fddf61a50ea5fb472b4ebe14 \
+    --hash=sha256:c3b67c93c471e947c18b5026f04f21614218adb706df8f48227d3ee8e0a7cdcc
     # via
     #   -r tests/jupyterhub-requirements.in
     #   notebook-shim
@@ -802,6 +802,7 @@ packaging==26.2 \
     #   jupyter-server
     #   jupyterhub
     #   nbconvert
+    #   wheel
 pamela==1.2.0 \
     --hash=sha256:0ea6e2a99dded8c7783a4a06f2d31f5bdcad894d79101e8f09322e387a34aacf \
     --hash=sha256:27e543f1059bab1d7bc35b322d97705b4653869d1a06fe867d8c2b5206ed9d28
@@ -1225,9 +1226,9 @@ referencing==0.37.0 \
     #   jsonschema
     #   jsonschema-specifications
     #   jupyter-events
-requests==2.32.4 \
-    --hash=sha256:27babd3cda2a6d50b30443204ee89830707d396671944c998b5975b031ac2b2c \
-    --hash=sha256:27d0316682c8a29834d3264820024b62a36942083d52caf2f14c0591336d3422
+requests==2.33.0 \
+    --hash=sha256:3324635456fa185245e24865e810cecec7b4caf933d7eb133dcde67d48cee69b \
+    --hash=sha256:c7ebc5e8b0f21837386ad0e1c8fe8b829fa5f544d8df3b2253bff14ef29d7652
     # via
     #   -r tests/jupyterhub-requirements.in
     #   jupyterhub
@@ -1568,17 +1569,17 @@ websocket-client==1.8.0 \
     # via
     #   -r tests/jupyterhub-requirements.in
     #   jupyter-server
-wheel==0.45.1 \
-    --hash=sha256:661e1abd9198507b1409a20c02106d9670b2576e916d58f520316666abca6729 \
-    --hash=sha256:708e7481cc80179af0e556bbf0cc00b8444c7321e2700b8d8580231d13017248
+wheel==0.46.2 \
+    --hash=sha256:33ae60725d69eaa249bc1982e739943c23b34b58d51f1cb6253453773aca6e65 \
+    --hash=sha256:3d79e48fde9847618a5a181f3cc35764c349c752e2fe911e65fa17faab9809b0
     # via -r tests/jupyterhub-requirements.in
 
 # The following packages are considered to be unsafe in a requirements file:
-pip==25.1.1 \
-    --hash=sha256:2913a38a2abf4ea6b64ab507bd9e967f3b53dc1ede74b01b0931e1ce548751af \
-    --hash=sha256:3de45d411d308d5054c2168185d8da7f9a2cd753dbac8acbfa88a8909ecd9077
+pip==26.1.2 \
+    --hash=sha256:382ff9f685ee3bc25864f820aa50505825f10f5458ffff07e30a6d96e5715cab \
+    --hash=sha256:f49cd134c61cf2fd75e0ce2676db03e4054504a5a4986d00f8299ae632dc4605
     # via -r tests/jupyterhub-requirements.in
-setuptools==80.9.0 \
-    --hash=sha256:062d34222ad13e0cc312a4c02d73f059e86a4acbfbdea8f8f76b28c99f306922 \
-    --hash=sha256:f36b47402ecde768dbfafc46e8e4207b4360c654f1f3bb84475f0a28628fb19c
+setuptools==83.0.0 \
+    --hash=sha256:025bccbbf0fa05b6192bc64ae1e7b16e001fd6d6d4d5de03c97b1c1ade523bef \
+    --hash=sha256:29b23c360f22f414dc7336bb39178cc7bcbf6021ed2733cde173f09dba19abb3
     # via -r tests/jupyterhub-requirements.in
