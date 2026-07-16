@@ -2,7 +2,7 @@
 
 # pingora-reverse-proxy
 
-[![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/pingora-reverse-proxy)](https://artifacthub.io/packages/search?repo=pingora-reverse-proxy)
+[![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/pingora-reverse-proxy)](https://artifacthub.io/packages/helm/pingora-reverse-proxy/pingora-reverse-proxy)
 [![Rust 1.85+](https://img.shields.io/badge/Rust-1.85%2B-000000?logo=rust)](https://www.rust-lang.org/)
 [![CHP compatibility](https://img.shields.io/badge/Configurable%20HTTP%20Proxy-5.3.0-2c7fb8)](https://github.com/jupyterhub/configurable-http-proxy/tree/5.3.0)
 
